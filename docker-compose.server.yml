@@ -1,0 +1,33 @@
+services:
+  app:
+    image: infinite-canvas:server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: infinite-canvas
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:${APP_PORT:?APP_PORT is required}:3000"
+    restart: unless-stopped
+    networks:
+      - app
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  app:
+    external: true
+    name: infinite-canvas-network
