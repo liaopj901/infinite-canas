@@ -18,7 +18,7 @@ import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
 import { modelKey, supportsVideoAudioGeneration, supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
 import { deleteStoredMedia, downloadRemoteMedia, resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer } from "@/services/file-storage";
-import { deleteStoredImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { deleteStoredImages, loadStorageConfig, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { deleteVideoGenerationLogs, fetchVideoGenerationLogs, saveVideoGenerationLogs } from "@/services/api/generation-logs";
 import { createVideoGenerationTask, deleteVideoGenerationTask, listVideoGenerationTasks, pollVideoGenerationTaskStatus, VIDEO_POLL_INTERVAL_MS, VideoRequestError, type VideoResponse } from "@/services/api/video";
 import { useAssetStore } from "@/stores/use-asset-store";
@@ -732,6 +732,20 @@ export default function VideoPage() {
         }
     };
 
+    const autoSyncGeneratedVideo = async (video: GeneratedVideo, index = 0) => {
+        if (video.storageKey) return video;
+        const storageConfig = await loadStorageConfig().catch(() => null);
+        if (!storageConfig?.autoSyncGeneratedMedia) return video;
+        try {
+            const uploaded = await uploadRemoteMediaToServer(video.url, `video-${index + 1}.mp4`);
+            return { ...video, url: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || video.width, height: uploaded.height || video.height, bytes: uploaded.bytes || video.bytes, mimeType: uploaded.mimeType || video.mimeType };
+        } catch (error) {
+            // 自动同步失败不能覆盖已生成结果，否则云存储故障会被误判为生视频失败。
+            message.warning(`视频已生成，但自动同步失败：${errorMessage(error)}`);
+            return video;
+        }
+    };
+
     const syncResultVideo = async (resultId: string, video: GeneratedVideo, index: number) => {
         const synced = await syncVideo(video, index);
         if (!synced) return;
@@ -961,7 +975,7 @@ export default function VideoPage() {
                     setResults((value) => updateResultByLogId(value, log.id, { status: "failed", task, error: nextLog.error, errorDetail: nextLog.errorDetail, durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                     return;
                 }
-                const video = videoFromTaskResponse(task, durationMs);
+                const video = await autoSyncGeneratedVideo(videoFromTaskResponse(task, durationMs));
                 const nextLog = { ...baseLog, status: "成功" as const, video, error: undefined, errorDetail: undefined };
                 await finalizeGenerationLog(nextLog);
                 setResults((value) => value.filter((item) => item.taskLogId !== log.id && item.id !== log.id));

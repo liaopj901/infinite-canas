@@ -49,6 +49,7 @@ export type StorageConfig = {
     mode: string;
     allowUserProvider: boolean;
     allowUserGlobalProvider: boolean;
+    autoSyncGeneratedMedia: boolean;
 };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });

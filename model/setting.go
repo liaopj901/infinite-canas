@@ -77,6 +77,8 @@ type PublicStorageSetting struct {
 	Mode                    string `json:"mode"`
 	AllowUserProvider       bool   `json:"allowUserProvider"`
 	AllowUserGlobalProvider bool   `json:"allowUserGlobalProvider"`
+	// 控制图片和视频生成结果是否由前端生成后自动上传对象存储。
+	AutoSyncGeneratedMedia bool `json:"autoSyncGeneratedMedia"`
 }
 
 type PublicAuthSetting struct {
@@ -112,6 +114,8 @@ type PrivateStorageSetting struct {
 	Mode                    string                      `json:"mode"`
 	AllowUserProvider       bool                        `json:"allowUserProvider"`
 	AllowUserGlobalProvider bool                        `json:"allowUserGlobalProvider"`
+	// 控制图片和视频生成结果是否由前端生成后自动上传对象存储。
+	AutoSyncGeneratedMedia bool                        `json:"autoSyncGeneratedMedia"`
 	Providers               []StorageProvider           `json:"providers"`
 	RoundRobinCursor        int                         `json:"roundRobinCursor"`
 	CapacityCheck           StorageCapacityCheckSetting `json:"capacityCheck"`

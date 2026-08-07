@@ -295,6 +295,16 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | --- | --- | --- |
 | `modelChannel` | object | 模型渠道公开配置组 |
 | `auth` | object | 公开登录配置 |
+| `storage` | object | 前端需要读取的存储能力和自动同步开关 |
+
+`public.value.storage` 当前字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `mode` | string | 当前存储模式 |
+| `allowUserProvider` | bool | 是否允许用户配置自己的对象存储 |
+| `allowUserGlobalProvider` | bool | 是否允许用户使用管理员配置的全局对象存储 |
+| `autoSyncGeneratedMedia` | bool | 是否自动同步图片和视频生成结果，默认关闭 |
 
 `modelChannel` 当前字段：
 
@@ -329,6 +339,7 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `channels` | object[] | 模型渠道配置列表 |
 | `promptSync` | object | GitHub 远程提示词定时同步配置 |
 | `auth` | object | 私有登录配置 |
+| `storage` | object | 对象存储提供商和生成结果同步配置 |
 
 `channels` 每项字段：
 
@@ -356,6 +367,18 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | --- | --- | --- |
 | `clientId` | string | Linux.do OAuth App Client ID |
 | `clientSecret` | string | Linux.do OAuth App Client Secret，后台返回时隐藏 |
+
+`storage` 当前字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `mode` | string | 存储模式，系统根据已启用的提供商自动识别 |
+| `allowUserProvider` | bool | 是否允许用户配置自己的对象存储 |
+| `allowUserGlobalProvider` | bool | 是否允许用户使用管理员配置的全局对象存储 |
+| `autoSyncGeneratedMedia` | bool | 是否自动同步图片和视频生成结果，默认关闭 |
+| `providers` | object[] | S3/R2 或 WebDAV 提供商配置 |
+| `capacityCheck` | object | 定时容量统计配置 |
+| `capacityLimitBytes` | number | 对象存储容量上限 |
 
 后端请求模型时，先按模型名筛选启用且包含该模型的渠道，再按 `weight` 加权随机选择一个渠道。
 

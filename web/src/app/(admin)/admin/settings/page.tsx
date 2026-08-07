@@ -8,6 +8,8 @@ import { useEffect, useMemo, useState } from "react";
 import { EditorView } from "@uiw/react-codemirror";
 
 import { fetchAdminSettings, fetchChannelModels, measureAdminStorageProvider, saveAdminSettings, testChannelModel, type AdminModelChannel, type AdminModelCost, type AdminSettings, type AdminStorageProvider } from "@/services/api/admin";
+import { clearStorageConfigCache as clearFileStorageConfigCache } from "@/services/file-storage";
+import { clearStorageConfigCache as clearImageStorageConfigCache } from "@/services/image-storage";
 import { useUserStore } from "@/stores/use-user-store";
 
 const CodeMirror = dynamic(() => import("@uiw/react-codemirror"), { ssr: false });
@@ -40,9 +42,9 @@ const emptySettings: AdminSettings = {
             allowUserRemoteChannel: false,
         },
         auth: { allowRegister: true, linuxDo: { enabled: false } },
-        storage: { mode: "local_indexeddb", allowUserProvider: false },
+        storage: { mode: "local_indexeddb", allowUserProvider: false, autoSyncGeneratedMedia: false },
     },
-    private: { channels: [], promptSync: { enabled: true, cron: "0 0 * * *" }, aiLog: { localDirectReportEnabled: false, cleanup: { enabled: false, retentionDays: 14, cron: "0 3 * * *" } }, auth: { linuxDo: { clientId: "", clientSecret: "" } }, storage: { mode: "local_indexeddb", allowUserProvider: false, allowUserGlobalProvider: true, providers: [], roundRobinCursor: 0, capacityCheck: { enabled: false, cron: "0 */6 * * *" }, capacityLimitBytes: 9 * 1024 * 1024 * 1024 } },
+    private: { channels: [], promptSync: { enabled: true, cron: "0 0 * * *" }, aiLog: { localDirectReportEnabled: false, cleanup: { enabled: false, retentionDays: 14, cron: "0 3 * * *" } }, auth: { linuxDo: { clientId: "", clientSecret: "" } }, storage: { mode: "local_indexeddb", allowUserProvider: false, allowUserGlobalProvider: true, autoSyncGeneratedMedia: false, providers: [], roundRobinCursor: 0, capacityCheck: { enabled: false, cron: "0 */6 * * *" }, capacityLimitBytes: 9 * 1024 * 1024 * 1024 } },
 };
 const emptyChannel: AdminModelChannel = { id: "", protocol: "openai", name: "", baseUrl: "", apiKey: "", models: [], weight: 1, timeout: 600, enabled: true, remark: "" };
 const emptyS3StorageProvider: AdminStorageProvider = { id: "", name: "", type: "s3", endpoint: "", region: "auto", bucket: "", accessKeyId: "", secretAccessKey: "", publicBaseUrl: "", pathPrefix: "canvas", username: "", password: "", weight: 1, enabled: true, ownerUserId: "", capacityBytes: 0, capacityCheckedAt: "", capacityExceeded: false };
@@ -141,6 +143,8 @@ export default function AdminSettingsPage() {
                 public: JSON.stringify(merged.public, null, 2),
                 private: JSON.stringify(merged.private, null, 2),
             });
+            clearImageStorageConfigCache();
+            clearFileStorageConfigCache();
             message.success("已保存");
         } catch (error) {
             message.error(error instanceof Error ? error.message : "保存失败");
@@ -645,6 +649,11 @@ export default function AdminSettingsPage() {
                                             </Form.Item>
                                         </Col>
                                         <Col xs={24} md={8}>
+                                            <Form.Item name={["private", "storage", "autoSyncGeneratedMedia"]} label="生成后自动同步至云端" valuePropName="checked" extra="仅影响图片和视频生成结果；关闭后仍可手动同步。">
+                                                <Switch />
+                                            </Form.Item>
+                                        </Col>
+                                        <Col xs={24} md={8}>
                                             <Form.Item name={["private", "storage", "capacityCheck", "enabled"]} label="定时统计容量" valuePropName="checked">
                                                 <Switch />
                                             </Form.Item>
@@ -1125,6 +1134,7 @@ function normalizePublicSetting(setting: Partial<AdminSettings["public"]> = {}):
         storage: {
             mode: setting.storage?.mode || "local_indexeddb",
             allowUserProvider: setting.storage?.allowUserProvider === true,
+            autoSyncGeneratedMedia: setting.storage?.autoSyncGeneratedMedia === true,
         },
     };
 }
@@ -1158,6 +1168,7 @@ function normalizePrivateSetting(setting: Partial<AdminSettings["private"]> = {}
             mode: setting.storage?.mode || "local_indexeddb",
             allowUserProvider: setting.storage?.allowUserProvider === true,
             allowUserGlobalProvider: setting.storage?.allowUserGlobalProvider === true,
+            autoSyncGeneratedMedia: setting.storage?.autoSyncGeneratedMedia === true,
             providers: (setting.storage?.providers || []).map(normalizeStorageProvider),
             roundRobinCursor: Number(setting.storage?.roundRobinCursor) || 0,
             capacityCheck: {

@@ -12,7 +12,7 @@ import { createCanvasImageTask, pollCanvasImageTaskStatus, requestImageQuestion,
 import { createCanvasAudioTask, pollCanvasAudioTaskStatus, type CanvasAudioTask } from "@/services/api/audio";
 import { createVideoGenerationTask, pollVideoGenerationTaskStatus, VIDEO_POLL_INTERVAL_MS, type VideoResponse } from "@/services/api/video";
 import { defaultConfig, type AiConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import { collectImageStorageKeys, deleteStoredImages, resolveImageUrl, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
+import { collectImageStorageKeys, deleteStoredImages, loadStorageConfig, resolveImageUrl, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
 import { resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
@@ -1922,10 +1922,10 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         saveAs(node.metadata.content, `canvas-${node.type}-${node.id}.${node.type === CanvasNodeType.Video ? "mp4" : node.type === CanvasNodeType.Audio ? audioExtension(node.metadata.mimeType) : imageExtension(node.metadata.content)}`);
     }, []);
 
-    const uploadNodeVideoToCloud = useCallback(async (node: CanvasNodeData) => {
+    const uploadNodeVideoToCloud = useCallback(async (node: CanvasNodeData, automatic = false) => {
         if (node.type !== CanvasNodeType.Video || !node.metadata?.content || node.metadata.storageKey?.startsWith("server:") || uploadingVideoNodeIdsRef.current.has(node.id)) return;
         uploadingVideoNodeIdsRef.current.add(node.id);
-        const hideLoading = message.loading("正在上传视频至云存储...", 0);
+        const hideLoading = automatic ? () => undefined : message.loading("正在上传视频至云存储...", 0);
         try {
             const videoUrl = await resolveMediaUrl(node.metadata.storageKey, node.metadata.content);
             const uploaded = await uploadRemoteMediaToServer(videoUrl, "canvas-video-" + node.id + ".mp4");
@@ -1941,10 +1941,13 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                     naturalHeight: uploaded.height || item.metadata?.naturalHeight,
                 },
             } : item)));
-            message.success("视频已上传至云存储");
+            if (!automatic) message.success("视频已上传至云存储");
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "";
-            if (errorMessage.includes("服务端对象存储未启用") || errorMessage.includes("用户对象存储配置不完整")) {
+            if (automatic) {
+                // 自动同步失败不能覆盖已生成结果，否则云存储故障会被误判为生成失败。
+                message.warning(`视频已生成，但自动同步失败：${errorMessage || "视频上传失败"}`);
+            } else if (errorMessage.includes("服务端对象存储未启用") || errorMessage.includes("用户对象存储配置不完整")) {
                 message.error("未添加云存储");
             } else {
                 message.error(errorMessage || "视频上传失败");
@@ -1955,10 +1958,10 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         }
     }, [message]);
 
-    const uploadNodeImageToCloud = useCallback(async (node: CanvasNodeData) => {
+    const uploadNodeImageToCloud = useCallback(async (node: CanvasNodeData, automatic = false) => {
         if (!isCanvasImageNodeType(node.type) || !node.metadata?.content || node.metadata.storageKey?.startsWith("server:") || uploadingImageNodeIdsRef.current.has(node.id)) return;
         uploadingImageNodeIdsRef.current.add(node.id);
-        const hideLoading = message.loading("正在上传图片至云存储...", 0);
+        const hideLoading = automatic ? () => undefined : message.loading("正在上传图片至云存储...", 0);
         try {
             const imageUrl = await resolveImageUrl(node.metadata.storageKey, node.metadata.content);
             const uploaded = await uploadRemoteImageToServer(imageUrl, "canvas-image-" + node.id + ".png");
@@ -1974,10 +1977,13 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                     naturalHeight: uploaded.height || item.metadata?.naturalHeight,
                 },
             } : item)));
-            message.success("图片已上传至云存储");
+            if (!automatic) message.success("图片已上传至云存储");
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "";
-            if (errorMessage.includes("服务端对象存储未启用") || errorMessage.includes("用户对象存储配置不完整")) {
+            if (automatic) {
+                // 自动同步失败不能覆盖已生成结果，否则云存储故障会被误判为生成失败。
+                message.warning(`图片已生成，但自动同步失败：${errorMessage || "图片上传失败"}`);
+            } else if (errorMessage.includes("服务端对象存储未启用") || errorMessage.includes("用户对象存储配置不完整")) {
                 message.error("未添加云存储");
             } else {
                 message.error(errorMessage || "图片上传失败");
@@ -1987,6 +1993,43 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             uploadingImageNodeIdsRef.current.delete(node.id);
         }
     }, [message]);
+
+    useEffect(() => {
+        if (!projectLoaded) return;
+        let cancelled = false;
+        void loadStorageConfig()
+            .then((storageConfig) => {
+                if (cancelled || !storageConfig.autoSyncGeneratedMedia) return;
+                nodesRef.current
+                    .filter(
+                        (node) =>
+                            isCanvasImageNodeType(node.type) &&
+                            node.metadata?.status === NODE_STATUS_SUCCESS &&
+                            Boolean(node.metadata.content) &&
+                            !node.metadata.storageKey &&
+                            Boolean(node.metadata.imageTaskId),
+                    )
+                    .forEach((node) => {
+                        void uploadNodeImageToCloud(node, true);
+                    });
+                nodesRef.current
+                    .filter(
+                        (node) =>
+                            node.type === CanvasNodeType.Video &&
+                            node.metadata?.status === NODE_STATUS_SUCCESS &&
+                            Boolean(node.metadata.content) &&
+                            !node.metadata.storageKey &&
+                            Boolean(node.metadata.videoTaskId || node.metadata.videoTaskVideoId),
+                    )
+                    .forEach((node) => {
+                        void uploadNodeVideoToCloud(node, true);
+                    });
+            })
+            .catch(() => undefined);
+        return () => {
+            cancelled = true;
+        };
+    }, [nodes, projectLoaded, uploadNodeImageToCloud, uploadNodeVideoToCloud]);
 
     const saveNodeAsset = useCallback(
         async (node: CanvasNodeData) => {

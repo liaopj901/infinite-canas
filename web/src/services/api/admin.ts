@@ -221,6 +221,7 @@ export type AdminPublicSettings = {
     storage: {
         mode: string;
         allowUserProvider: boolean;
+        autoSyncGeneratedMedia: boolean;
     };
 };
 
@@ -269,6 +270,7 @@ export type AdminPrivateSettings = {
         mode: string;
         allowUserProvider: boolean;
         allowUserGlobalProvider: boolean;
+        autoSyncGeneratedMedia: boolean;
         providers: AdminStorageProvider[];
         roundRobinCursor: number;
         capacityCheck: {
