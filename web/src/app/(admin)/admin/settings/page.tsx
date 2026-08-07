@@ -672,7 +672,6 @@ export default function AdminSettingsPage() {
                                                 {fields.map((field) => {
                                                     const provider = storageProviders[field.name] || emptyS3StorageProvider;
                                                     const isWebDAV = provider.type === "webdav";
-                                                    const blockedByOtherType = storageProviders.some((item: AdminStorageProvider, index: number) => index !== field.name && item.enabled && item.type !== provider.type);
                                                     const weightField = (
                                                         <Col xs={24} md={3}>
                                                             <Form.Item name={[field.name, "weight"]} label="权重">
@@ -724,7 +723,18 @@ export default function AdminSettingsPage() {
                                                                 )}
                                                                 <Col xs={24} md={4}>
                                                                     <Form.Item name={[field.name, "enabled"]} label="启用" valuePropName="checked">
-                                                                        <Switch disabled={blockedByOtherType} />
+                                                                        <Switch
+                                                                            onChange={(checked) => {
+                                                                                if (!checked) return;
+                                                                                const providers = form.getFieldValue(["private", "storage", "providers"]) || [];
+                                                                                const type = form.getFieldValue(["private", "storage", "providers", field.name, "type"]);
+                                                                                providers.forEach((item: AdminStorageProvider, i: number) => {
+                                                                                    if (i !== field.name && item.type !== type) {
+                                                                                        form.setFieldValue(["private", "storage", "providers", i, "enabled"], false);
+                                                                                    }
+                                                                                });
+                                                                            }}
+                                                                        />
                                                                     </Form.Item>
                                                                 </Col>
                                                                 {isWebDAV && weightField}

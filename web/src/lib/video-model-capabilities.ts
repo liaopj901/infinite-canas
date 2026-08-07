@@ -14,6 +14,8 @@ export function supportsVideoFrameReferences(modelName: string) {
         model === "hailuo-02-image-to-video-pro" ||
         model === "kling-v2-1-pro" ||
         model === "kling-v2-5-turbo-image-to-video-pro" ||
+        model === "minimax-h3-image-to-video" ||
+        model === "minimax-h3" ||
         model.includes("doubao-seedance-2-0") ||
         model.includes("doubao-seedance-1-5") ||
         model.includes("doubao-seedance-1-0") ||
