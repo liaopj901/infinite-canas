@@ -131,6 +131,20 @@ git fetch fork local
 git log --oneline --decorate --graph local fork/local -20
 ```
 
+如果首次向空仓库推送时出现 `did not receive expected object` 或 `index-pack failed`，先确认本地是否为浅克隆：
+
+```bash
+git rev-parse --is-shallow-repository
+```
+
+如果结果为 `true`，从标准仓库补齐历史后再推送：
+
+```bash
+git fetch --unshallow origin
+git fsck --full --no-dangling
+git push --no-thin -u fork local:local
+```
+
 ## 推荐的提交边界
 
 二开代码、标准版合并、文档更新分别使用清晰的提交：
