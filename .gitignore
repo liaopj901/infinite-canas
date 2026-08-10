@@ -6,6 +6,7 @@ node_modules/
 data/
 /director/
 /dist/*.tar
+/.playwright-mcp/
 *.log
 *.tsbuildinfo
 .DS_Store

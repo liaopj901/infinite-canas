@@ -16,6 +16,7 @@
 ## 开发文档
 
 - [本地开发](backend/local-development.md)
+- [main 与 local 分支合并流程](development/main-local-merge.md)
 - [接口响应约定](backend/api-response.md)
 - [系统配置数据结构](backend/system-settings.md)
 - [后端数据库说明](backend/backend-database.md)
