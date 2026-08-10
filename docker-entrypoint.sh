@@ -5,7 +5,7 @@ PORT=8080 /app/server &
 API_PID=$!
 
 cd /app/web
-PORT=3000 node server.js &
+PORT=3001 node server.js &
 WEB_PID=$!
 
 shutdown() {

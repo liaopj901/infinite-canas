@@ -19,7 +19,7 @@ docker compose up -d
 启动后访问：
 
 ```text
-http://localhost:3000
+http://localhost:3001
 ```
 
 默认管理员账号：

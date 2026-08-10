@@ -213,6 +213,7 @@ export type AdminPublicModelChannelInfo = {
 export type AdminPublicSettings = {
     modelChannel: AdminPublicModelChannelSettings;
     auth: {
+        requireLogin: boolean;
         allowRegister: boolean;
         linuxDo: {
             enabled: boolean;
@@ -222,6 +223,7 @@ export type AdminPublicSettings = {
         mode: string;
         allowUserProvider: boolean;
         autoSyncGeneratedMedia: boolean;
+        autoSyncLocalGeneratedMedia: boolean;
     };
 };
 
@@ -271,6 +273,7 @@ export type AdminPrivateSettings = {
         allowUserProvider: boolean;
         allowUserGlobalProvider: boolean;
         autoSyncGeneratedMedia: boolean;
+        autoSyncLocalGeneratedMedia: boolean;
         providers: AdminStorageProvider[];
         roundRobinCursor: number;
         capacityCheck: {

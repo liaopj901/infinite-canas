@@ -47,7 +47,7 @@ import { nanoid } from "nanoid";
 import { formatBytes, formatDuration, getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { ImageRequestError, batchCanvasImageTaskStatus, createCanvasImageTask, deleteCanvasImageTask, listCanvasImageTasks, requestEdit, requestGeneration, type CanvasImageTask } from "@/services/api/image";
 import { deleteImageGenerationLogs, fetchImageGenerationLogs, saveImageGenerationLogs } from "@/services/api/generation-logs";
-import { deleteStoredImages, imageToDataUrl, loadStorageConfig, resolveImageUrl, uploadImage, uploadRemoteImageToServer } from "@/services/image-storage";
+import { deleteStoredImages, imageToDataUrl, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadImage, uploadRemoteImageToServer } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
@@ -611,10 +611,10 @@ export default function ImagePage() {
         }
     };
 
-    const autoSyncGeneratedImage = async (image: GeneratedImage, index: number) => {
+    const autoSyncGeneratedImage = async (image: GeneratedImage, index: number, channelMode: AiConfig["channelMode"]) => {
         if (image.storageKey) return image;
         const storageConfig = await loadStorageConfig().catch(() => null);
-        if (!storageConfig?.autoSyncGeneratedMedia) return image;
+        if (!storageConfig || !shouldAutoSyncGeneratedMedia(storageConfig, channelMode)) return image;
         try {
             const uploaded = await uploadRemoteImageToServer(image.dataUrl, "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl));
             return { ...image, dataUrl: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || image.width, height: uploaded.height || image.height, bytes: uploaded.bytes || image.bytes, mimeType: uploaded.mimeType || image.mimeType };
@@ -827,7 +827,7 @@ export default function ImagePage() {
                     }
                     let nextLog = imageLogFromTask(log, task);
                     if (nextLog.status === "成功" && nextLog.images.length) {
-                        const image = await autoSyncGeneratedImage(nextLog.images[0], 0);
+                        const image = await autoSyncGeneratedImage(nextLog.images[0], 0, nextLog.config.channelMode);
                         nextLog = { ...nextLog, images: [image], thumbnails: [image.dataUrl] };
                     }
                     await saveLog(nextLog);
@@ -964,7 +964,7 @@ export default function ImagePage() {
             if (!image) throw new Error("接口没有返回图片");
             const meta = await readImageMeta(image.dataUrl);
             const nextImage: GeneratedImage = { id: image.id, dataUrl: image.dataUrl, durationMs: performance.now() - itemStartedAt, width: meta.width, height: meta.height, bytes: getDataUrlByteSize(image.dataUrl), mimeType: meta.mimeType };
-            const syncedImage = await autoSyncGeneratedImage(nextImage, 0);
+            const syncedImage = await autoSyncGeneratedImage(nextImage, 0, snapshot.requestConfig.channelMode);
             setResults((value) => updateResult(value, resultId, { status: "success", image: syncedImage, durationMs: syncedImage.durationMs }));
             return syncedImage;
         } catch (error) {

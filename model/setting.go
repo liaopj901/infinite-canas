@@ -77,11 +77,15 @@ type PublicStorageSetting struct {
 	Mode                    string `json:"mode"`
 	AllowUserProvider       bool   `json:"allowUserProvider"`
 	AllowUserGlobalProvider bool   `json:"allowUserGlobalProvider"`
-	// 控制图片和视频生成结果是否由前端生成后自动上传对象存储。
+	// 控制云端渠道生成的图片和视频是否由前端自动上传对象存储。
 	AutoSyncGeneratedMedia bool `json:"autoSyncGeneratedMedia"`
+	// 控制本地直连生成的图片和视频是否由前端自动上传对象存储。
+	AutoSyncLocalGeneratedMedia bool `json:"autoSyncLocalGeneratedMedia"`
 }
 
 type PublicAuthSetting struct {
+	// RequireLogin 控制游客是否可以进入创作功能页面，默认关闭以保留本地直连能力。
+	RequireLogin bool                     `json:"requireLogin"`
 	AllowRegister *bool                    `json:"allowRegister"`
 	LinuxDo       PublicLinuxDoAuthSetting `json:"linuxDo"`
 }
@@ -114,12 +118,14 @@ type PrivateStorageSetting struct {
 	Mode                    string                      `json:"mode"`
 	AllowUserProvider       bool                        `json:"allowUserProvider"`
 	AllowUserGlobalProvider bool                        `json:"allowUserGlobalProvider"`
-	// 控制图片和视频生成结果是否由前端生成后自动上传对象存储。
-	AutoSyncGeneratedMedia bool                        `json:"autoSyncGeneratedMedia"`
-	Providers               []StorageProvider           `json:"providers"`
-	RoundRobinCursor        int                         `json:"roundRobinCursor"`
-	CapacityCheck           StorageCapacityCheckSetting `json:"capacityCheck"`
-	CapacityLimitBytes      int64                       `json:"capacityLimitBytes"`
+	// 控制云端渠道生成的图片和视频是否由前端自动上传对象存储。
+	AutoSyncGeneratedMedia bool `json:"autoSyncGeneratedMedia"`
+	// 控制本地直连生成的图片和视频是否由前端自动上传对象存储。
+	AutoSyncLocalGeneratedMedia bool                        `json:"autoSyncLocalGeneratedMedia"`
+	Providers                   []StorageProvider           `json:"providers"`
+	RoundRobinCursor            int                         `json:"roundRobinCursor"`
+	CapacityCheck               StorageCapacityCheckSetting `json:"capacityCheck"`
+	CapacityLimitBytes          int64                       `json:"capacityLimitBytes"`
 }
 
 type StorageProvider struct {

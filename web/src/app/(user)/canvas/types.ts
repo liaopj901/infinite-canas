@@ -44,6 +44,7 @@ export type CanvasNodeMetadata = {
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
+    channelMode?: "local" | "remote";
     channelId?: string;
     size?: string;
     quality?: string;

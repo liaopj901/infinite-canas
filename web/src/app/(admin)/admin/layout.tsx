@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 import { useEffect } from "react";
 
 import { UserStatusActions } from "@/components/layout/user-status-actions";
+import { BRAND_NAME } from "@/constant/brand";
 import { adminLayoutStyle } from "@/lib/app-theme";
 import { useUserStore } from "@/stores/use-user-store";
 
@@ -68,7 +69,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
                 <Flex align="center" gap={12} style={{ height: adminLayoutStyle.brandHeight, padding: "0 20px", borderBottom: `1px solid ${antToken.colorBorderSecondary}` }}>
                     <span aria-hidden style={{ display: "inline-block", width: 30, height: 30, background: antToken.colorText, WebkitMask: "url(/logo.svg) center / contain no-repeat", mask: "url(/logo.svg) center / contain no-repeat" }} />
                     <Typography.Text strong style={{ fontSize: 18, letterSpacing: 0 }}>
-                        无限画布
+                        {BRAND_NAME}
                     </Typography.Text>
                 </Flex>
                 <Menu

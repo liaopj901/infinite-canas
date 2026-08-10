@@ -41,10 +41,10 @@ const emptySettings: AdminSettings = {
             allowCustomChannel: true,
             allowUserRemoteChannel: false,
         },
-        auth: { allowRegister: true, linuxDo: { enabled: false } },
-        storage: { mode: "local_indexeddb", allowUserProvider: false, autoSyncGeneratedMedia: false },
+        auth: { requireLogin: false, allowRegister: true, linuxDo: { enabled: false } },
+        storage: { mode: "local_indexeddb", allowUserProvider: false, autoSyncGeneratedMedia: false, autoSyncLocalGeneratedMedia: false },
     },
-    private: { channels: [], promptSync: { enabled: true, cron: "0 0 * * *" }, aiLog: { localDirectReportEnabled: false, cleanup: { enabled: false, retentionDays: 14, cron: "0 3 * * *" } }, auth: { linuxDo: { clientId: "", clientSecret: "" } }, storage: { mode: "local_indexeddb", allowUserProvider: false, allowUserGlobalProvider: true, autoSyncGeneratedMedia: false, providers: [], roundRobinCursor: 0, capacityCheck: { enabled: false, cron: "0 */6 * * *" }, capacityLimitBytes: 9 * 1024 * 1024 * 1024 } },
+    private: { channels: [], promptSync: { enabled: true, cron: "0 0 * * *" }, aiLog: { localDirectReportEnabled: false, cleanup: { enabled: false, retentionDays: 14, cron: "0 3 * * *" } }, auth: { linuxDo: { clientId: "", clientSecret: "" } }, storage: { mode: "local_indexeddb", allowUserProvider: false, allowUserGlobalProvider: true, autoSyncGeneratedMedia: false, autoSyncLocalGeneratedMedia: false, providers: [], roundRobinCursor: 0, capacityCheck: { enabled: false, cron: "0 */6 * * *" }, capacityLimitBytes: 9 * 1024 * 1024 * 1024 } },
 };
 const emptyChannel: AdminModelChannel = { id: "", protocol: "openai", name: "", baseUrl: "", apiKey: "", models: [], weight: 1, timeout: 600, enabled: true, remark: "" };
 const emptyS3StorageProvider: AdminStorageProvider = { id: "", name: "", type: "s3", endpoint: "", region: "auto", bucket: "", accessKeyId: "", secretAccessKey: "", publicBaseUrl: "", pathPrefix: "canvas", username: "", password: "", weight: 1, enabled: true, ownerUserId: "", capacityBytes: 0, capacityCheckedAt: "", capacityExceeded: false };
@@ -511,6 +511,11 @@ export default function AdminSettingsPage() {
                                         </Form.Item>
                                     </Col>
                                     <Col span={24}>
+                                        <Form.Item name={["public", "auth", "requireLogin"]} label="是否强制登录后使用" extra="开启后，游客仍可访问首页和登录页，画布、生图、视频等功能页面需要先登录" valuePropName="checked">
+                                            <Switch />
+                                        </Form.Item>
+                                    </Col>
+                                    <Col span={24}>
                                         <Form.Item name={["public", "auth", "allowRegister"]} label="是否允许用户注册" extra="关闭后隐藏注册入口，注册接口也会拒绝新用户创建" valuePropName="checked">
                                             <Switch />
                                         </Form.Item>
@@ -649,7 +654,12 @@ export default function AdminSettingsPage() {
                                             </Form.Item>
                                         </Col>
                                         <Col xs={24} md={8}>
-                                            <Form.Item name={["private", "storage", "autoSyncGeneratedMedia"]} label="生成后自动同步至云端" valuePropName="checked" extra="仅影响图片和视频生成结果；关闭后仍可手动同步。">
+                                            <Form.Item name={["private", "storage", "autoSyncGeneratedMedia"]} label="云端渠道生成后自动同步" valuePropName="checked" extra="仅影响云端渠道的图片和视频生成结果；关闭后仍可手动同步。">
+                                                <Switch />
+                                            </Form.Item>
+                                        </Col>
+                                        <Col xs={24} md={8}>
+                                            <Form.Item name={["private", "storage", "autoSyncLocalGeneratedMedia"]} label="本地直连生成后自动同步" valuePropName="checked" extra="仅影响本地直连的图片和视频生成结果；关闭后仍可手动同步。">
                                                 <Switch />
                                             </Form.Item>
                                         </Col>
@@ -1126,6 +1136,7 @@ function normalizePublicSetting(setting: Partial<AdminSettings["public"]> = {}):
             },
         },
         auth: {
+            requireLogin: setting.auth?.requireLogin === true,
             allowRegister: setting.auth?.allowRegister !== false,
             linuxDo: {
                 enabled: setting.auth?.linuxDo?.enabled === true,
@@ -1135,6 +1146,7 @@ function normalizePublicSetting(setting: Partial<AdminSettings["public"]> = {}):
             mode: setting.storage?.mode || "local_indexeddb",
             allowUserProvider: setting.storage?.allowUserProvider === true,
             autoSyncGeneratedMedia: setting.storage?.autoSyncGeneratedMedia === true,
+            autoSyncLocalGeneratedMedia: setting.storage?.autoSyncLocalGeneratedMedia === true,
         },
     };
 }
@@ -1169,6 +1181,7 @@ function normalizePrivateSetting(setting: Partial<AdminSettings["private"]> = {}
             allowUserProvider: setting.storage?.allowUserProvider === true,
             allowUserGlobalProvider: setting.storage?.allowUserGlobalProvider === true,
             autoSyncGeneratedMedia: setting.storage?.autoSyncGeneratedMedia === true,
+            autoSyncLocalGeneratedMedia: setting.storage?.autoSyncLocalGeneratedMedia === true,
             providers: (setting.storage?.providers || []).map(normalizeStorageProvider),
             roundRobinCursor: Number(setting.storage?.roundRobinCursor) || 0,
             capacityCheck: {

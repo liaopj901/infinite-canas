@@ -5,22 +5,29 @@ import { usePathname, useRouter } from "next/navigation";
 
 import { AppTopNav } from "@/components/layout/app-top-nav";
 import { fetchUserConfig } from "@/services/api/user-config";
+import { useConfigStore } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 
 const protectedPrefixes = ["/asset-library"];
+const publicPaths = new Set(["/", "/login"]);
 
 export default function UserLayout({ children }: { children: ReactNode }) {
     const pathname = usePathname();
     const router = useRouter();
+    const publicSettings = useConfigStore((state) => state.publicSettings);
+    const isPublicSettingsReady = useConfigStore((state) => state.isPublicSettingsReady);
     const user = useUserStore((state) => state.user);
     const isReady = useUserStore((state) => state.isReady);
     const wasLoggedOutRef = useRef(false);
-    const isProtectedPage = protectedPrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+    const isPublicPage = publicPaths.has(pathname);
+    const isAlwaysProtected = protectedPrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+    const isProtectedPage = isAlwaysProtected || (!isPublicPage && publicSettings?.auth.requireLogin === true);
+    const isAccessReady = isPublicPage || (isPublicSettingsReady && isReady);
 
     useEffect(() => {
-        if (!isReady || !isProtectedPage || user) return;
+        if (!isAccessReady || !isProtectedPage || user) return;
         router.replace(`/login?redirect=${encodeURIComponent(pathname)}`);
-    }, [isProtectedPage, isReady, pathname, router, user]);
+    }, [isAccessReady, isProtectedPage, pathname, router, user]);
 
     useEffect(() => {
         if (!isReady) return;
@@ -52,7 +59,7 @@ export default function UserLayout({ children }: { children: ReactNode }) {
     return (
         <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
             <AppTopNav />
-            <div className="min-h-0 flex-1 overflow-hidden">{isProtectedPage && (!isReady || !user) ? null : children}</div>
+            <div className="min-h-0 flex-1 overflow-hidden">{!isAccessReady || (isProtectedPage && !user) ? null : children}</div>
         </div>
     );
 }

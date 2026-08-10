@@ -1,10 +1,11 @@
 "use client";
 
-import { Menu } from "lucide-react";
+import { ArrowUpRight, Menu } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { navigationTools, type NavigationToolSlug } from "@/constant/navigation-tools";
+import { BRAND_NAME, NEW_API_DASHBOARD_URL } from "@/constant/brand";
 import { AppConfigModal } from "@/components/layout/app-config-modal";
 import { MobileNavDrawer } from "@/components/layout/mobile-nav-drawer";
 import { UserStatusActions } from "@/components/layout/user-status-actions";
@@ -24,7 +25,7 @@ export function AppTopNav() {
                 <header className="sticky top-0 z-20 h-16 shrink-0 border-b border-stone-200 bg-background/90 backdrop-blur-xl dark:border-stone-800">
                     <div className="mx-auto flex h-full max-w-7xl items-stretch justify-between gap-5 px-6">
                         <div className="flex min-w-0 items-center">
-                            <Link href="/" className="flex h-full shrink-0 items-center gap-2 text-sm font-semibold leading-none tracking-tight text-stone-950 transition hover:text-stone-600 dark:text-stone-100 dark:hover:text-stone-300">
+                            <Link href="/" className="flex h-full shrink-0 items-center gap-2 text-sm font-semibold leading-none tracking-normal text-stone-950 transition hover:text-stone-600 dark:text-stone-100 dark:hover:text-stone-300">
                                 <span
                                     className="size-5 shrink-0 bg-current"
                                     style={{
@@ -32,7 +33,7 @@ export function AppTopNav() {
                                         WebkitMask: "url(/logo.svg) center / contain no-repeat",
                                     }}
                                 />
-                                <span className="text-base font-medium">无限画布</span>
+                                <span className="text-base font-medium">{BRAND_NAME}</span>
                             </Link>
 
                             <button
@@ -69,6 +70,13 @@ export function AppTopNav() {
                         </div>
 
                         <div className="my-auto flex h-9 min-w-0 items-center justify-end gap-2 justify-self-end whitespace-nowrap">
+                            <a
+                                href={NEW_API_DASHBOARD_URL}
+                                className="hidden items-center gap-1 text-sm text-stone-500 transition hover:text-stone-950 sm:inline-flex dark:text-stone-400 dark:hover:text-stone-100"
+                            >
+                                <span>返回 NewAPI</span>
+                                <ArrowUpRight className="size-3.5" aria-hidden="true" />
+                            </a>
                             <UserStatusActions />
                         </div>
                     </div>

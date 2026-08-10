@@ -103,7 +103,7 @@ port_is_used() {
 port_belongs_to_app() {
   local port="$1"
   docker inspect "${CONTAINER_NAME}" \
-    --format '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' \
+    --format '{{(index (index .NetworkSettings.Ports "3001/tcp") 0).HostPort}}' \
     2>/dev/null | grep -qx "${port}"
 }
 
@@ -118,12 +118,12 @@ find_app_port() {
     PORT_CHANGED=1
   fi
 
-  APP_PORT=3000
+  APP_PORT=3001
   while port_is_used "${APP_PORT}"; do
     APP_PORT=$((APP_PORT + 1))
-    [ "${APP_PORT}" -le 3099 ] || fail "3000-3099 端口均被占用。"
+    [ "${APP_PORT}" -le 3099 ] || fail "3001-3099 端口均被占用。"
   done
-  [ "${APP_PORT}" -eq 3000 ] || PORT_CHANGED=1
+  [ "${APP_PORT}" -eq 3001 ] || PORT_CHANGED=1
 }
 
 load_or_create_secrets() {
@@ -310,7 +310,7 @@ confirm_public_network() {
   log "等待公网放行确认"
   printf '应用实际端口：127.0.0.1:%s\n' "${APP_PORT}"
   if [ "${PORT_CHANGED}" -eq 1 ]; then
-    printf '检测到 3000 或原端口被占用，已自动切换到 %s，并已同步更新 Nginx。\n' "${APP_PORT}"
+    printf '检测到 3001 或原端口被占用，已自动切换到 %s，并已同步更新 Nginx。\n' "${APP_PORT}"
   fi
   printf '请在云服务器安全组中放行 TCP 80 和 443。\n'
   printf '不要向公网放行 %s，也不要向公网放行 PostgreSQL 5432。\n' "${APP_PORT}"

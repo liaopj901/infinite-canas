@@ -5,6 +5,7 @@ import localforage from "localforage";
 import { nanoid } from "nanoid";
 import { readImageMeta } from "@/lib/image-utils";
 import { apiGet } from "@/services/api/request";
+import type { AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 
 export type UploadedImage = {
@@ -50,6 +51,7 @@ export type StorageConfig = {
     allowUserProvider: boolean;
     allowUserGlobalProvider: boolean;
     autoSyncGeneratedMedia: boolean;
+    autoSyncLocalGeneratedMedia: boolean;
 };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
@@ -62,6 +64,11 @@ let storageConfigPromise: Promise<StorageConfig> | null = null;
 export function canUseGlobalStorage(config: StorageConfig) {
     const user = useUserStore.getState().user;
     return config.mode === "server_sqlite_s3" && Boolean(user && user.role !== "guest" && (user.role === "admin" || config.allowUserGlobalProvider));
+}
+
+export function shouldAutoSyncGeneratedMedia(config: StorageConfig, channelMode: AiConfig["channelMode"]) {
+    // 必须按生成时的渠道判断，不能让用户后续切换渠道改变历史结果的上传策略。
+    return channelMode === "local" ? config.autoSyncLocalGeneratedMedia : config.autoSyncGeneratedMedia;
 }
 
 function isLocalNetworkHost(hostname: string) {

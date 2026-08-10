@@ -304,7 +304,16 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `mode` | string | 当前存储模式 |
 | `allowUserProvider` | bool | 是否允许用户配置自己的对象存储 |
 | `allowUserGlobalProvider` | bool | 是否允许用户使用管理员配置的全局对象存储 |
-| `autoSyncGeneratedMedia` | bool | 是否自动同步图片和视频生成结果，默认关闭 |
+| `autoSyncGeneratedMedia` | bool | 是否自动同步云端渠道生成的图片和视频，默认关闭 |
+| `autoSyncLocalGeneratedMedia` | bool | 是否自动同步本地直连生成的图片和视频，默认关闭 |
+
+`public.value.auth` 当前字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `requireLogin` | bool | 是否要求登录后才能进入画布、生图、视频等功能页面，默认关闭 |
+| `allowRegister` | bool | 是否允许用户注册，默认允许 |
+| `linuxDo` | object | Linux.do 登录公开配置 |
 
 `modelChannel` 当前字段：
 
@@ -375,7 +384,8 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `mode` | string | 存储模式，系统根据已启用的提供商自动识别 |
 | `allowUserProvider` | bool | 是否允许用户配置自己的对象存储 |
 | `allowUserGlobalProvider` | bool | 是否允许用户使用管理员配置的全局对象存储 |
-| `autoSyncGeneratedMedia` | bool | 是否自动同步图片和视频生成结果，默认关闭 |
+| `autoSyncGeneratedMedia` | bool | 是否自动同步云端渠道生成的图片和视频，默认关闭 |
+| `autoSyncLocalGeneratedMedia` | bool | 是否自动同步本地直连生成的图片和视频，默认关闭 |
 | `providers` | object[] | S3/R2 或 WebDAV 提供商配置 |
 | `capacityCheck` | object | 定时容量统计配置 |
 | `capacityLimitBytes` | number | 对象存储容量上限 |

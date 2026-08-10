@@ -8,11 +8,12 @@ import { ChevronLeft, ChevronRight, Globe2, Home, ImageIcon, Images, Layers3, Li
 import { saveAs } from "file-saver";
 
 import { deleteCanvasProjects, deleteCanvasTasks } from "@/services/api/canvas-tasks";
+import { getCanvasProjectTitle } from "@/constant/brand";
 import { createCanvasImageTask, pollCanvasImageTaskStatus, requestImageQuestion, type CanvasImageTask } from "@/services/api/image";
 import { createCanvasAudioTask, pollCanvasAudioTaskStatus, type CanvasAudioTask } from "@/services/api/audio";
 import { createVideoGenerationTask, pollVideoGenerationTaskStatus, VIDEO_POLL_INTERVAL_MS, type VideoResponse } from "@/services/api/video";
 import { defaultConfig, type AiConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import { collectImageStorageKeys, deleteStoredImages, loadStorageConfig, resolveImageUrl, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
+import { collectImageStorageKeys, deleteStoredImages, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
 import { resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
@@ -1245,7 +1246,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
     }, [applyHistory]);
 
     const createAndOpenProject = useCallback(() => {
-        const id = createProject(`无限画布 ${useCanvasStore.getState().projects.length + 1}`);
+        const id = createProject(getCanvasProjectTitle(useCanvasStore.getState().projects.map(({ title }) => title)));
         router.push(`/canvas/${id}`);
     }, [createProject, router]);
 
@@ -1999,11 +2000,12 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         let cancelled = false;
         void loadStorageConfig()
             .then((storageConfig) => {
-                if (cancelled || !storageConfig.autoSyncGeneratedMedia) return;
+                if (cancelled) return;
                 nodesRef.current
                     .filter(
                         (node) =>
                             isCanvasImageNodeType(node.type) &&
+                            shouldAutoSyncGeneratedMedia(storageConfig, node.metadata?.channelMode || "remote") &&
                             node.metadata?.status === NODE_STATUS_SUCCESS &&
                             Boolean(node.metadata.content) &&
                             !node.metadata.storageKey &&
@@ -2016,6 +2018,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                     .filter(
                         (node) =>
                             node.type === CanvasNodeType.Video &&
+                            shouldAutoSyncGeneratedMedia(storageConfig, node.metadata?.channelMode || "remote") &&
                             node.metadata?.status === NODE_STATUS_SUCCESS &&
                             Boolean(node.metadata.content) &&
                             !node.metadata.storageKey &&
@@ -2864,7 +2867,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         position: isEmptyVideoNode ? sourceNode.position : { x: parent.x + (sourceNode?.width || spec.width) + 96, y: parent.y },
                         width: isEmptyVideoNode ? sourceNode.width : spec.width,
                         height: isEmptyVideoNode ? sourceNode.height : spec.height,
-                        metadata: { prompt: effectivePrompt, cameraControl: sourceNode?.metadata?.cameraControl, status: NODE_STATUS_LOADING, model: videoGenerationConfig.model, channelId: videoGenerationConfig.videoChannelId || videoGenerationConfig.activeChannelId, size: videoGenerationConfig.size, seconds: videoGenerationConfig.videoSeconds, vquality: videoGenerationConfig.vquality, mode: videoGenerationConfig.videoMode, negativePrompt: videoGenerationConfig.videoNegativePrompt, multiShot: videoGenerationConfig.videoMultiShot, shotType: videoGenerationConfig.videoShotType, generateAudio: videoGenerationConfig.videoGenerateAudio, characterOrientation: videoGenerationConfig.videoCharacterOrientation, watermark: videoGenerationConfig.videoWatermark, references: generationReferenceUrls({ ...generationContext, referenceImages: videoReferenceImages, firstFrame, lastFrame }), firstFrameNodeId: sourceNode?.metadata?.firstFrameNodeId, lastFrameNodeId: sourceNode?.metadata?.lastFrameNodeId, klingImageNodeIds: sourceNode?.metadata?.klingImageNodeIds, klingMultiPrompt: sourceNode?.metadata?.klingMultiPrompt, klingElementList: sourceNode?.metadata?.klingElementList, startedAt: generationStartedAt, progress: 0, videoTaskId: clientTaskId },
+                        metadata: { prompt: effectivePrompt, cameraControl: sourceNode?.metadata?.cameraControl, status: NODE_STATUS_LOADING, model: videoGenerationConfig.model, channelMode: videoGenerationConfig.channelMode, channelId: videoGenerationConfig.videoChannelId || videoGenerationConfig.activeChannelId, size: videoGenerationConfig.size, seconds: videoGenerationConfig.videoSeconds, vquality: videoGenerationConfig.vquality, mode: videoGenerationConfig.videoMode, negativePrompt: videoGenerationConfig.videoNegativePrompt, multiShot: videoGenerationConfig.videoMultiShot, shotType: videoGenerationConfig.videoShotType, generateAudio: videoGenerationConfig.videoGenerateAudio, characterOrientation: videoGenerationConfig.videoCharacterOrientation, watermark: videoGenerationConfig.videoWatermark, references: generationReferenceUrls({ ...generationContext, referenceImages: videoReferenceImages, firstFrame, lastFrame }), firstFrameNodeId: sourceNode?.metadata?.firstFrameNodeId, lastFrameNodeId: sourceNode?.metadata?.lastFrameNodeId, klingImageNodeIds: sourceNode?.metadata?.klingImageNodeIds, klingMultiPrompt: sourceNode?.metadata?.klingMultiPrompt, klingElementList: sourceNode?.metadata?.klingElementList, startedAt: generationStartedAt, progress: 0, videoTaskId: clientTaskId },
                     };
                     pendingChildIds = [videoId];
                     setNodes((prev) => (isEmptyVideoNode ? prev.map((node) => (node.id === nodeId ? { ...node, ...videoNode } : node)) : [...prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS } } : node)), videoNode]));
@@ -3295,6 +3298,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         excludeUpstreamText: true,
                         status: "idle",
                         model: generationConfig.model,
+                        channelMode: generationConfig.channelMode,
                         channelId: mode === "video" ? generationConfig.videoChannelId : mode === "audio" ? generationConfig.audioChannelId : generationConfig.imageChannelId,
                         size: stringValue("size") || generationConfig.size,
                     };
@@ -3410,7 +3414,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             const retryVideoTaskId = node.type === CanvasNodeType.Video ? `client_video_task_${node.id}` : "";
             const retryImageTaskId = isCanvasImageNodeType(node.type) ? `client_image_task_${node.id}` : "";
             const retryAudioTaskId = node.type === CanvasNodeType.Audio ? `client_audio_task_${node.id}` : "";
-            setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_LOADING, errorDetails: undefined, content: undefined, storageKey: "", progress: 0, startedAt: retryStartedAt, ...(item.type === CanvasNodeType.Video ? { videoTaskId: retryVideoTaskId, videoTaskVideoId: undefined } : {}), ...(isCanvasImageNodeType(item.type) ? { imageTaskId: retryImageTaskId, imageTaskResultId: undefined } : {}), ...(item.type === CanvasNodeType.Audio ? { audioTaskId: retryAudioTaskId, audioTaskResultId: undefined } : {}) } } : item)));
+            setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_LOADING, errorDetails: undefined, content: undefined, storageKey: "", progress: 0, startedAt: retryStartedAt, ...((item.type === CanvasNodeType.Video || isCanvasImageNodeType(item.type)) ? { channelMode: generationConfig.channelMode } : {}), ...(item.type === CanvasNodeType.Video ? { videoTaskId: retryVideoTaskId, videoTaskVideoId: undefined } : {}), ...(isCanvasImageNodeType(item.type) ? { imageTaskId: retryImageTaskId, imageTaskResultId: undefined } : {}), ...(item.type === CanvasNodeType.Audio ? { audioTaskId: retryAudioTaskId, audioTaskResultId: undefined } : {}) } } : item)));
 
             try {
                 if (node.type === CanvasNodeType.Text) {
@@ -3441,7 +3445,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
                 const task = await createCanvasImageTask({ ...generationConfig, quality: isPanorama && generationConfig.quality === "auto" ? "medium" : generationConfig.quality }, requestPrompt, useReferenceImages ? retryImages : [], { nodeId: node.id, sourceId: projectId, clientTaskId: retryImageTaskId });
                 const generationMetadata = savedImageMetadata?.generationType
-                    ? { generationType: savedImageMetadata.generationType, model: generationConfig.model, channelId: generationConfig.imageChannelId || generationConfig.activeChannelId, size: generationConfig.size, quality: generationConfig.quality, count: savedImageMetadata.count || 1, references: savedImageMetadata.references }
+                    ? { generationType: savedImageMetadata.generationType, model: generationConfig.model, channelMode: generationConfig.channelMode, channelId: generationConfig.imageChannelId || generationConfig.activeChannelId, size: generationConfig.size, quality: generationConfig.quality, count: savedImageMetadata.count || 1, references: savedImageMetadata.references }
                     : buildImageGenerationMetadata(useReferenceImages ? "edit" : "generation", generationConfig, 1, retryImages);
                 setNodes((prev) =>
                     prev.map((item) =>
@@ -4419,6 +4423,7 @@ function buildImageGenerationMetadata(type: CanvasImageGenerationType, config: A
     return {
         generationType: type,
         model: config.model,
+        channelMode: config.channelMode,
         channelId: config.imageChannelId || config.activeChannelId,
         size: config.size,
         quality: config.quality,
@@ -4579,6 +4584,7 @@ function applyCanvasVideoTaskUpdate(nodes: CanvasNodeData[], nodeId: string, tas
             status: failed ? NODE_STATUS_ERROR : completed ? NODE_STATUS_SUCCESS : NODE_STATUS_LOADING,
             errorDetails: failed ? task.error?.message || (completed ? "视频生成完成但没有返回视频地址" : "视频生成失败") : undefined,
             model: task.model || config.model,
+            channelMode: node.metadata?.channelMode || config.channelMode,
             size: task.size || node.metadata?.size || config.size,
             seconds: task.seconds || node.metadata?.seconds || config.videoSeconds,
             vquality: node.metadata?.vquality || config.vquality,

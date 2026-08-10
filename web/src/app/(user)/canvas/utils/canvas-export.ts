@@ -1,12 +1,13 @@
 import { saveAs } from "file-saver";
 
+import { BRAND_NAME } from "@/constant/brand";
 import { createZip } from "@/lib/zip";
 import { getMediaBlob } from "@/services/file-storage";
 import { getImageBlob } from "@/services/image-storage";
 import type { CanvasExportAsset, CanvasExportFile } from "../export-types";
 import type { CanvasProject } from "../stores/use-canvas-store";
 
-export async function exportCanvasProjects(projects: CanvasProject[], fileName = "无限画布") {
+export async function exportCanvasProjects(projects: CanvasProject[], fileName = BRAND_NAME) {
     const zipFiles: { name: string; data: BlobPart }[] = [];
     const exportedProjects = await Promise.all(
         projects.map(async (project) => {

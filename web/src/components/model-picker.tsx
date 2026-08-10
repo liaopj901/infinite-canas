@@ -23,9 +23,16 @@ export function ModelPicker({ config, value, channelId, capability, onChange, cl
     const pickerId = useId();
     const [open, setOpen] = useState(false);
     const channelOptions = useMemo(() => {
+        const publicModels = new Set(config.models);
         const channels =
             config.channelMode === "remote"
-                ? config.publicChannels.map((channel) => ({ id: channel.id, name: channel.name || "云端渠道", baseUrl: channel.baseUrl, models: channel.models }))
+                ? config.publicChannels.map((channel) => ({
+                    id: channel.id,
+                    name: channel.name || "云端渠道",
+                    baseUrl: channel.baseUrl,
+                    // 展示范围必须与有效配置一致，否则选中未公开模型后会立即回退。
+                    models: (channel.models || []).filter((model) => publicModels.has(model)),
+                }))
                 : normalizeLocalChannels(config).map((channel) => ({ id: channel.id, name: channel.name || "本地渠道", baseUrl: channel.baseUrl, models: channel.models }));
         const models = channels.flatMap((channel) => (channel.models ?? []).map((model) => ({ key: `${channel.id}::${model}`, channelId: channel.id, channelName: channel.name, model })));
         if (!capability) return models;

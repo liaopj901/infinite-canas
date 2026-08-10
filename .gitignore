@@ -5,6 +5,7 @@ node_modules/
 !.env.example
 data/
 /director/
+/dist/*.tar
 *.log
 *.tsbuildinfo
 .DS_Store
