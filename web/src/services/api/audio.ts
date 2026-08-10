@@ -1,9 +1,12 @@
 import axios from "axios";
+import { nanoid } from "nanoid";
 
 import { audioMimeType, normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
-import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
+import { isMimoPresetTtsModel, isMimoTtsModel, isMimoVoiceCloneModel, isMimoVoiceDesignModel, normalizeMimoTtsFormat, normalizeMimoTtsVoice } from "@/lib/mimo-tts";
+import { resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { buildApiUrl, channelIdForActiveModel, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
+import type { ReferenceAudio } from "@/types/media";
 
 export type CanvasAudioTask = {
     id: string;
@@ -23,6 +26,8 @@ export type CanvasAudioTask = {
     error_detail?: string;
 };
 export type CanvasAudioTaskOptions = { nodeId?: string; sourceId?: string; clientTaskId?: string };
+
+type MiMoAudioResponse = { choices?: Array<{ message?: { audio?: { data?: string } } }> };
 
 function usesAccountProxy(config: AiConfig) {
     const token = useUserStore.getState().token;
@@ -61,25 +66,21 @@ function refreshRemoteUser(config: AiConfig) {
     if (usesAccountProxy(config)) void useUserStore.getState().hydrateUser();
 }
 
-export async function requestAudioGeneration(config: AiConfig, prompt: string): Promise<Blob> {
+export async function requestAudioGeneration(config: AiConfig, prompt: string, referenceAudio?: ReferenceAudio): Promise<Blob> {
     const model = (config.model || config.audioModel).trim();
     assertAudioConfig(config, model);
-    const format = normalizeAudioFormatValue(config.audioFormat);
-    const instructions = config.audioInstructions.trim();
 
     try {
-        const response = await axios.post<Blob>(
-            aiApiUrl(config, "/audio/speech"),
-            {
-                model,
-                input: prompt,
-                voice: normalizeAudioVoiceValue(config.audioVoice),
-                response_format: format,
-                speed: Number(normalizeAudioSpeedValue(config.audioSpeed)),
-                ...(instructions ? { instructions } : {}),
-            },
-            { headers: aiHeaders(config), responseType: "blob" },
-        );
+        if (isMimoTtsModel(model) && !usesAccountProxy(config)) {
+            const format = normalizeMimoTtsFormat(config.mimoTtsFormat);
+            const body = await buildMiMoNativeRequest(config, model, prompt, referenceAudio);
+            const response = await axios.post<MiMoAudioResponse>(aiApiUrl(config, "/chat/completions"), body, { headers: aiHeaders(config) });
+            return decodeMiMoAudio(response.data, format);
+        }
+
+        const format = isMimoTtsModel(model) ? normalizeMimoTtsFormat(config.mimoTtsFormat) : normalizeAudioFormatValue(config.audioFormat);
+        const body = await buildAudioSpeechRequest(config, model, prompt, referenceAudio);
+        const response = await axios.post<Blob>(aiApiUrl(config, "/audio/speech"), body, { headers: aiHeaders(config), responseType: "blob" });
         await assertAudioBlob(response.data);
         refreshRemoteUser(config);
         return response.data.type.startsWith("audio/") ? response.data : new Blob([response.data], { type: audioMimeType(format) });
@@ -93,12 +94,32 @@ export async function storeGeneratedAudio(blob: Blob, format = "mp3"): Promise<U
     return uploadMediaFile(audio, "audio");
 }
 
-export async function createCanvasAudioTask(config: AiConfig, prompt: string, options: CanvasAudioTaskOptions = {}) {
-    if (!usesAccountProxy(config)) throw new Error("请先登录后再使用任务恢复");
+export async function createCanvasAudioTask(config: AiConfig, prompt: string, options: CanvasAudioTaskOptions = {}, referenceAudio?: ReferenceAudio): Promise<CanvasAudioTask> {
     const model = (config.model || config.audioModel).trim();
     assertAudioConfig(config, model);
-    const format = normalizeAudioFormatValue(config.audioFormat);
-    const instructions = config.audioInstructions.trim();
+
+    if (!usesAccountProxy(config)) {
+        const blob = await requestAudioGeneration(config, prompt, referenceAudio);
+        const format = isMimoTtsModel(model) ? normalizeMimoTtsFormat(config.mimoTtsFormat) : normalizeAudioFormatValue(config.audioFormat);
+        const stored = await storeGeneratedAudio(blob, format);
+        const now = new Date().toISOString();
+        return {
+            id: options.clientTaskId || `local_audio_task_${nanoid()}`,
+            status: "completed",
+            progress: 100,
+            url: stored.url,
+            audio_url: stored.url,
+            storageKey: stored.storageKey,
+            mimeType: stored.mimeType,
+            bytes: stored.bytes,
+            started_at: now,
+            startedAt: now,
+            created_at: now,
+            createdAt: now,
+            completed_at: now,
+        };
+    }
+
     const response = await fetch("/api/v1/canvas/audio-tasks", {
         method: "POST",
         headers: aiHeaders(config),
@@ -108,14 +129,7 @@ export async function createCanvasAudioTask(config: AiConfig, prompt: string, op
             sourceId: options.sourceId || "",
             clientTaskId: options.clientTaskId || "",
             prompt,
-            request: {
-                model,
-                input: prompt,
-                voice: normalizeAudioVoiceValue(config.audioVoice),
-                response_format: format,
-                speed: Number(normalizeAudioSpeedValue(config.audioSpeed)),
-                ...(instructions ? { instructions } : {}),
-            },
+            request: await buildAudioSpeechRequest(config, model, prompt, referenceAudio),
         }),
     });
     if (!response.ok) throw new Error(await readFetchError(response, "音频任务创建失败"));
@@ -137,10 +151,108 @@ export async function pollCanvasAudioTaskStatus(taskId: string): Promise<CanvasA
     return payload.data;
 }
 
+async function buildAudioSpeechRequest(config: AiConfig, model: string, prompt: string, referenceAudio?: ReferenceAudio) {
+    if (isMimoTtsModel(model)) {
+        const instructions = config.audioInstructions.trim();
+        return {
+            model,
+            input: prompt,
+            ...(isMimoPresetTtsModel(model) ? { voice: normalizeMimoTtsVoice(config.mimoTtsVoice) } : {}),
+            ...(isMimoVoiceDesignModel(model) ? { mimo_voice_design_prompt: config.mimoVoiceDesignPrompt.trim() } : {}),
+            ...(isMimoVoiceCloneModel(model) ? { mimo_voice_clone_audio: await referenceAudioDataUrl(referenceAudio) } : {}),
+            ...((isMimoPresetTtsModel(model) || isMimoVoiceCloneModel(model)) && instructions ? { instructions } : {}),
+            response_format: normalizeMimoTtsFormat(config.mimoTtsFormat),
+        };
+    }
+
+    const instructions = config.audioInstructions.trim();
+    return {
+        model,
+        input: prompt,
+        voice: normalizeAudioVoiceValue(config.audioVoice),
+        response_format: normalizeAudioFormatValue(config.audioFormat),
+        speed: Number(normalizeAudioSpeedValue(config.audioSpeed)),
+        ...(instructions ? { instructions } : {}),
+    };
+}
+
+async function buildMiMoNativeRequest(config: AiConfig, model: string, prompt: string, referenceAudio?: ReferenceAudio) {
+    const messages: Array<{ role: "user" | "assistant"; content: string }> = [];
+    const instructions = config.audioInstructions.trim();
+    if (isMimoVoiceDesignModel(model)) {
+        const description = config.mimoVoiceDesignPrompt.trim();
+        if (!description) throw new Error("请填写音色描述");
+        messages.push({ role: "user", content: description });
+    } else if (instructions && (isMimoPresetTtsModel(model) || isMimoVoiceCloneModel(model))) {
+        messages.push({ role: "user", content: instructions });
+    }
+    messages.push({ role: "assistant", content: prompt });
+
+    return {
+        model,
+        messages,
+        audio: {
+            format: normalizeMimoTtsFormat(config.mimoTtsFormat),
+            ...(isMimoPresetTtsModel(model) ? { voice: normalizeMimoTtsVoice(config.mimoTtsVoice) } : {}),
+            ...(isMimoVoiceCloneModel(model) ? { voice: await referenceAudioDataUrl(referenceAudio) } : {}),
+        },
+    };
+}
+
+async function referenceAudioDataUrl(referenceAudio?: ReferenceAudio) {
+    if (!referenceAudio) throw new Error("请连接并选择参考音频节点");
+    const url = await resolveMediaUrl(referenceAudio.storageKey, referenceAudio.url);
+    if (!url) throw new Error("参考音频不可用");
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`读取参考音频失败（${response.status}）`);
+    const blob = await response.blob();
+    const mimeType = normalizeCloneMimeType(blob.type) || normalizeCloneMimeType(referenceAudio.type);
+    if (!mimeType) throw new Error("参考音频仅支持 MP3 或 WAV");
+    const base64 = await blobToBase64(blob);
+    if (base64.length > 10 * 1024 * 1024) throw new Error("参考音频 Base64 编码后不能超过 10MB");
+    return `data:${mimeType};base64,${base64}`;
+}
+
+function normalizeCloneMimeType(value: string) {
+    const type = value.trim().toLowerCase().split(";")[0];
+    if (type === "audio/mpeg" || type === "audio/mp3") return "audio/mpeg";
+    if (type === "audio/wav" || type === "audio/x-wav" || type === "audio/wave") return "audio/wav";
+    return "";
+}
+
+function blobToBase64(blob: Blob) {
+    return new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("读取参考音频失败"));
+        reader.onload = () => {
+            const value = typeof reader.result === "string" ? reader.result : "";
+            const separator = value.indexOf(",");
+            resolve(separator >= 0 ? value.slice(separator + 1) : value);
+        };
+        reader.readAsDataURL(blob);
+    });
+}
+
+function decodeMiMoAudio(payload: MiMoAudioResponse, format: string) {
+    const data = payload.choices?.[0]?.message?.audio?.data?.trim() || "";
+    if (!data) throw new Error("MiMo 没有返回音频数据");
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return new Blob([bytes], { type: audioMimeType(format) });
+}
+
 function assertAudioConfig(config: AiConfig, model: string) {
     if (!model) throw new Error("请先配置音频模型");
-    if (config.channelMode === "local" && !config.baseUrl.trim()) throw new Error("请先配置 Base URL");
-    if (config.channelMode === "local" && !config.apiKey.trim()) throw new Error("请先配置 API Key");
+    if (config.channelMode !== "local") return;
+    if (!isMimoTtsModel(model)) {
+        if (!config.baseUrl.trim()) throw new Error("请先配置 Base URL");
+        if (!config.apiKey.trim()) throw new Error("请先配置 API Key");
+        return;
+    }
+    const channel = localChannelForActiveModel(config);
+    if (!(channel?.baseUrl || config.baseUrl).trim()) throw new Error("请先配置 Base URL");
+    if (!(channel?.apiKey || config.apiKey).trim()) throw new Error("请先配置 API Key");
 }
 
 async function assertAudioBlob(blob: Blob) {

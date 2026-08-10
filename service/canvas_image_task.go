@@ -115,6 +115,9 @@ func CanvasImageTaskResponse(task model.CanvasImageTask) map[string]any {
 	if task.ImageURL != "" {
 		result["url"] = task.ImageURL
 		result["image_url"] = task.ImageURL
+		if len(task.ImageURLs) > 0 {
+			result["image_urls"] = task.ImageURLs
+		}
 		result["storageKey"] = task.StorageKey
 		result["width"] = task.Width
 		result["height"] = task.Height

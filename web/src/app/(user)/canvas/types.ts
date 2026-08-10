@@ -60,6 +60,10 @@ export type CanvasNodeMetadata = {
     audioFormat?: string;
     audioSpeed?: string;
     audioInstructions?: string;
+    mimoTtsVoice?: string;
+    mimoTtsFormat?: string;
+    mimoVoiceDesignPrompt?: string;
+    mimoVoiceCloneAudioNodeId?: string;
     references?: string[];
     naturalWidth?: number;
     naturalHeight?: number;

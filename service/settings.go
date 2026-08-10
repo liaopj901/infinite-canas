@@ -481,6 +481,11 @@ func resolveAdminChannel(index *int, channel model.ModelChannel) (model.ModelCha
 }
 
 func fetchAdminChannelModels(channel model.ModelChannel) ([]string, error) {
+	if IsMiMoChannel(channel) {
+		result := MiMoModels()
+		sort.Strings(result)
+		return result, nil
+	}
 	if isKIEAdminChannel(channel) {
 		result := kieMarketModels()
 		sort.Strings(result)
@@ -536,6 +541,7 @@ func kieMarketModels() []string {
 		"seedream/5-lite-image-to-image",
 		"seedream/5-pro-text-to-image",
 		"seedream/5-pro-image-to-image",
+		"seedream/5-pro-layer-decomposition",
 		"z-image",
 		"nano-banana-2",
 		"nano-banana-2-lite",
@@ -645,6 +651,9 @@ func testAdminChannelModel(channel model.ModelChannel, modelName string) (string
 	if strings.TrimSpace(modelName) == "" {
 		return "", errors.New("缺少模型名称")
 	}
+	if IsMiMoTTSModelName(modelName) {
+		return testMiMoTTSChannelModel(channel, modelName)
+	}
 	body, _ := json.Marshal(map[string]any{
 		"model": modelName,
 		"messages": []map[string]string{{
@@ -677,6 +686,48 @@ func testAdminChannelModel(channel model.ModelChannel, modelName string) (string
 	_ = json.Unmarshal(responseBody, &payload)
 	if len(payload.Choices) > 0 && strings.TrimSpace(payload.Choices[0].Message.Content) != "" {
 		return payload.Choices[0].Message.Content, nil
+	}
+	return "ok", nil
+}
+
+func testMiMoTTSChannelModel(channel model.ModelChannel, modelName string) (string, error) {
+	if strings.EqualFold(strings.TrimSpace(modelName), "mimo-v2.5-tts-voiceclone") {
+		return "MiMo VoiceClone 需要画布连接 MP3/WAV 参考音频，后台不发送克隆样本，因此未执行上游生成测试。", nil
+	}
+	messages := []map[string]string{{"role": "assistant", "content": "你好，这是语音模型测试。"}}
+	audio := map[string]any{"format": "wav"}
+	if strings.EqualFold(strings.TrimSpace(modelName), "mimo-v2.5-tts-voicedesign") {
+		messages = append([]map[string]string{{"role": "user", "content": "自然清晰的年轻女声"}}, messages...)
+	} else {
+		audio["voice"] = "冰糖"
+	}
+	body, _ := json.Marshal(map[string]any{"model": modelName, "messages": messages, "audio": audio})
+	request, err := http.NewRequest(http.MethodPost, BuildModelChannelURL(channel, "/chat/completions"), strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+channel.APIKey)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := adminModelHTTPClient.Do(request)
+	if err != nil {
+		return "", safeMessageError{message: "测试失败：上游接口无响应或网络不可达"}
+	}
+	defer response.Body.Close()
+	responseBody, _ := io.ReadAll(response.Body)
+	if response.StatusCode >= http.StatusBadRequest {
+		return "", readAdminChannelError(responseBody, response.StatusCode, "测试失败")
+	}
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Audio *struct {
+					Data string `json:"data"`
+				} `json:"audio"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(responseBody, &payload) != nil || len(payload.Choices) == 0 || payload.Choices[0].Message.Audio == nil || strings.TrimSpace(payload.Choices[0].Message.Audio.Data) == "" {
+		return "", safeMessageError{message: "测试失败：MiMo TTS 未返回音频数据"}
 	}
 	return "ok", nil
 }

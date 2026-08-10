@@ -341,6 +341,15 @@ func apimartVideoConfig(modelName string) apimartInputConfig {
 		config.aspectField = "aspect_ratio"
 		config.videoRefField = "video_urls"
 		config.videoRefKind = "array"
+	case strings.Contains(model, "flux-3-video"):
+		config.aspectField = "aspect_ratio"
+		config.hasResolution = true
+		config.resolutionCase = "video"
+		config.maxImageRefs = 10
+		config.imageRefField = "image_urls"
+		config.imageRefKind = "array"
+		config.videoRefField = "video_url"
+		config.videoRefKind = "single"
 	}
 	return config
 }
@@ -559,6 +568,38 @@ func normalizeAPIMartImageCount(payload map[string]any, config apimartInputConfi
 
 func applyAPIMartVideoDefaults(payload map[string]any, modelName string) {
 	model := normalizeAPIMartModelName(modelName)
+	if model == "doubao-seedance-2.5" {
+		switch strings.ToLower(strings.TrimSpace(toStringSafe(payload["resolution"]))) {
+		case "1080p", "1080", "2k", "4k":
+			payload["resolution"] = "720p"
+		}
+		if !isEmptyValue(payload["duration"]) {
+			duration := normalizeAPIMartInt(payload["duration"])
+			if duration == -1 {
+			} else if duration < 4 {
+				duration = 4
+			} else if duration > 30 {
+				duration = 30
+			}
+			payload["duration"] = duration
+		}
+	}
+	if model == "flux-3-video" {
+		switch strings.ToLower(strings.TrimSpace(toStringSafe(payload["resolution"]))) {
+		case "360p", "360", "480p", "480":
+			payload["resolution"] = "720p"
+		}
+		if !isEmptyValue(payload["duration"]) {
+			duration := normalizeAPIMartInt(payload["duration"])
+			if duration < 5 {
+				duration = 5
+			}
+			if duration > 20 {
+				duration = 20
+			}
+			payload["duration"] = duration
+		}
+	}
 	if model == "minimax-h3" {
 		switch toStringSafe(payload["resolution"]) {
 		case "480p", "720p", "768p":

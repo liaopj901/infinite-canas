@@ -403,7 +403,7 @@ func resolveKIEFrameReferenceField(modelName string, config kieInputConfig, sour
 
 func isKIEModelNamedFrame(modelName string) bool {
 	modelName = strings.ToLower(strings.TrimSpace(modelName))
-	return modelName == "bytedance/seedance-2" || modelName == "bytedance/seedance-2-fast" || modelName == "bytedance/seedance-2-mini" || modelName == "wan/2-7-image-to-video"
+	return modelName == "bytedance/seedance-2" || modelName == "bytedance/seedance-2-fast" || modelName == "bytedance/seedance-2-mini" || modelName == "bytedance/seedance-2-5" || modelName == "wan/2-7-image-to-video"
 }
 
 func isKIEModelTailFrame(modelName string) bool {
@@ -865,6 +865,9 @@ func normalizeKIEResolutionValue(value string, resolutionKind string) string {
 	}
 	if resolutionKind == "minimax_h3_video" {
 		return normalizeKIEMiniMaxH3VideoResolution(value)
+	}
+	if resolutionKind == "seedance_2_5_video" {
+		return normalizeKIESeedance25VideoResolution(value)
 	}
 	if resolutionKind == "image" {
 		return normalizeKIEImageResolution(value)

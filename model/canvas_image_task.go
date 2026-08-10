@@ -21,8 +21,9 @@ type CanvasImageTask struct {
 	ResponseBody    string `json:"responseBody" gorm:"type:text"`
 	Error           string `json:"error" gorm:"type:text"`
 	ErrorDetail     string `json:"errorDetail" gorm:"type:text"`
-	ImageURL        string `json:"imageUrl" gorm:"type:text"`
-	StorageKey      string `json:"storageKey"`
+	ImageURL        string   `json:"imageUrl" gorm:"type:text"`
+	ImageURLs       []string `json:"imageUrls" gorm:"serializer:json"`
+	StorageKey      string   `json:"storageKey"`
 	Width           int    `json:"width"`
 	Height          int    `json:"height"`
 	MimeType        string `json:"mimeType"`

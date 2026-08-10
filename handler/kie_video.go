@@ -233,6 +233,7 @@ func isKIEFrontendOnlyField(key string) bool {
 
 func normalizeKIEInputFields(input map[string]any, modelName string) {
 	config := kieModelInputConfig(modelName)
+	layerSize, layerQuality := input["size"], input["quality"]
 
 	if value, ok := input["resolution_name"]; ok {
 		if !isEmptyValue(value) {
@@ -283,6 +284,10 @@ func normalizeKIEInputFields(input map[string]any, modelName string) {
 				delete(input, key)
 			}
 		}
+	}
+	if isKIESeedreamLayerDecompositionModel(modelName) {
+		normalizeKIESeedreamLayerDecompositionInput(input, layerSize, layerQuality)
+		return
 	}
 
 	if value, ok := input["resolution"]; ok {
@@ -362,6 +367,41 @@ func normalizeKIEInputFields(input map[string]any, modelName string) {
 
 	applyKIEModelDefaults(input, modelName)
 
+	for key := range input {
+		if isKIEFrontendOnlyField(key) {
+			delete(input, key)
+		}
+	}
+}
+
+func isKIESeedreamLayerDecompositionModel(modelName string) bool {
+	return strings.EqualFold(strings.TrimSpace(modelName), "seedream/5-pro-layer-decomposition")
+}
+
+func normalizeKIESeedreamLayerDecompositionInput(input map[string]any, size any, quality any) {
+	clearKIEReferenceAliases(input, "image_url")
+	resolution := strings.ToLower(strings.TrimSpace(toStringSafe(size)))
+	switch resolution {
+	case "1k", "1.5k", "2k":
+		input["size"] = strings.ToUpper(resolution)
+	case "auto":
+		input["size"] = "auto"
+	default:
+		switch strings.ToLower(strings.TrimSpace(toStringSafe(quality))) {
+		case "low":
+			input["size"] = "1K"
+		case "medium":
+			input["size"] = "1.5K"
+		case "high":
+			input["size"] = "2K"
+		default:
+			input["size"] = "auto"
+		}
+	}
+	input["output_format"] = "png"
+	for _, key := range []string{"quality", "ratio", "aspect_ratio", "image_size", "resolution", "image_resolution", "n", "num_images", "max_images", "actual_image_count"} {
+		delete(input, key)
+	}
 	for key := range input {
 		if isKIEFrontendOnlyField(key) {
 			delete(input, key)
@@ -495,6 +535,16 @@ func normalizeKIEMiniMaxH3VideoResolution(value string) string {
 		return "2K"
 	default:
 		return value
+	}
+}
+
+func normalizeKIESeedance25VideoResolution(value string) string {
+	value = strings.ReplaceAll(strings.TrimSpace(value), " ", "")
+	switch strings.ToLower(value) {
+	case "1080", "1080p", "2k", "4k":
+		return "720p"
+	default:
+		return normalizeKIEResolution(value)
 	}
 }
 
@@ -721,8 +771,8 @@ func applyKIEVideoGenerateAudioInput(input map[string]any, modelName string) {
 		input["sound"] = enabled
 	case "kling-3.0/video":
 		input["sound"] = enabled
-	case "bytedance/seedance-2", "bytedance/seedance-2-fast", "bytedance/seedance-2-mini", "bytedance/seedance-1.5-pro", "bytedance/seedance-1-5-pro":
-		input["generate_audio"] = enabled
+	case "bytedance/seedance-2", "bytedance/seedance-2-fast", "bytedance/seedance-2-mini", "bytedance/seedance-1.5-pro", "bytedance/seedance-1-5-pro", "bytedance/seedance-2-5":
+    	input["generate_audio"] = enabled
 	case "wan/2-6-flash-image-to-video", "wan/2-6-flash-video-to-video":
 		input["audio"] = enabled
 	}
@@ -741,7 +791,7 @@ func validateKIERequiredInputs(input map[string]any, modelName string) error {
 		return requireKIEAnyInput(input, "input_urls")
 	case "google/nano-banana-edit", "grok-imagine/image-to-image", "seedream/4.5-edit", "seedream/5-lite-image-to-image", "seedream/5-pro-image-to-image", "bytedance/seedream-v4-edit":
 		return requireKIEAnyInput(input, "image_urls")
-	case "qwen/image-to-image", "qwen/image-edit", "qwen2/image-edit", "ideogram/v3-remix":
+	case "qwen/image-to-image", "qwen/image-edit", "qwen2/image-edit", "ideogram/v3-remix", "seedream/5-pro-layer-decomposition":
 		return requireKIEAnyInput(input, "image_url")
 	case "ideogram/character":
 		return requireKIEAnyInput(input, "reference_image_urls")
@@ -844,6 +894,7 @@ func kieModelInputConfig(modelName string) kieInputConfig {
 		"bytedance/seedance-2":                 {aspectField: "aspect_ratio", durationKind: "number", hasResolution: true, imageRefField: "reference_image_urls", imageRefKind: "array", videoRefField: "reference_video_urls", videoRefKind: "array", audioRefField: "reference_audio_urls", audioRefKind: "array"},
 		"bytedance/seedance-2-fast":            {aspectField: "aspect_ratio", durationKind: "number", hasResolution: true, imageRefField: "reference_image_urls", imageRefKind: "array", videoRefField: "reference_video_urls", videoRefKind: "array", audioRefField: "reference_audio_urls", audioRefKind: "array"},
 		"bytedance/seedance-2-mini":            {aspectField: "aspect_ratio", durationKind: "number", hasResolution: true, imageRefField: "reference_image_urls", imageRefKind: "array", videoRefField: "reference_video_urls", videoRefKind: "array", audioRefField: "reference_audio_urls", audioRefKind: "array"},
+		"bytedance/seedance-2-5":               {aspectField: "aspect_ratio", durationKind: "number", durationMin: 4, durationMax: 30, hasResolution: true, resolutionKind: "seedance_2_5_video", imageRefField: "reference_image_urls", imageRefKind: "array", videoRefField: "reference_video_urls", videoRefKind: "array", audioRefField: "reference_audio_urls", audioRefKind: "array"},
 		"bytedance/v1-lite-image-to-video":     {durationKind: "string", hasResolution: true, imageRefField: "image_url", imageRefKind: "single"},
 		"bytedance/v1-lite-text-to-video":      {aspectField: "aspect_ratio", durationKind: "string", hasResolution: true},
 		"bytedance/v1-pro-fast-image-to-video": {durationKind: "string", hasResolution: true, imageRefField: "image_url", imageRefKind: "single"},
@@ -947,9 +998,10 @@ func kieModelInputConfig(modelName string) kieInputConfig {
 		"seedream/4.5-text-to-image":     {aspectField: "aspect_ratio", hasQuality: true},
 		"seedream/5-lite-image-to-image": {aspectField: "aspect_ratio", hasQuality: true, imageRefField: "image_urls", imageRefKind: "array"},
 		"seedream/5-lite-text-to-image":  {aspectField: "aspect_ratio", hasQuality: true},
-		"seedream/5-pro-text-to-image":   {aspectField: "aspect_ratio", hasQuality: true},
-		"seedream/5-pro-image-to-image":  {aspectField: "aspect_ratio", hasQuality: true, imageRefField: "image_urls", imageRefKind: "array"},
-		"topaz/image-upscale":            {imageRefField: "image_url", imageRefKind: "single"},
+		"seedream/5-pro-text-to-image":        {aspectField: "aspect_ratio", hasQuality: true},
+		"seedream/5-pro-image-to-image":       {aspectField: "aspect_ratio", hasQuality: true, imageRefField: "image_urls", imageRefKind: "array"},
+		"seedream/5-pro-layer-decomposition": {imageRefField: "image_url", imageRefKind: "single"},
+		"topaz/image-upscale":                 {imageRefField: "image_url", imageRefKind: "single"},
 		"topaz/video-upscale":            {videoRefField: "video_url", videoRefKind: "single"},
 		"infinitalk/from-audio":          {hasResolution: true, imageRefField: "image_url", imageRefKind: "single", audioRefField: "audio_url", audioRefKind: "single"},
 		"z-image":                        {aspectField: "aspect_ratio"},

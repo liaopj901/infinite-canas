@@ -10,6 +10,7 @@ import { useUserStore } from "@/stores/use-user-store";
 
 export type LocalModelChannel = {
     id: string;
+    protocol: "openai" | "kie" | "mimo";
     name: string;
     baseUrl: string;
     apiKey: string;
@@ -33,6 +34,9 @@ export type AiConfig = {
     audioFormat: string;
     audioSpeed: string;
     audioInstructions: string;
+    mimoTtsVoice: string;
+    mimoTtsFormat: string;
+    mimoVoiceDesignPrompt: string;
     videoSeconds: string;
     videoMode: string;
     videoNegativePrompt: string;
@@ -95,6 +99,9 @@ export const defaultConfig: AiConfig = {
     audioFormat: "mp3",
     audioSpeed: "1",
     audioInstructions: "",
+    mimoTtsVoice: "冰糖",
+    mimoTtsFormat: "wav",
+    mimoVoiceDesignPrompt: "",
     videoSeconds: "6",
     videoMode: "std",
     videoNegativePrompt: "",
@@ -442,13 +449,14 @@ export function normalizeLocalChannels(config: Partial<AiConfig>) {
     const channels = Array.isArray(config.localChannels) ? config.localChannels : [];
     const normalized = channels.map((channel, index) => ({
         id: channel.id || `local-${index + 1}`,
+        protocol: channel.protocol === "kie" || channel.protocol === "mimo" ? channel.protocol : "openai",
         name: typeof channel.name === "string" ? channel.name : `本地渠道 ${index + 1}`,
         baseUrl: channel.baseUrl || "",
         apiKey: channel.apiKey || "",
         models: Array.isArray(channel.models) ? channel.models.filter(Boolean) : [],
     }));
     if (!normalized.length) {
-        normalized.push({ id: "local-default", name: "本地直连", baseUrl: config.baseUrl || defaultConfig.baseUrl, apiKey: config.apiKey || "", models: Array.isArray(config.models) ? config.models.filter(Boolean) : [] });
+        normalized.push({ id: "local-default", protocol: "openai", name: "本地直连", baseUrl: config.baseUrl || defaultConfig.baseUrl, apiKey: config.apiKey || "", models: Array.isArray(config.models) ? config.models.filter(Boolean) : [] });
     }
     return normalized;
 }
@@ -470,4 +478,3 @@ export function localChannelForActiveModel(config: AiConfig) {
     const preferredId = channelIdForActiveModel(config);
     return channels.find((channel) => channel.id === preferredId && channel.models.includes(config.model)) || channels.find((channel) => channel.models.includes(config.model)) || channels.find((channel) => channel.id === preferredId) || channels[0];
 }
-

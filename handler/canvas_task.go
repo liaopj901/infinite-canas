@@ -268,7 +268,8 @@ func runCanvasImageTask(task model.CanvasImageTask, user model.AuthUser, body []
 		saveFailedCanvasImageTask(task, message, string(payload))
 		return
 	}
-	imageURL, mimeType, bytes, err := imageURLFromAIResponse(payload, responseContentType)
+	collectAll := isKIESeedreamLayerDecompositionModel(task.Model)
+	imageURLs, mimeType, bytes, err := imageURLsFromAIResponse(payload, responseContentType, collectAll)
 	if err != nil {
 		saveFailedCanvasImageTask(task, err.Error(), string(payload))
 		return
@@ -277,7 +278,10 @@ func runCanvasImageTask(task model.CanvasImageTask, user model.AuthUser, body []
 	task.Progress = 100
 	task.CompletedAt = taskTime()
 	task.ResponseBody = string(payload)
-	task.ImageURL = imageURL
+	task.ImageURL = imageURLs[0]
+	if collectAll {
+		task.ImageURLs = imageURLs
+	}
 	task.StorageKey = ""
 	task.MimeType = mimeType
 	task.Bytes = bytes
@@ -320,19 +324,14 @@ func runCanvasAudioTask(task model.CanvasAudioTask, user model.AuthUser, body []
 	if task.ContentType != "" && strings.HasPrefix(task.ContentType, "audio/") {
 		mimeType = task.ContentType
 	}
-	object, err := service.UploadStorageObject(service.WithUser(context.Background(), user), "canvas-audio"+extensionForTaskMime(mimeType), mimeType, payload)
-	if err != nil {
-		saveFailedCanvasAudioTask(task, err.Error(), err.Error())
-		return
-	}
 	task.Status = "completed"
 	task.Progress = 100
 	task.CompletedAt = taskTime()
 	task.ResponseBody = "[binary audio]"
-	task.AudioURL = object.URL
-	task.StorageKey = object.StorageKey
-	task.MimeType = object.MimeType
-	task.Bytes = object.Bytes
+	task.AudioURL = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(payload)
+	task.StorageKey = ""
+	task.MimeType = mimeType
+	task.Bytes = int64(len(payload))
 	task.Error = ""
 	task.ErrorDetail = ""
 	_, _ = service.SaveCanvasAudioTask(task)
@@ -511,25 +510,47 @@ func imageBytesFromAIResponse(payload []byte) ([]byte, string, error) {
 	return nil, "", errors.New("图片接口没有返回图片")
 }
 
-func imageURLFromAIResponse(payload []byte, contentType string) (string, string, int64, error) {
+func imageURLsFromAIResponse(payload []byte, contentType string, collectAll bool) ([]string, string, int64, error) {
 	candidates, err := imageCandidatesFromAIResponse(payload, contentType)
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", 0, err
 	}
+	urls := make([]string, 0, len(candidates))
+	seen := map[string]bool{}
+	firstMimeType := ""
+	var firstBytes int64
 	for _, candidate := range candidates {
-		if strings.HasPrefix(candidate, "http://") || strings.HasPrefix(candidate, "https://") {
-			return candidate, "", 0, nil
+		url := candidate
+		mimeType := ""
+		var bytes int64
+		if !strings.HasPrefix(candidate, "http://") && !strings.HasPrefix(candidate, "https://") {
+			data, detectedMimeType, err := imageCandidateBytes(candidate)
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			mimeType = detectedMimeType
+			bytes = int64(len(data))
+			if !strings.HasPrefix(candidate, "data:image/") {
+				url = "data:" + mimeType + ";base64," + candidate
+			}
 		}
-		data, mimeType, err := imageCandidateBytes(candidate)
-		if err != nil || len(data) == 0 {
+		if seen[url] {
 			continue
 		}
-		if strings.HasPrefix(candidate, "data:image/") {
-			return candidate, mimeType, int64(len(data)), nil
+		seen[url] = true
+		urls = append(urls, url)
+		if len(urls) == 1 {
+			firstMimeType = mimeType
+			firstBytes = bytes
 		}
-		return "data:" + mimeType + ";base64," + candidate, mimeType, int64(len(data)), nil
+		if !collectAll {
+			return urls, firstMimeType, firstBytes, nil
+		}
 	}
-	return "", "", 0, errors.New("图片接口没有返回图片")
+	if len(urls) == 0 {
+		return nil, "", 0, errors.New("图片接口没有返回图片")
+	}
+	return urls, firstMimeType, firstBytes, nil
 }
 
 type serverSentJSONEvent struct {
@@ -672,28 +693,6 @@ func imageSize(data []byte) (int, int) {
 		return 0, 0
 	}
 	return config.Width, config.Height
-}
-
-func extensionForTaskMime(mimeType string) string {
-	switch strings.ToLower(strings.Split(mimeType, ";")[0]) {
-	case "image/jpeg":
-		return ".jpg"
-	case "image/png":
-		return ".png"
-	case "image/webp":
-		return ".webp"
-	case "audio/wav", "audio/x-wav":
-		return ".wav"
-	case "audio/ogg":
-		return ".ogg"
-	case "audio/mp4", "audio/aac":
-		return ".m4a"
-	default:
-		if strings.HasPrefix(mimeType, "audio/") {
-			return ".mp3"
-		}
-		return ".bin"
-	}
 }
 
 func taskTime() string {

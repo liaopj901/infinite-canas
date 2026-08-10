@@ -1,6 +1,8 @@
 import axios from "axios";
 
 import { dataUrlToFile } from "@/lib/image-utils";
+import { isKIESeedreamLayerDecompositionModel } from "@/lib/kie-models";
+import { isMimoChannel, mimoModels } from "@/lib/mimo-tts";
 import { imageToDataUrl, resolveImageUrl } from "@/services/image-storage";
 import { buildApiUrl, channelIdForActiveModel, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
@@ -29,6 +31,7 @@ type ResponsesApiResponse = {
 type GeneratedImage = { id: string; dataUrl: string; seed?: number };
 export type CanvasImageTask = {
     id: string;
+    parent_task_id?: string;
     object?: string;
     source?: string;
     source_id?: string;
@@ -42,6 +45,7 @@ export type CanvasImageTask = {
     progress?: number;
     url?: string;
     image_url?: string;
+    image_urls?: string[];
     storageKey?: string;
     width?: number;
     height?: number;
@@ -803,7 +807,8 @@ export async function requestEdit(config: AiConfig & { seedIndex?: number; seedC
 
 export async function createCanvasImageTask(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], options: CanvasImageTaskOptions = {}): Promise<CanvasImageTask> {
     if (!usesAccountProxy(config)) {
-        const [image] = await requestImages({ ...config, count: "1" }, prompt, references);
+        const images = await requestImages({ ...config, count: "1" }, prompt, references);
+        const [image] = images;
         if (!image) throw new Error("接口没有返回图片");
         return {
             id: options.clientTaskId || nanoid(),
@@ -815,6 +820,7 @@ export async function createCanvasImageTask(config: AiConfig & { seedIndex?: num
             status: "completed",
             progress: 100,
             image_url: image.dataUrl,
+            ...(isKIESeedreamLayerDecompositionModel(config.model) ? { image_urls: images.map((item) => item.dataUrl) } : {}),
         };
     }
     const params = createImageRequestParams({ ...config, count: "1" });
@@ -1007,6 +1013,8 @@ export async function requestImageQuestion(config: AiConfig, messages: ChatCompl
 
 export async function fetchImageModels(config: AiConfig) {
     if (config.channelMode === "remote") return config.models;
+    const channel = localChannelForActiveModel(config);
+    if (isMimoChannel(channel || { baseUrl: config.baseUrl })) return [...mimoModels];
     try {
         const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
             headers: {
@@ -1170,5 +1178,3 @@ export async function deleteCanvasImageTask(config: AiConfig, task?: CanvasImage
     const payload = (await response.json()) as { code?: number; msg?: string };
     if (payload.code !== 0) throw new ImageRequestError(payload.msg || "删除图片任务失败", payload);
 }
-
-

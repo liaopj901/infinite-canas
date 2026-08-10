@@ -687,7 +687,17 @@ export default function ImagePage() {
 
     const deleteBackendImageTasks = async (items: GenerationLog[]) => {
         if (!token) return;
-        await Promise.all(items.map((item) => deleteCanvasImageTask(imageTaskConfig(), item.task).catch(() => undefined)));
+        const tasks = Array.from(
+            new Map(
+                items.flatMap((item) => {
+                    const taskId = item.task?.parent_task_id || item.task?.id;
+                    return item.task && taskId
+                        ? [[taskId, { ...item.task, id: taskId }] as const]
+                        : [];
+                }),
+            ).values(),
+        );
+        await Promise.all(tasks.map((task) => deleteCanvasImageTask(imageTaskConfig(), task).catch(() => undefined)));
     };
 
     const deleteAccountImageLogs = async (items: GenerationLog[]) => {
@@ -825,6 +835,20 @@ export default function ImagePage() {
                         setResults((value) => updateResultByLogId(value, log.id, { status: "failed", error: nextLog.errors[0], errorDetail: nextLog.errorDetails?.[0], durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                         return;
                     }
+                    if ((task.image_urls?.length || 0) > 1) {
+                        const nextLogs = imageLogsFromTask(log, task);
+                        const syncedLogs = await Promise.all(
+                            nextLogs.map(async (item, index) => {
+                                if (item.status !== "成功" || !item.images.length) return item;
+                                const image = await autoSyncGeneratedImage(item.images[0], index, item.config.channelMode);
+                                return { ...item, images: [image], thumbnails: [image.dataUrl] };
+                            }),
+                        );
+                        await Promise.all(syncedLogs.map(saveLog));
+                        setResults((value) => value.filter((item) => !imageResultMatchesLog(item, syncedLogs[0])));
+                        return;
+                    }
+
                     let nextLog = imageLogFromTask(log, task);
                     if (nextLog.status === "成功" && nextLog.images.length) {
                         const image = await autoSyncGeneratedImage(nextLog.images[0], 0, nextLog.config.channelMode);
@@ -2269,7 +2293,14 @@ function imageTaskIdentityKeys(task?: CanvasImageTask) {
 }
 
 function imageLogIdentityKeys(log: GenerationLog) {
-    return uniqueStrings([log.id, ...imageTaskIdentityKeys(log.task), ...log.images.flatMap((image) => [image.id, image.storageKey])]);
+    const taskKeys = (log.task?.image_urls?.length || 0) > 1
+        ? []
+        : imageTaskIdentityKeys(log.task);
+    return uniqueStrings([
+        log.id,
+        ...taskKeys,
+        ...log.images.flatMap((image) => [image.id, image.storageKey]),
+    ]);
 }
 
 function imageResultIdentityKeys(result: GenerationResult) {
@@ -2433,6 +2464,38 @@ function mergeBackendImageTasks(logs: GenerationLog[], tasks: CanvasImageTask[],
         imageLogIdentityKeys(nextLog).forEach((key) => byKey.set(key, nextLog));
     });
     return dedupeGenerationLogs(nextLogs);
+}
+
+function imageLogsFromTask(log: GenerationLog, task: CanvasImageTask): GenerationLog[] {
+    const urls = uniqueStrings(task.image_urls || []);
+    if (urls.length <= 1) return [imageLogFromTask(log, task)];
+    const parentTaskId = task.parent_task_id || task.id;
+
+    return urls.map((url, index) => {
+        const nextLog = imageLogFromTask(
+            {
+                ...log,
+                id: index === 0 ? log.id : `${log.id}:${index}`,
+            },
+            {
+                ...task,
+                id: index === 0 ? task.id : `${parentTaskId}:${index}`,
+                parent_task_id: parentTaskId,
+                url,
+                image_url: url,
+                storageKey: undefined,
+                bytes: 0,
+            },
+        );
+
+        return {
+            ...nextLog,
+            images: nextLog.images.map((image) => ({
+                ...image,
+                id: index === 0 ? task.id : `${parentTaskId}:${index}`,
+            })),
+        };
+    });
 }
 
 function imageLogFromTask(log: GenerationLog, task: CanvasImageTask): GenerationLog {

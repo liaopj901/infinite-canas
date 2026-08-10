@@ -138,7 +138,14 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 		credits *= readAIRequestCount(body, contentType)
 	}
 	upstreamPath := resolveAIProxyPath(channel, modelName, path)
-	if isKIEChannel(channel, modelName) && upstreamPath == "/jobs/createTask" {
+	if service.IsMiMoTTSModelName(modelName) && path == "/audio/speech" {
+		body, contentType, err = normalizeMiMoTTSBody(body, contentType, modelName)
+		if err != nil {
+			log.Printf("AI proxy normalize MiMo TTS request failed: model=%s err=%v", modelName, err)
+			Fail(w, err.Error())
+			return
+		}
+	} else if isKIEChannel(channel, modelName) && upstreamPath == "/jobs/createTask" {
 		body, contentType, err = normalizeKIEVideoBody(body, contentType, modelName, channel)
 		if err != nil {
 			log.Printf("AI proxy normalize KIE request failed: model=%s err=%v", modelName, err)
@@ -231,6 +238,9 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.
 		return
 	}
 
+	if copyMiMoTTSResponse(w, response, logContext, onFailure) {
+		return
+	}
 	if copyKIEVideoResponse(w, response, request, channel, logContext, onFailure) {
 		return
 	}
@@ -382,8 +392,8 @@ func redactLargeImages(value *any) {
 	switch typed := (*value).(type) {
 	case map[string]any:
 		for key, item := range typed {
-			if text, ok := item.(string); ok && (strings.HasPrefix(text, "data:image/") || len(text) > 2048 && looksLikeBase64(text)) {
-				typed[key] = fmt.Sprintf("[redacted image/string len=%d]", len(text))
+			if text, ok := item.(string); ok && (strings.HasPrefix(text, "data:image/") || strings.HasPrefix(text, "data:audio/") || len(text) > 2048 && looksLikeBase64(text)) {
+				typed[key] = fmt.Sprintf("[redacted media/string len=%d]", len(text))
 				continue
 			}
 			redactLargeImages(&item)
@@ -499,6 +509,9 @@ func agnesVideoQueryID(modelName string, path string) (string, bool) {
 }
 
 func resolveAIProxyPath(channel model.ModelChannel, modelName string, path string) string {
+	if service.IsMiMoTTSModelName(modelName) && path == "/audio/speech" {
+		return "/chat/completions"
+	}
 	if isKIEChannel(channel, modelName) {
 		if path == "/videos" || path == "/images/generations" || path == "/images/edits" {
 			return "/jobs/createTask"

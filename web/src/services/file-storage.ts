@@ -34,7 +34,7 @@ export async function uploadAssetMediaFile(file: File, prefix = "asset-media"): 
 
 export async function downloadRemoteMedia(url: string) {
     const response = await fetch(getProxyUrl(url));
-    if (!response.ok) throw new Error(`视频下载失败：${response.status}`);
+    if (!response.ok) throw new Error(`媒体下载失败：${response.status}`);
     const blob = await response.blob();
     if (blob.type.includes("json") || blob.type.startsWith("text/")) {
         const text = await blob.text().catch(() => "");
@@ -45,7 +45,7 @@ export async function downloadRemoteMedia(url: string) {
         } catch {
             message = text;
         }
-        throw new Error(message || "视频下载失败");
+        throw new Error(message || "媒体下载失败");
     }
     return blob;
 }
@@ -60,15 +60,15 @@ async function uploadMediaBlobToServer(blob: Blob, filename: string): Promise<Up
     const userProvider = config?.allowUserProvider ? loadUserStorageProvider() : null;
     if (!config || (!canUseGlobalStorage(config) && !userProvider)) throw new Error("服务端对象存储未启用");
     const token = useUserStore.getState().token;
-    if (!token) throw new Error("请先登录后再同步视频");
+    if (!token) throw new Error("请先登录后再同步媒体");
     const formData = new FormData();
     formData.append("file", blob, filename);
     if (userProvider) formData.append("provider", JSON.stringify(toProviderPayload(userProvider)));
     const response = await fetch("/api/v1/files", { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: formData });
     const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedFile } | null;
-    if (!response.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "视频同步失败");
+    if (!response.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "媒体同步失败");
     const meta = payload.data.mimeType?.startsWith("video/") ? await readVideoMeta(payload.data.url) : {};
-    return { ...payload.data, bytes: payload.data.bytes || blob.size, mimeType: payload.data.mimeType || blob.type || "video/mp4", ...meta };
+    return { ...payload.data, bytes: payload.data.bytes || blob.size, mimeType: payload.data.mimeType || blob.type || "application/octet-stream", ...meta };
 }
 
 async function loadStorageConfig() {

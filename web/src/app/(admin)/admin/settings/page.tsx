@@ -918,6 +918,7 @@ export default function AdminSettingsPage() {
                                         options={[
                                             { label: "OpenAI", value: "openai" },
                                             { label: "KIE", value: "kie" },
+                                            { label: "MiMo", value: "mimo" },
                                         ]}
                                     />
                                 </Form.Item>
@@ -1056,7 +1057,7 @@ export default function AdminSettingsPage() {
                     destroyOnHidden
                 >
                     <Flex vertical gap={12}>
-                        <Typography.Text type="secondary">测试会向选中模型发送一条 hi，用于确认渠道是否有响应。</Typography.Text>
+                        <Typography.Text type="secondary">测试会向选中模型发送最小测试请求，用于确认渠道是否有响应。</Typography.Text>
                         <Input.Search placeholder="搜索模型..." allowClear value={testKeyword} onChange={(event) => setTestKeyword(event.target.value)} />
                         <Table
                             rowKey="model"
@@ -1081,6 +1082,7 @@ export default function AdminSettingsPage() {
                                             <Space size={6} wrap>
                                                 <Tag color="success">成功</Tag>
                                                 <Typography.Text type="secondary">请求时长: {result.duration}</Typography.Text>
+                                                {result.message && result.message !== "ok" ? <Typography.Text type="secondary">{result.message}</Typography.Text> : null}
                                             </Space>
                                         ) : (
                                             <Typography.Text type="danger">{result.message}</Typography.Text>
