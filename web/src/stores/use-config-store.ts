@@ -445,9 +445,9 @@ function normalizeArkPlanBaseUrl(baseUrl: string) {
     }
 }
 
-export function normalizeLocalChannels(config: Partial<AiConfig>) {
+export function normalizeLocalChannels(config: Partial<AiConfig>): LocalModelChannel[] {
     const channels = Array.isArray(config.localChannels) ? config.localChannels : [];
-    const normalized = channels.map((channel, index) => ({
+    const normalized: LocalModelChannel[] = channels.map((channel, index) => ({
         id: channel.id || `local-${index + 1}`,
         protocol: channel.protocol === "kie" || channel.protocol === "mimo" ? channel.protocol : "openai",
         name: typeof channel.name === "string" ? channel.name : `本地渠道 ${index + 1}`,
@@ -477,4 +477,25 @@ export function localChannelForActiveModel(config: AiConfig) {
     const channels = normalizeLocalChannels(config);
     const preferredId = channelIdForActiveModel(config);
     return channels.find((channel) => channel.id === preferredId && channel.models.includes(config.model)) || channels.find((channel) => channel.models.includes(config.model)) || channels.find((channel) => channel.id === preferredId) || channels[0];
+}
+
+export type DirectAIProvider = "kie" | "apimart";
+
+const directAIProviderCache = new Map<string, DirectAIProvider | null>();
+
+export function directAIProviderForConfig(config: AiConfig): DirectAIProvider | null {
+    const channel = localChannelForActiveModel(config);
+    if (!channel) return null;
+    const protocol = channel.protocol.toLowerCase();
+    const baseUrl = channel.baseUrl.trim().toLowerCase();
+    const model = (config.model || "").trim().toLowerCase();
+    const key = `${protocol}\n${baseUrl}\n${model}`;
+    if (directAIProviderCache.has(key)) return directAIProviderCache.get(key) || null;
+    const provider = protocol === "kie" || baseUrl.includes("kie.ai") || model.includes("kie/")
+        ? "kie"
+        : baseUrl.includes("apimart.ai") || model.includes("apimart")
+            ? "apimart"
+            : null;
+    directAIProviderCache.set(key, provider);
+    return provider;
 }

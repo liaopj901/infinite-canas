@@ -4,7 +4,7 @@ import { dataUrlToFile } from "@/lib/image-utils";
 import { isKIESeedreamLayerDecompositionModel } from "@/lib/kie-models";
 import { isMimoChannel, mimoModels } from "@/lib/mimo-tts";
 import { imageToDataUrl, resolveImageUrl } from "@/services/image-storage";
-import { buildApiUrl, channelIdForActiveModel, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
+import { buildApiUrl, channelIdForActiveModel, directAIProviderForConfig, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
 import { nanoid } from "nanoid";
@@ -607,6 +607,12 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
         body.partial_images = params.streamPartialImages;
     }
 
+    const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
+    if (directProvider) {
+        const { requestDirectImages } = await import("@/services/api/direct-ai");
+        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/generations", body, params.timeoutSeconds), mime);
+    }
+
     return requestAndParseImages(
         config,
         "/images/generations",
@@ -649,6 +655,12 @@ async function requestImageEditSingle(config: AiConfig, prompt: string, referenc
     }
     const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     files.forEach((file) => formData.append("image", file));
+
+    const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
+    if (directProvider) {
+        const { requestDirectImages } = await import("@/services/api/direct-ai");
+        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/edits", formData, params.timeoutSeconds), mime);
+    }
 
     return requestAndParseImages(
         config,
