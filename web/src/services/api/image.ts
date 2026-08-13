@@ -117,6 +117,17 @@ function normalizeBoundedInteger(value: string | number, fallback: number, min: 
     return Math.max(min, Math.min(max, number));
 }
 
+function greatestCommonDivisor(a: number, b: number) {
+    a = Math.round(a);
+    b = Math.round(b);
+    while (b) {
+        const remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return a;
+}
+
 function resolveSize(quality: string, ratio: string): string | undefined {
     const basePixels = QUALITY_BASE[quality];
     if (!basePixels || ratio === "auto" || !ratio) return undefined;
@@ -127,13 +138,7 @@ function resolveSize(quality: string, ratio: string): string | undefined {
     const h = Number(parts[1]);
     if (!w || !h) return undefined;
 
-    let a = Math.round(w);
-    let b = Math.round(h);
-    while (b) {
-        const remainder = a % b;
-        a = b;
-        b = remainder;
-    }
+    const a = greatestCommonDivisor(w, h);
 
     const unit = Math.round(Math.sqrt((basePixels * basePixels) / ((w / a) * (h / a))) / 16) * 16;
     return `${(w / a) * unit}x${(h / a) * unit}`;
@@ -156,6 +161,36 @@ function createImageRequestParams(config: AiConfig): ImageRequestParams {
         timeoutSeconds: IMAGE_REQUEST_TIMEOUT_SECONDS,
         streamPartialImages: normalizeBoundedInteger(config.streamPartialImages, 1, 0, 3),
     };
+}
+
+function isGrokImageModel(model: string) {
+    return model.trim().toLowerCase().startsWith("grok-imagine-image");
+}
+
+function applyImageGenerationParams(body: Record<string, unknown>, config: AiConfig, params: ImageRequestParams, operation: "generation" | "edit" = "generation") {
+    const model = config.model.trim().toLowerCase();
+    const grok = isGrokImageModel(model) && (operation === "edit" || !model.includes("edit"));
+    if (grok) {
+        const size = config.size.trim().toLowerCase();
+        if (size && size !== "auto") {
+            const match = size.match(/^(\d+)x(\d+)$/);
+            if (match) {
+                const width = Number(match[1]);
+                const height = Number(match[2]);
+                const divisor = greatestCommonDivisor(width, height);
+                body.aspect_ratio = `${width / divisor}:${height / divisor}`;
+            } else {
+                body.aspect_ratio = size;
+            }
+        }
+        if (params.quality !== "auto") {
+            body.resolution = operation === "edit" && model.includes("edit") ? "1k" : QUALITY_BASE[params.quality] > 1024 ? "2k" : "1k";
+        }
+        return;
+    }
+
+    if (params.size) body.size = params.size;
+    if (params.quality && !config.codexCli) body.quality = params.quality;
 }
 
 function normalizeBase64Image(value: string, fallbackMime: string) {
@@ -637,8 +672,7 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
         prompt: withPromptGuard(config, withSystemPrompt(config, prompt)),
     };
     if (params.n > 1) body.n = params.n;
-    if (params.size) body.size = params.size;
-    if (params.quality && !config.codexCli) body.quality = params.quality;
+    applyImageGenerationParams(body, config, params);
     if (config.responseFormatB64Json) body.response_format = "b64_json";
     if (config.streamImages) {
         body.stream = true;
@@ -680,7 +714,55 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
     );
 }
 
+async function createGrokImageEditBody(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams) {
+    const body: Record<string, unknown> = {
+        model: config.model,
+        prompt: withPromptGuard(config, withSystemPrompt(config, prompt)),
+        images: await Promise.all(references.map(async (image) => ({ url: await imageToDataUrl(image) }))),
+    };
+    if (params.n > 1) body.n = params.n;
+    applyImageGenerationParams(body, config, params, "edit");
+    if (config.responseFormatB64Json) body.response_format = "b64_json";
+    if (config.streamImages) {
+        body.stream = true;
+        body.partial_images = params.streamPartialImages;
+    }
+    return body;
+}
+
+async function requestGrokImageEditSingle(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams): Promise<GeneratedImage[]> {
+    const mime = IMAGE_MIME;
+    const body = await createGrokImageEditBody(config, prompt, references, params);
+    return requestAndParseImages(
+        config,
+        "/images/edits",
+        body,
+        params.timeoutSeconds,
+        () =>
+            requestWithTransientRetry(() =>
+                withTimeout(params.timeoutSeconds, (signal) =>
+                    fetch(aiApiUrl(config, "/images/edits"), {
+                        method: "POST",
+                        headers: aiHeaders(config, "application/json"),
+                        body: JSON.stringify(body),
+                        signal,
+                    }),
+                ),
+            ),
+        async (response) => {
+            if (config.streamImages && isEventStreamResponse(response)) {
+                const images = await parseImagesStreamResponse(response, mime);
+                return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
+            }
+            const payload = (await response.json()) as ImageApiResponse;
+            return { images: parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
+        },
+    );
+}
+
 async function requestImageEditSingle(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams): Promise<GeneratedImage[]> {
+    if (isGrokImageModel(config.model)) return requestGrokImageEditSingle(config, prompt, references, params);
+
     const mime = IMAGE_MIME;
     const formData = new FormData();
     formData.set("model", config.model);
@@ -952,6 +1034,14 @@ async function createCanvasImageTaskRequest(config: AiConfig & { seedIndex?: num
             body: JSON.stringify({ endpoint: "/responses", ...meta, request: body }),
         };
     }
+    if (references.length && isGrokImageModel(config.model)) {
+        const body = await createGrokImageEditBody(config, prompt, references, params);
+        return {
+            method: "POST",
+            headers: jsonHeaders,
+            body: JSON.stringify({ endpoint: "/images/edits", ...meta, request: body }),
+        };
+    }
     if (references.length) {
         const formData = new FormData();
         formData.set("_canvas_endpoint", "/images/edits");
@@ -991,8 +1081,7 @@ async function createCanvasImageTaskRequest(config: AiConfig & { seedIndex?: num
         model: config.model,
         prompt: withPromptGuard(config, withSystemPrompt(config, prompt)),
     };
-    if (params.size) body.size = params.size;
-    if (params.quality && !config.codexCli) body.quality = params.quality;
+    applyImageGenerationParams(body, config, params);
     if (config.responseFormatB64Json) body.response_format = "b64_json";
     if (config.streamImages) {
         body.stream = true;

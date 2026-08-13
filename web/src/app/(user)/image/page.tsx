@@ -30,7 +30,7 @@ import { App, Button, Checkbox, Drawer, Empty, Image, Input, Modal, Segmented, T
 import localforage from "localforage";
 import { saveAs } from "file-saver";
 
-import { ImageSettingsPanel, imageFormatLabel, imageQualityLabel, imageSizeLabel } from "@/components/image-settings-panel";
+import { ImageSettingsPanel, imageFormatLabel, imageQualityLabel, imageSizeLabel, imageSizeOptions } from "@/components/image-settings-panel";
 import { ModelPicker } from "@/components/model-picker";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/app/(user)/canvas/components/asset-picker-modal";
@@ -1281,19 +1281,6 @@ export default function ImagePage() {
     );
 }
 
-const quickSizeOptions = [
-    { value: "auto", label: "auto" },
-    { value: "1:1", label: "1:1" },
-    { value: "3:2", label: "3:2" },
-    { value: "2:3", label: "2:3" },
-    { value: "4:3", label: "4:3" },
-    { value: "3:4", label: "3:4" },
-    { value: "9:16", label: "9:16" },
-    { value: "2048x2048", label: "1:1 2k" },
-    { value: "2048x1152", label: "16:9 2k" },
-    { value: "1152x2048", label: "9:16 2k" },
-];
-
 const quickQualityOptions = [
     { value: "auto", label: "自动" },
     { value: "high", label: "高" },
@@ -1412,7 +1399,7 @@ function WorkbenchPanel({
                                     />
                                 </div>
                             </label>
-                            <QuickSelect label="尺寸" value={config.size || "auto"} options={quickSizeOptions} onChange={(value) => updateConfig("size", value)} />
+                            <QuickSelect label="尺寸" value={config.size || "auto"} options={imageSizeOptions} onChange={(value) => updateConfig("size", value)} />
                             <QuickSelect label="质量" value={config.quality || "auto"} options={quickQualityOptions} onChange={(value) => updateConfig("quality", value)} />
                             <QuickNumber label="数量" value={config.count || "1"} min={1} max={10} onChange={(value) => updateConfig("count", value)} />
                             <ReferenceQuickActions references={references} onUploadReferences={onUploadReferences} />

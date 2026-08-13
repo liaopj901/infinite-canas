@@ -35,6 +35,11 @@ const aspectOptions = [
     { value: "auto", label: "auto", width: 0, height: 0, icon: "auto" },
 ];
 
+export const imageSizeOptions = aspectOptions.map((item) => ({
+    value: item.size || item.value,
+    label: item.label,
+}));
+
 type ImageSettingsPanelProps = {
     config: AiConfig;
     onConfigChange: (key: "quality" | "size" | "count", value: string) => void;

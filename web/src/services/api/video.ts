@@ -4,14 +4,14 @@ import { dataUrlToFile } from "@/lib/image-utils";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio } from "@/lib/seedance-video";
 import { isKIEGrokVideoModel } from "@/components/video-settings-panel";
 import { modelKey, supportsVideoAudioGeneration } from "@/lib/video-model-capabilities";
-import { resolveMediaUrl } from "@/services/file-storage";
+import { resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
 import { imageToDataUrl, resolveImageUrl } from "@/services/image-storage";
 import { buildApiUrl, channelIdForActiveModel, directAIProviderForConfig, localChannelForActiveModel, type AiConfig, type VideoElementReference } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
-export type VideoResponse = { id: string; task_id?: string; video_id?: string; source_id?: string; sourceId?: string; channelId?: string; userChannelId?: string; channelName?: string; channel_id?: string; user_channel_id?: string; channel_name?: string; status?: string; video_url?: string; url?: string; progress?: number; error?: { message?: string }; size?: string; seconds?: string; model?: string; created_at?: string | number; createdAt?: string | number; started_at?: string | number; startedAt?: string | number; request_body?: string };
+export type VideoResponse = { id: string; task_id?: string; video_id?: string; source_id?: string; sourceId?: string; channelId?: string; userChannelId?: string; channelName?: string; channel_id?: string; user_channel_id?: string; channel_name?: string; status?: string; video_url?: string; url?: string; storageKey?: string; progress?: number; error?: { message?: string }; size?: string; seconds?: string; model?: string; created_at?: string | number; createdAt?: string | number; started_at?: string | number; startedAt?: string | number; request_body?: string };
 type ApiVideoEnvelope = { code: number; data?: VideoResponse | VideoResponse[] | null; msg?: string; message?: string };
 type ApiVideoResponse = VideoResponse | ApiVideoEnvelope;
 export type VideoGenerationResult = { id: string; url: string; durationMs: number; width: number; height: number; bytes: number; mimeType: string; task: VideoResponse };
@@ -98,7 +98,7 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
         const directProvider = !accountProxy ? directAIProviderForConfig(config) : null;
         const created = directProvider
             ? await (await import("@/services/api/direct-ai")).createDirectVideoTask(config, directProvider, body)
-            : unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers })).data);
+            : unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, !accountProxy && isGrok2APIVideoConfig(config, model) ? "/videos/generations" : "/videos"), body, { headers })).data);
         if (!created.id && !created.video_id) throw new Error("视频接口没有返回任务 ID");
         if (typeof created.progress === "number") onProgress?.(created.progress, created);
         return { task: created, pollId: videoPollId(model, created), startedAt, requestBody: body };
@@ -154,8 +154,10 @@ export async function pollVideoGenerationTaskStatus(config: AiConfig, task: Vide
     const pollId = videoPollId(model, task);
     if (!pollId) throw new VideoRequestError("视频接口没有返回任务 ID", task);
     const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
-    if (directProvider) return (await import("@/services/api/direct-ai")).pollDirectVideoTask(config, directProvider, pollId);
-    return unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data);
+    const result = directProvider
+        ? await (await import("@/services/api/direct-ai")).pollDirectVideoTask(config, directProvider, pollId)
+        : unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data);
+    return cacheProtectedGrokVideo(config, model, result);
 }
 
 export async function listVideoGenerationTasks(config: AiConfig) {
@@ -173,8 +175,43 @@ export async function deleteVideoGenerationTask(config: AiConfig, task?: VideoRe
     if (payload.code !== 0) throw new VideoRequestError(payload.msg || payload.message || "删除视频任务失败", payload);
 }
 
+function isGrok2APIVideoConfig(config: AiConfig, model: string) {
+    if (model.trim().toLowerCase() !== "grok-imagine-video") return false;
+    const channel = videoChannelText(config, model);
+    return !channel.includes("kie") && !channel.includes("apimart");
+}
+
+async function cacheProtectedGrokVideo(config: AiConfig, model: string, task: VideoResponse) {
+    const url = task.video_url || task.url || "";
+    if (!isCompletedVideoStatus(task.status) || task.storageKey || !isGrok2APIVideoConfig(config, model) || !/\/v1\/videos\/[^/]+\/content(?:[?#]|$)/.test(url)) return task;
+    const taskId = task.task_id || task.id || task.video_id || "";
+    const response = await fetch(`${aiApiUrl(config, `/videos/${encodeURIComponent(taskId)}/content`)}?model=${encodeURIComponent(model)}`, { headers: aiHeaders(config) });
+    if (!response.ok) throw new VideoRequestError(`视频内容下载失败：${response.status}`, task);
+    const media = await uploadMediaFile(await response.blob(), "generated-video");
+    return { ...task, url: media.url, video_url: media.url, storageKey: media.storageKey };
+}
+
+async function createGrok2APIVideoRequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
+    const body: Record<string, unknown> = {
+        model,
+        prompt,
+        duration: Number(normalizeVideoSeconds(config.videoSeconds)),
+        resolution: normalizeVideoResolution(config.vquality),
+    };
+    const aspectRatio = normalizeSeedanceRatio(config.size);
+    if (aspectRatio !== "adaptive") body.aspect_ratio = aspectRatio;
+
+    const references = [input.firstFrame, ...input.references, input.lastFrame].filter((reference): reference is ReferenceImage => Boolean(reference));
+    const urls = await Promise.all(references.map((reference) => imageToDataUrl(reference)));
+    if (urls.length) body.image = { url: urls[0] };
+    if (urls.length > 1) body.reference_images = urls.slice(1).map((url) => ({ url }));
+
+    return body;
+}
+
 async function createVideoRequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
     const size = normalizeVideoSize(config.size);
+    if (isGrok2APIVideoConfig(config, model)) return createGrok2APIVideoRequestBody(config, model, prompt, input);
     if (isAgnesVideoModel(model)) {
         const references = input.references;
         const inputReferences = await Promise.all(references.slice(0, 7).map(imageToAgnesReference));

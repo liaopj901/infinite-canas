@@ -9,10 +9,14 @@ import { type CanvasTheme } from "@/lib/canvas-theme";
 import { modelKey, supportsVideoAudioGeneration } from "@/lib/video-model-capabilities";
 import { channelIdForActiveModel, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 
-const resolutionOptions = [
+export const videoResolutionOptions = [
     { value: "720", label: "720p" },
     { value: "480", label: "480p" },
+    { value: "1080", label: "1080p" },
+    { value: "2k", label: "2K" },
+    { value: "4k", label: "4K" },
 ];
+const resolutionButtonOptions = videoResolutionOptions.slice(0, 2);
 
 const sizeOptions = [
     { value: "1280x720", label: "横屏", width: 1280, height: 720 },
@@ -69,6 +73,11 @@ export function VideoSettingsPanel({ config, modelName, onConfigChange, theme, s
     const resolution = normalizeVideoResolutionValue(config.vquality);
     const audioGenerationEnabled = supportsVideoAudioGeneration(model);
     const generateAudio = boolConfig(config.videoGenerateAudio, false);
+    const updateResolution = (value: string) => {
+        const nextResolution = normalizeVideoResolutionValue(value);
+        onConfigChange("vquality", nextResolution);
+        onConfigChange("size", videoSizeForResolution(nextResolution, config.size));
+    };
     const updateDimension = (key: "width" | "height", value: number | null) => {
         const next = Math.max(1, Math.floor(value || dimensions[key] || 720));
         const width = key === "width" ? next : dimensions.width;
@@ -102,12 +111,12 @@ export function VideoSettingsPanel({ config, modelName, onConfigChange, theme, s
                 ) : null}
                 <SettingGroup title="清晰度" color={theme.node.muted}>
                     <div className="grid grid-cols-3 gap-2.5">
-                        {resolutionOptions.map((item) => (
-                            <OptionPill key={item.value} selected={resolution === item.value} theme={theme} onClick={() => onConfigChange("vquality", item.value)}>
+                        {resolutionButtonOptions.map((item) => (
+                            <OptionPill key={item.value} selected={resolution === item.value} theme={theme} onClick={() => updateResolution(item.value)}>
                                 {item.label}
                             </OptionPill>
                         ))}
-                        <ResolutionInput value={resolution} theme={theme} onChange={(value) => onConfigChange("vquality", value)} />
+                        <ResolutionInput value={resolution} theme={theme} onChange={updateResolution} />
                     </div>
                 </SettingGroup>
                 <SettingGroup title="尺寸" color={theme.node.muted}>
@@ -322,13 +331,18 @@ function SeedanceVideoSettingsPanel({ config, modelName, onConfigChange, theme, 
 }
 
 export function videoResolutionLabel(value: string) {
-    return `${normalizeVideoResolutionValue(value)}p`;
+    const resolution = normalizeVideoResolutionValue(value);
+    return resolution.toLowerCase().endsWith("k") ? resolution : `${resolution}p`;
 }
 
 export function videoSizeLabel(value: string) {
     const ratio = normalizeSeedanceRatio(value);
     if (value === "adaptive" || value === "auto") return "自适应";
     if (ratio === value) return seedanceRatioOptions.find((item) => item.value === ratio)?.label || ratio;
+    const presetRatio = seedanceRatioOptions.find((item) =>
+        item.value !== "adaptive" && videoResolutionOptions.some((resolution) => seedancePixelLabel(resolution.value, item.value) === value),
+    );
+    if (presetRatio) return presetRatio.label;
     const size = normalizeVideoSizeValue(value);
     return sizeOptions.find((item) => item.value === size)?.label || size;
 }
@@ -348,6 +362,22 @@ export function normalizeVideoResolutionValue(value: string) {
     if (value === "480p" || value === "low") return "480";
     if (value === "720p" || value === "auto" || value === "high" || value === "medium") return "720";
     return value.replace(/p$/i, "") || "720";
+}
+
+export function videoSizeForResolution(resolution: string, size: string) {
+    const ratio = normalizeSeedanceRatio(size);
+    if (ratio === "adaptive") return "auto";
+    const normalizedResolution = normalizeVideoResolutionValue(resolution);
+    if (!videoResolutionOptions.some((item) => item.value === normalizedResolution.toLowerCase())) return normalizeVideoSizeValue(size);
+    return seedancePixelLabel(normalizedResolution, ratio);
+}
+
+export function videoSizeOptions(resolution: string) {
+    const normalizedResolution = normalizeVideoResolutionValue(resolution);
+    return seedanceRatioOptions.map((item) => {
+        const value = item.value === "adaptive" ? "auto" : seedancePixelLabel(normalizedResolution, item.value);
+        return { value, label: value };
+    });
 }
 
 function OptionPill({ selected, disabled = false, theme, onClick, children }: { selected: boolean; disabled?: boolean; theme: CanvasTheme; onClick: () => void; children: ReactNode }) {

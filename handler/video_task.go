@@ -379,7 +379,7 @@ func parseVideoTaskPayload(payload []byte, modelName string) parsedVideoTaskPayl
 	}
 	data := normalizeVideoPayloadMap(root)
 	result := parsedVideoTaskPayload{
-		UpstreamTaskID:  firstNonEmpty(readStringPath(data, "task_id"), readStringPath(data, "taskId"), readStringPath(data, "id")),
+		UpstreamTaskID:  firstNonEmpty(readStringPath(data, "task_id"), readStringPath(data, "taskId"), readStringPath(data, "id"), readStringPath(data, "request_id")),
 		UpstreamVideoID: firstNonEmpty(readStringPath(data, "video_id"), readStringPath(data, "videoId")),
 		Status:          service.NormalizeVideoTaskStatus(firstNonEmpty(readStringPath(data, "status"), readStringPath(data, "state"))),
 		Progress:        readIntPath(data, "progress"),
