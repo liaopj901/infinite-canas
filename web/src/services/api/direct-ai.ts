@@ -12,20 +12,22 @@ type SerializedDirectBody = { body: unknown; references: DirectReference[] };
 
 const DIRECT_REFERENCE_HOST = "direct-reference.invalid";
 const DIRECT_IMAGE_POLL_INTERVAL_MS = 2000;
+const DIRECT_IMAGE_MAX_RETRIES = 3;
+const DIRECT_IMAGE_RETRY_DELAY_MS = 700;
 
 export async function requestDirectImages(config: AiConfig, provider: DirectAIProvider, endpoint: "/images/generations" | "/images/edits", body: DirectRequestBody, timeoutSeconds: number): Promise<DirectImageResponse> {
     const startedAt = Date.now();
     const { plan, requestBody, apiKey } = await prepareDirectRequest(config, provider, endpoint, body);
-    const created = await requestDirectJSON(plan.url, apiKey, plan.contentType, requestBody, remainingTimeoutMs(startedAt, timeoutSeconds));
+    const created = await requestDirectJSON(plan.url, apiKey, plan.contentType, requestBody, remainingTimeoutMs(startedAt, timeoutSeconds), true);
     const directUrls = readDirectImageURLs(provider, created);
     if (directUrls.length) return directImageResponse(directUrls);
     const taskId = readDirectTaskId(provider, created);
-    if (!taskId) throw new Error(readDirectError(created) || "图片接口没有返回结果或任务 ID");
+    if (!taskId) throw new Error(readDirectFailureMessage(created) || "图片接口没有返回结果或任务 ID");
 
     for (;;) {
         const waitMs = Math.min(DIRECT_IMAGE_POLL_INTERVAL_MS, remainingTimeoutMs(startedAt, timeoutSeconds));
         await delay(waitMs);
-        const payload = await requestDirectJSON(directPollURL(config, provider, taskId), apiKey, "", undefined, remainingTimeoutMs(startedAt, timeoutSeconds));
+        const payload = await requestDirectJSON(directPollURL(config, provider, taskId), apiKey, "", undefined, remainingTimeoutMs(startedAt, timeoutSeconds), true);
         const result = readDirectImagePoll(provider, payload);
         if (result.error) throw new Error(result.error);
         if (result.urls.length) return directImageResponse(result.urls);
@@ -37,7 +39,7 @@ export async function createDirectVideoTask(config: AiConfig, provider: DirectAI
     const { plan, requestBody, apiKey } = await prepareDirectRequest(config, provider, "/videos", body);
     const payload = await requestDirectJSON(plan.url, apiKey, plan.contentType, requestBody);
     const taskId = readDirectTaskId(provider, payload);
-    if (!taskId) throw new Error(readDirectError(payload) || "视频接口没有返回任务 ID");
+    if (!taskId) throw new Error(readDirectFailureMessage(payload) || "视频接口没有返回任务 ID");
     return {
         id: taskId,
         task_id: taskId,
@@ -89,8 +91,9 @@ async function prepareDirectRequest(config: AiConfig, provider: DirectAIProvider
         body: serialized.body,
     });
     if (plan.provider !== provider) throw new Error("前后端渠道识别结果不一致");
-    const requestBody = await uploadAndReplaceReferences(plan, serialized.references, channel.apiKey);
-    return { plan, requestBody, apiKey: channel.apiKey };
+    const apiKey = channel.apiKey.trim();
+    const requestBody = await uploadAndReplaceReferences(plan, serialized.references, apiKey);
+    return { plan, requestBody, apiKey };
 }
 
 function requireDirectChannel(config: AiConfig) {
@@ -275,28 +278,54 @@ function replaceDirectMarkers(value: unknown, uploaded: Map<string, string>): un
     return value;
 }
 
-async function requestDirectJSON(url: string, apiKey: string, contentType: string, body?: unknown, timeoutMs?: number) {
-    const controller = new AbortController();
-    const timeout = timeoutMs ? window.setTimeout(() => controller.abort(), timeoutMs) : 0;
-    try {
-        const response = await fetch(url, {
-            method: body === undefined ? "GET" : "POST",
-            headers: {
-                Authorization: `Bearer ${apiKey}`,
-                ...(body === undefined ? {} : { "Content-Type": contentType || "application/json" }),
-            },
-            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-            signal: controller.signal,
-        });
-        const payload = await readDirectResponse(response);
-        if (!response.ok) throw new Error(readDirectError(payload) || `上游请求失败：${response.status}`);
-        const error = readDirectError(payload);
-        if (error) throw new Error(error);
-        return payload;
-    } finally {
-        if (timeout) window.clearTimeout(timeout);
+async function requestDirectJSON(url: string, apiKey: string, contentType: string, body?: unknown, timeoutMs?: number, retryImage = false) {
+    const startedAt = Date.now();
+    for (let attempt = 0; ; attempt += 1) {
+        const remaining = timeoutMs ? timeoutMs - (Date.now() - startedAt) : undefined;
+        if (remaining !== undefined && remaining <= 0) throw new Error("请求超时");
+        const controller = new AbortController();
+        const timeout = remaining ? window.setTimeout(() => controller.abort(), remaining) : 0;
+        try {
+            const response = await fetch(url, {
+                method: body === undefined ? "GET" : "POST",
+                headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    ...(body === undefined ? {} : { "Content-Type": contentType || "application/json" }),
+                },
+                ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+                signal: controller.signal,
+            });
+            const payload = await readDirectResponse(response);
+            const knownError = readDirectError(payload);
+            if (!response.ok) {
+                const httpError = readDirectHTTPError(payload);
+                if (!shouldRetryDirectImage(response.status, httpError) || !retryImage) {
+                    throw new DirectAIRequestError(httpError || `上游请求失败：${response.status}`);
+                }
+                if (attempt >= DIRECT_IMAGE_MAX_RETRIES) {
+                    throw new DirectAIRequestError(`上游临时不可用：${response.status}，已重试 ${DIRECT_IMAGE_MAX_RETRIES} 次`);
+                }
+            } else {
+                if (knownError) throw new DirectAIRequestError(knownError);
+                const raw = readDirectRawError(payload);
+                if (raw) throw new DirectAIRequestError(raw);
+                return payload;
+            }
+        } catch (error) {
+            if (error instanceof DirectAIRequestError) throw error;
+            if (!retryImage) throw error;
+            if (attempt >= DIRECT_IMAGE_MAX_RETRIES) {
+                throw new Error(`上游网络异常，已重试 ${DIRECT_IMAGE_MAX_RETRIES} 次`);
+            }
+        } finally {
+            if (timeout) window.clearTimeout(timeout);
+        }
+        // 图片创建请求可能产生费用，按用户确认仅对无明确业务错误的临时故障重试。
+        await delay(DIRECT_IMAGE_RETRY_DELAY_MS * (attempt + 1));
     }
 }
+
+class DirectAIRequestError extends Error {}
 
 async function readDirectResponse(response: Response): Promise<unknown> {
     const text = await response.text();
@@ -304,8 +333,12 @@ async function readDirectResponse(response: Response): Promise<unknown> {
     try {
         return JSON.parse(text);
     } catch {
-        return { message: text };
+        return { raw: text };
     }
+}
+
+function shouldRetryDirectImage(status: number, knownError: string) {
+    return !knownError && [500, 502, 503, 504].includes(status);
 }
 
 function directPollURL(config: AiConfig, provider: DirectAIProvider, taskId: string) {
@@ -352,6 +385,25 @@ function readDirectError(payload: unknown) {
     if (explicitError) return explicitError;
     if (code !== undefined && code !== 0 && code !== 200) return firstString(readPath(payload, "msg"), readPath(payload, "message"), `上游请求失败：${code}`);
     return "";
+}
+
+function readDirectHTTPError(payload: unknown) {
+    return firstString(
+        readPath(payload, "error.message"),
+        readPath(payload, "data.error.message"),
+        readPath(payload, "data.failMsg"),
+        readPath(payload, "data.failCode"),
+        readPath(payload, "msg"),
+        readPath(payload, "message"),
+    );
+}
+
+function readDirectRawError(payload: unknown) {
+    return readString(readPath(payload, "raw")).slice(0, 500);
+}
+
+function readDirectFailureMessage(payload: unknown) {
+    return firstString(readDirectHTTPError(payload), readDirectRawError(payload));
 }
 
 function normalizeDirectStatus(value: string) {

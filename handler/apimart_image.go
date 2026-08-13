@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/tigerowo/infinite-canvas/model"
-	"github.com/tigerowo/infinite-canvas/service"
 )
 
 func normalizeAPIMartImageBody(body []byte, contentType string, modelName string, channel model.ModelChannel) ([]byte, string, error) {
@@ -45,6 +44,9 @@ func normalizeAPIMartImageParams(payload map[string]any, modelName string, chann
 
 	normalizeAPIMartResolution(payload, config)
 	normalizeAPIMartAspect(payload, config)
+	if value := strings.TrimSpace(toStringSafe(payload[config.aspectField])); isAPIMartGrokImageAspectModel(modelName) && value != "" {
+		payload[config.aspectField] = normalizeGrokImageAspect(value)
+	}
 	normalizeAPIMartImageCount(payload, config)
 	normalizeAPIMartImageQuality(payload, config)
 	if apimartImageReferenceExcluded(modelName) {
@@ -254,13 +256,16 @@ func pollAPIMartImageTask(request *http.Request, channel model.ModelChannel, tas
 			return nil, err.Error()
 		}
 		pollRequest.Header.Set("Authorization", "Bearer "+channel.APIKey)
-		response, err := service.HTTPClientForChannel(channel).Do(pollRequest)
+		response, err := doAIRequestWithRetry(pollRequest, channel, true)
 		if err != nil {
-			return nil, err.Error()
+			return nil, imageRetryFailureMessage(true, 0, err)
 		}
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 512*1024))
 		_ = response.Body.Close()
 		if response.StatusCode >= http.StatusBadRequest {
+			if shouldRetryImageUpstream(true, response.StatusCode, body) {
+				return nil, imageRetryFailureMessage(true, response.StatusCode, nil)
+			}
 			return nil, readUpstreamAIErrorMessage(body, response.StatusCode)
 		}
 		imageURLs, done, errorMessage := readAPIMartImageTaskResult(body)

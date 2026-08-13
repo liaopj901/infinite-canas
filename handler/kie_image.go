@@ -1061,13 +1061,16 @@ func pollKIEImageTask(request *http.Request, channel model.ModelChannel, taskID 
 		}
 		pollRequest.Header.Set("Authorization", "Bearer "+channel.APIKey)
 
-		response, err := service.HTTPClientForChannel(channel).Do(pollRequest)
+		response, err := doAIRequestWithRetry(pollRequest, channel, true)
 		if err != nil {
-			return nil, err.Error(), ""
+			return nil, imageRetryFailureMessage(true, 0, err), ""
 		}
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 512*1024))
 		_ = response.Body.Close()
 		if response.StatusCode >= http.StatusBadRequest {
+			if shouldRetryImageUpstream(true, response.StatusCode, body) {
+				return nil, imageRetryFailureMessage(true, response.StatusCode, nil), string(body)
+			}
 			return nil, readUpstreamAIErrorMessage(body, response.StatusCode), string(body)
 		}
 

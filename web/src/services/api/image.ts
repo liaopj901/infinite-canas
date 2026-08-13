@@ -19,6 +19,7 @@ type ImageApiResponse = {
     error?: { message?: string };
     code?: number;
     msg?: string;
+    message?: string;
 };
 
 type ResponsesApiResponse = {
@@ -26,6 +27,7 @@ type ResponsesApiResponse = {
     error?: { message?: string };
     code?: number;
     msg?: string;
+    message?: string;
 };
 
 type GeneratedImage = { id: string; dataUrl: string; seed?: number };
@@ -68,11 +70,13 @@ type ParsedImageResponse = {
 
 export class ImageRequestError extends Error {
     detail?: string;
+    status?: number;
 
-    constructor(message: string, detail?: unknown) {
+    constructor(message: string, detail?: unknown, status?: number) {
         super(message);
         this.name = "ImageRequestError";
         this.detail = formatErrorDetail(detail);
+        this.status = status;
     }
 }
 
@@ -169,8 +173,11 @@ function resolveImageDataUrl(item: Record<string, unknown>, mime: string) {
 }
 
 function parseImagePayload(payload: ImageApiResponse, mime: string): GeneratedImage[] {
+    if (payload.error?.message) {
+        throw new ImageRequestError(payload.error.message, payload);
+    }
     if (typeof payload.code === "number" && payload.code !== 0) {
-        throw new ImageRequestError(payload.msg || "请求失败", payload);
+        throw new ImageRequestError(payload.msg || payload.message || "请求失败", payload);
     }
     const images =
         payload.data
@@ -179,7 +186,7 @@ function parseImagePayload(payload: ImageApiResponse, mime: string): GeneratedIm
             .map((dataUrl) => ({ id: nanoid(), dataUrl })) || [];
 
     if (images.length === 0) {
-        throw new ImageRequestError("接口没有返回图片", payload);
+        throw new ImageRequestError(payload.msg || payload.message || "接口没有返回图片", payload);
     }
 
     return images;
@@ -212,8 +219,11 @@ function collectResponsesImageBase64(item: Record<string, unknown>) {
 }
 
 function parseResponsesPayload(payload: ResponsesApiResponse, mime: string): GeneratedImage[] {
+    if (payload.error?.message) {
+        throw new ImageRequestError(payload.error.message, payload);
+    }
     if (typeof payload.code === "number" && payload.code !== 0) {
-        throw new ImageRequestError(payload.msg || "请求失败", payload);
+        throw new ImageRequestError(payload.msg || payload.message || "请求失败", payload);
     }
     const images =
         payload.output
@@ -223,16 +233,21 @@ function parseResponsesPayload(payload: ResponsesApiResponse, mime: string): Gen
             .map((b64) => ({ id: nanoid(), dataUrl: normalizeBase64Image(b64, mime) })) || [];
 
     if (images.length === 0) {
-        throw new ImageRequestError("Responses API 没有返回图片", payload);
+        throw new ImageRequestError(payload.msg || payload.message || "Responses API 没有返回图片", payload);
     }
 
     return images;
 }
 
 function readAxiosError(error: unknown, fallback: string) {
-    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; code?: number }>(error)) {
+    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; message?: string; code?: number } | string>(error)) {
         const responseData = error.response?.data;
-        return responseData?.msg || responseData?.error?.message || (error.response?.status ? `${fallback}：${error.response.status}` : fallback);
+        if (typeof responseData === "string" && responseData.trim()) return responseData.trim();
+        if (responseData && typeof responseData === "object") {
+            const message = responseData.error?.message || responseData.msg || responseData.message;
+            if (message) return message;
+        }
+        return error.response?.status ? `${fallback}：${error.response.status}` : fallback;
     }
     return error instanceof Error ? error.message : fallback;
 }
@@ -280,23 +295,44 @@ async function withTimeout<T>(timeoutSeconds: number, run: (signal: AbortSignal)
 }
 
 function isTransientStatus(status: number) {
-    return status === 429 || status === 502 || status === 503 || status === 504;
+    return status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 function retryDelay(attempt: number) {
     return 700 * attempt;
 }
 
-async function requestWithTransientRetry(run: () => Promise<Response>, retries = 2) {
+async function readKnownRetryError(response: Response) {
+    const text = await response.clone().text();
+    if (!text.trim()) return { message: "", detail: `${response.status} ${response.statusText}` };
+    try {
+        const payload = JSON.parse(text) as { error?: { message?: string }; msg?: string; message?: string };
+        return { message: payload.error?.message || payload.msg || payload.message || "", detail: payload };
+    } catch {
+        return { message: "", detail: text };
+    }
+}
+
+async function requestWithTransientRetry(run: () => Promise<Response>, enabled: boolean, retries = 3) {
     let lastError: unknown;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
         try {
             const response = await run();
-            if (!isTransientStatus(response.status) || attempt === retries) return response;
+            if (!enabled || !isTransientStatus(response.status)) return response;
+            const error = await readKnownRetryError(response);
+            if (error.message) return response;
+            await response.body?.cancel();
+            if (attempt === retries) {
+                throw new ImageRequestError(`上游临时不可用：${response.status}，已重试 ${retries} 次`, error.detail, response.status);
+            }
             lastError = new Error(`上游接口临时不可用：${response.status}`);
         } catch (error) {
+            if (error instanceof ImageRequestError) throw error;
             lastError = error;
-            if (attempt === retries) throw error;
+            if (!enabled) throw error;
+            if (attempt === retries) {
+                throw new ImageRequestError(`上游网络异常，已重试 ${retries} 次`, error instanceof Error ? error.message : error);
+            }
         }
         await new Promise((resolve) => window.setTimeout(resolve, retryDelay(attempt + 1)));
     }
@@ -464,7 +500,7 @@ export function aiHeaders(config: AiConfig, contentType?: string) {
         };
     }
     return {
-        Authorization: `Bearer ${localChannelForActiveModel(config)?.apiKey || config.apiKey}`,
+        Authorization: `Bearer ${(localChannelForActiveModel(config)?.apiKey || config.apiKey).trim()}`,
         ...(contentType ? { "Content-Type": contentType } : {}),
     };
 }
@@ -572,15 +608,17 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
             body,
             params.timeoutSeconds,
             () =>
-                requestWithTransientRetry(() =>
-                    withTimeout(params.timeoutSeconds, (signal) =>
-                        fetch(aiApiUrl(config, "/images/generations"), {
-                            method: "POST",
-                            headers: aiHeaders(config, "application/json"),
-                            body: JSON.stringify(body),
-                            signal,
-                        }),
-                    ),
+                requestWithTransientRetry(
+                    () =>
+                        withTimeout(params.timeoutSeconds, (signal) =>
+                            fetch(aiApiUrl(config, "/images/generations"), {
+                                method: "POST",
+                                headers: aiHeaders(config, "application/json"),
+                                body: JSON.stringify(body),
+                                signal,
+                            }),
+                        ),
+                    !usesAccountProxy(config),
                 ),
             async (response) => {
                 if (config.streamImages && isEventStreamResponse(response)) {
@@ -619,15 +657,17 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
         body,
         params.timeoutSeconds,
         () =>
-            requestWithTransientRetry(() =>
-                withTimeout(params.timeoutSeconds, (signal) =>
-                    fetch(aiApiUrl(config, "/images/generations"), {
-                        method: "POST",
-                        headers: aiHeaders(config, "application/json"),
-                        body: JSON.stringify(body),
-                        signal,
-                    }),
-                ),
+            requestWithTransientRetry(
+                () =>
+                    withTimeout(params.timeoutSeconds, (signal) =>
+                        fetch(aiApiUrl(config, "/images/generations"), {
+                            method: "POST",
+                            headers: aiHeaders(config, "application/json"),
+                            body: JSON.stringify(body),
+                            signal,
+                        }),
+                    ),
+                !usesAccountProxy(config),
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
@@ -668,15 +708,17 @@ async function requestImageEditSingle(config: AiConfig, prompt: string, referenc
         summarizeFormData(formData),
         params.timeoutSeconds,
         () =>
-            requestWithTransientRetry(() =>
-                withTimeout(params.timeoutSeconds, (signal) =>
-                    fetch(aiApiUrl(config, "/images/edits"), {
-                        method: "POST",
-                        headers: aiHeaders(config),
-                        body: formData,
-                        signal,
-                    }),
-                ),
+            requestWithTransientRetry(
+                () =>
+                    withTimeout(params.timeoutSeconds, (signal) =>
+                        fetch(aiApiUrl(config, "/images/edits"), {
+                            method: "POST",
+                            headers: aiHeaders(config),
+                            body: formData,
+                            signal,
+                        }),
+                    ),
+                !usesAccountProxy(config),
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
@@ -733,15 +775,17 @@ async function requestResponsesSingle(config: AiConfig, prompt: string, inputIma
         body,
         params.timeoutSeconds,
         () =>
-            requestWithTransientRetry(() =>
-                withTimeout(params.timeoutSeconds, (signal) =>
-                    fetch(aiApiUrl(config, "/responses"), {
-                        method: "POST",
-                        headers: aiHeaders(config, "application/json"),
-                        body: JSON.stringify(body),
-                        signal,
-                    }),
-                ),
+            requestWithTransientRetry(
+                () =>
+                    withTimeout(params.timeoutSeconds, (signal) =>
+                        fetch(aiApiUrl(config, "/responses"), {
+                            method: "POST",
+                            headers: aiHeaders(config, "application/json"),
+                            body: JSON.stringify(body),
+                            signal,
+                        }),
+                    ),
+                !usesAccountProxy(config),
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
@@ -771,7 +815,8 @@ async function requestAndParseImages(config: AiConfig, endpoint: string, request
         return parsed.images;
     } catch (error) {
         if (!logged) {
-            void writeLocalAICallLog(config, endpoint, startedAt, 0, timeoutSeconds, stringifyLogPayload(requestBody), "", error instanceof ImageRequestError ? error.detail || error.message : error instanceof Error ? error.message : "请求失败");
+            const status = error instanceof ImageRequestError ? error.status || 0 : 0;
+            void writeLocalAICallLog(config, endpoint, startedAt, status, timeoutSeconds, stringifyLogPayload(requestBody), "", error instanceof ImageRequestError ? error.detail || error.message : error instanceof Error ? error.message : "请求失败");
         }
         throw error;
     }
@@ -1028,13 +1073,19 @@ export async function fetchImageModels(config: AiConfig) {
     const channel = localChannelForActiveModel(config);
     if (isMimoChannel(channel || { baseUrl: config.baseUrl })) return [...mimoModels];
     try {
-        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
+        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string }; msg?: string; message?: string; code?: number }>(buildApiUrl((channel?.baseUrl || config.baseUrl).trim(), "/models"), {
             headers: {
-                Authorization: `Bearer ${config.apiKey}`,
+                Authorization: `Bearer ${(channel?.apiKey || config.apiKey).trim()}`,
             },
             timeout: IMAGE_REQUEST_TIMEOUT_SECONDS * 1000,
         });
-        return (response.data.data || [])
+        const invalidCode = typeof response.data.code === "number" && response.data.code !== 0 && response.data.code !== 200;
+        const upstreamError = response.data.error?.message || (invalidCode || !Array.isArray(response.data.data) ? response.data.msg || response.data.message : "");
+        if (upstreamError || invalidCode) {
+            throw new Error(upstreamError || `读取模型失败：${response.data.code}`);
+        }
+        if (!Array.isArray(response.data.data)) throw new Error("上游未返回模型列表");
+        return response.data.data
             .map((model) => model.id)
             .filter((id): id is string => Boolean(id))
             .sort((a, b) => a.localeCompare(b));
@@ -1123,15 +1174,17 @@ async function requestAgnesImageEdit(config: AiConfig & { seedIndex?: number; se
         body,
         params.timeoutSeconds,
         () =>
-            requestWithTransientRetry(() =>
-                withTimeout(params.timeoutSeconds, (signal) =>
-                    fetch(aiApiUrl(config, "/images/generations"), {
-                        method: "POST",
-                        headers: aiHeaders(config, "application/json"),
-                        body: JSON.stringify(body),
-                        signal,
-                    }),
-                ),
+            requestWithTransientRetry(
+                () =>
+                    withTimeout(params.timeoutSeconds, (signal) =>
+                        fetch(aiApiUrl(config, "/images/generations"), {
+                            method: "POST",
+                            headers: aiHeaders(config, "application/json"),
+                            body: JSON.stringify(body),
+                            signal,
+                        }),
+                    ),
+                !usesAccountProxy(config),
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {

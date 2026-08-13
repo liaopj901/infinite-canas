@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,11 @@ import (
 )
 
 const userModelChannelHeader = "X-User-Model-Channel-ID"
+
+const (
+	imageUpstreamMaxRetries = 3
+	imageUpstreamRetryDelay = 700 * time.Millisecond
+)
 
 func selectAIRequestChannel(user model.AuthUser, modelName string, channelID string, userChannelID string) (model.ModelChannel, string, error) {
 	userChannelID = strings.TrimSpace(userChannelID)
@@ -193,6 +199,7 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 		UserDisplayName: firstNonEmpty(user.DisplayName, user.Username),
 		Credits:         credits,
 		RequestBody:     summarizeAIRequest(body, contentType),
+		ImageRequest:    isImageAIRequest(path, body),
 	}, func() {
 		if credits > 0 {
 			if err := service.RefundUserCredits(user.ID, modelName, credits, upstreamPath); err != nil {
@@ -212,17 +219,18 @@ type aiLogContext struct {
 	UserDisplayName string
 	Credits         int
 	RequestBody     string
+	ImageRequest    bool
 }
 
 func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.ModelChannel, logContext aiLogContext, onFailure func()) {
-	response, err := service.HTTPClientForChannel(channel).Do(request)
+	response, err := doAIRequestWithRetry(request, channel, logContext.ImageRequest)
 	if err != nil {
 		log.Printf("AI proxy request failed: url=%s err=%v", request.URL.String(), err)
 		if onFailure != nil {
 			onFailure()
 		}
 		saveAIProxyLog(logContext, 0, "", err.Error())
-		Fail(w, "AI 接口请求失败")
+		Fail(w, imageRetryFailureMessage(logContext.ImageRequest, 0, err))
 		return
 	}
 	defer response.Body.Close()
@@ -234,7 +242,11 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.
 			onFailure()
 		}
 		saveAIProxyLog(logContext, response.StatusCode, string(payload), strings.TrimSpace(string(payload)))
-		Fail(w, readUpstreamAIErrorMessage(payload, response.StatusCode))
+		message := readUpstreamAIErrorMessage(payload, response.StatusCode)
+		if shouldRetryImageUpstream(logContext.ImageRequest, response.StatusCode, payload) {
+			message = imageRetryFailureMessage(logContext.ImageRequest, response.StatusCode, nil)
+		}
+		Fail(w, message)
 		return
 	}
 
@@ -264,6 +276,145 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.
 	w.WriteHeader(response.StatusCode)
 	responseBody := copyAIResponseBody(w, response.Body)
 	saveAIProxyLog(logContext, response.StatusCode, responseBody, "")
+}
+
+func doAIRequestWithRetry(request *http.Request, channel model.ModelChannel, retryImage bool) (*http.Response, error) {
+	client := service.HTTPClientForChannel(channel)
+	maxRetries := 0
+	if retryImage {
+		maxRetries = imageUpstreamMaxRetries
+	}
+	// 图片 POST 只有在没有明确业务错误时才重放，避免把余额不足或参数错误放大成重复任务。
+	for attempt := 0; ; attempt++ {
+		current, err := cloneAIRequest(request)
+		if err != nil {
+			return nil, err
+		}
+		response, err := client.Do(current)
+		if err != nil {
+			if attempt >= maxRetries {
+				if retryImage {
+					return nil, &imageUpstreamRetryError{err: err}
+				}
+				return nil, err
+			}
+			log.Printf("AI upstream temporary failure, retrying: url=%s attempt=%d/%d err=%v", request.URL.String(), attempt+1, maxRetries, err)
+			if err := waitAIRequestRetry(request, attempt); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if !shouldInspectImageRetryResponse(retryImage, response.StatusCode) {
+			return response, nil
+		}
+		payload, readErr := io.ReadAll(io.LimitReader(response.Body, 256*1024))
+		response.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		response.Body = io.NopCloser(bytes.NewReader(payload))
+		if !shouldRetryImageUpstream(retryImage, response.StatusCode, payload) || attempt >= maxRetries {
+			return response, nil
+		}
+		log.Printf("AI upstream temporary failure, retrying: url=%s status=%d attempt=%d/%d", request.URL.String(), response.StatusCode, attempt+1, maxRetries)
+		if err := waitAIRequestRetry(request, attempt); err != nil {
+			return nil, err
+		}
+	}
+}
+
+type imageUpstreamRetryError struct {
+	err error
+}
+
+func (e *imageUpstreamRetryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *imageUpstreamRetryError) Unwrap() error {
+	return e.err
+}
+
+func cloneAIRequest(request *http.Request) (*http.Request, error) {
+	cloned := request.Clone(request.Context())
+	if request.Body == nil {
+		return cloned, nil
+	}
+	if request.GetBody == nil {
+		return nil, errors.New("AI 请求体无法重试")
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	cloned.Body = body
+	return cloned, nil
+}
+
+func waitAIRequestRetry(request *http.Request, attempt int) error {
+	// 线性退避避免连续冲击临时故障的上游，同时保持图片任务等待时间可控。
+	timer := time.NewTimer(imageUpstreamRetryDelay * time.Duration(attempt+1))
+	defer timer.Stop()
+	select {
+	case <-request.Context().Done():
+		return request.Context().Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isImageAIRequest(endpoint string, body []byte) bool {
+	switch endpoint {
+	case "/images/generations", "/images/edits":
+		return true
+	case "/responses":
+		var payload struct {
+			Tools []struct {
+				Type string `json:"type"`
+			} `json:"tools"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			return false
+		}
+		for _, tool := range payload.Tools {
+			if tool.Type == "image_generation" {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func shouldInspectImageRetryResponse(retryImage bool, statusCode int) bool {
+	if !retryImage {
+		return false
+	}
+	switch statusCode {
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetryImageUpstream(retryImage bool, statusCode int, body []byte) bool {
+	return shouldInspectImageRetryResponse(retryImage, statusCode) && readKnownUpstreamAIErrorMessage(body) == ""
+}
+
+func imageRetryFailureMessage(retryImage bool, statusCode int, err error) string {
+	if !retryImage {
+		return "AI 接口请求失败"
+	}
+	if statusCode > 0 {
+		return fmt.Sprintf("上游临时不可用：%d，已重试 %d 次", statusCode, imageUpstreamMaxRetries)
+	}
+	var retryError *imageUpstreamRetryError
+	if errors.As(err, &retryError) {
+		return fmt.Sprintf("上游网络异常，已重试 %d 次", imageUpstreamMaxRetries)
+	}
+	return "AI 接口请求失败"
 }
 
 func copyAIResponseBody(w http.ResponseWriter, body io.Reader) string {
@@ -364,6 +515,16 @@ func summarizeMultipartAIRequest(body []byte, contentType string) string {
 }
 
 func readUpstreamAIErrorMessage(body []byte, statusCode int) string {
+	if message := readKnownUpstreamAIErrorMessage(body); message != "" {
+		return message
+	}
+	if statusCode > 0 {
+		return fmt.Sprintf("AI 接口请求失败：%d", statusCode)
+	}
+	return "AI 接口请求失败"
+}
+
+func readKnownUpstreamAIErrorMessage(body []byte) string {
 	var payload struct {
 		Error *struct {
 			Message string `json:"message"`
@@ -382,10 +543,7 @@ func readUpstreamAIErrorMessage(body []byte, statusCode int) string {
 			return payload.Message
 		}
 	}
-	if statusCode > 0 {
-		return fmt.Sprintf("AI 接口请求失败：%d", statusCode)
-	}
-	return "AI 接口请求失败"
+	return ""
 }
 
 func redactLargeImages(value *any) {

@@ -422,6 +422,9 @@ func setKIEAspectInput(input map[string]any, modelName string, value any) {
 
 	setKIESizeResolutionInput(input, modelName, value)
 	normalized := normalizeKIEAspectValue(toStringSafe(value), config.aspectKind)
+	if strings.EqualFold(strings.TrimSpace(modelName), "grok-imagine/text-to-image") {
+		normalized = normalizeGrokImageAspect(normalized)
+	}
 	delete(input, "size")
 
 	if field == "ratio" {

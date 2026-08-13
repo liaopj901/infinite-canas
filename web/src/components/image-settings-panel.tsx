@@ -13,6 +13,8 @@ const qualityOptions = [
     { value: "low", label: "低" },
 ];
 const DIMENSION_STEP = 16;
+const GROK_IMAGE_ASPECTS = new Set(["1:1", "3:2", "2:3", "16:9", "9:16"]);
+const GROK_IMAGE_ASPECT_MODELS = new Set(["grok-imagine/text-to-image", "grok-imagine-1.5-apimart", "grok-imagine-1.5-ext"]);
 
 const aspectOptions = [
     { value: "1:1", label: "1:1", width: 1024, height: 1024, icon: "square" },
@@ -50,10 +52,14 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
     const quality = config.quality || "auto";
     const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
     const activeSize = config.size || "auto";
-    const selectedAspect = aspectOptions.find((item) => (item.size || item.value) === activeSize || item.value === activeSize);
-    const dimensions = readSizeDimensions(activeSize, selectedAspect || aspectOptions[0]);
+    const model = (config.model || config.imageModel || "").trim().toLowerCase();
+    const isGrokImageToImage = model === "grok-imagine/image-to-image";
+    const hasGrokAspectLimits = GROK_IMAGE_ASPECT_MODELS.has(model);
+    const availableAspectOptions = hasGrokAspectLimits ? aspectOptions.filter((item) => GROK_IMAGE_ASPECTS.has(item.value)) : aspectOptions;
+    const selectedAspect = availableAspectOptions.find((item) => (item.size || item.value) === activeSize || item.value === activeSize);
+    const dimensions = readSizeDimensions(activeSize, selectedAspect || availableAspectOptions[0] || aspectOptions[0]);
     const selectAspect = (value: string) => {
-        const option = aspectOptions.find((item) => item.value === value);
+        const option = availableAspectOptions.find((item) => item.value === value);
         onConfigChange("size", option?.size || option?.value || "auto");
     };
     const updateDimension = (key: "width" | "height", value: number | null) => {
@@ -85,30 +91,32 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         ))}
                     </div>
                 </div>
-                {showSize ? (
+                {showSize && !isGrokImageToImage ? (
                     <>
-                        <div className="space-y-2.5">
-                            <div className="flex items-center justify-between gap-3">
-                                <SettingTitle color={theme.node.muted}>尺寸</SettingTitle>
-                                <div className="flex items-center gap-2">
-                                    <span className="text-xs font-medium" style={{ color: theme.node.muted }}>
-                                        16倍数对齐
-                                    </span>
-                                    <span title="输入完成后自动向上补成 16 的倍数" onMouseDown={(event) => event.stopPropagation()}>
-                                        <Switch size="small" checked={snapDimensionToStep} onChange={setSnapDimensionToStep} />
-                                    </span>
+                        {!hasGrokAspectLimits ? (
+                            <div className="space-y-2.5">
+                                <div className="flex items-center justify-between gap-3">
+                                    <SettingTitle color={theme.node.muted}>尺寸</SettingTitle>
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs font-medium" style={{ color: theme.node.muted }}>
+                                            16倍数对齐
+                                        </span>
+                                        <span title="输入完成后自动向上补成 16 的倍数" onMouseDown={(event) => event.stopPropagation()}>
+                                            <Switch size="small" checked={snapDimensionToStep} onChange={setSnapDimensionToStep} />
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2.5">
+                                    <DimensionInput prefix="W" value={dimensions.width} disabled={activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
+                                    <span className="text-lg opacity-45">↔</span>
+                                    <DimensionInput prefix="H" value={dimensions.height} disabled={activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
                                 </div>
                             </div>
-                            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2.5">
-                                <DimensionInput prefix="W" value={dimensions.width} disabled={activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
-                                <span className="text-lg opacity-45">↔</span>
-                                <DimensionInput prefix="H" value={dimensions.height} disabled={activeSize === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
-                            </div>
-                        </div>
+                        ) : null}
                         <div className="space-y-2.5">
                             <SettingTitle color={theme.node.muted}>宽高比</SettingTitle>
                             <div className="grid grid-cols-4 gap-2.5">
-                                {aspectOptions.map((item) => (
+                                {availableAspectOptions.map((item) => (
                                     <button
                                         key={item.value}
                                         type="button"
