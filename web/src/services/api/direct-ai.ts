@@ -15,10 +15,10 @@ const DIRECT_IMAGE_POLL_INTERVAL_MS = 2000;
 const DIRECT_IMAGE_MAX_RETRIES = 3;
 const DIRECT_IMAGE_RETRY_DELAY_MS = 700;
 
-export async function requestDirectImages(config: AiConfig, provider: DirectAIProvider, endpoint: "/images/generations" | "/images/edits", body: DirectRequestBody, timeoutSeconds: number): Promise<DirectImageResponse> {
+export async function requestDirectImages(config: AiConfig, provider: DirectAIProvider, endpoint: "/images/generations" | "/images/edits", body: DirectRequestBody, timeoutSeconds: number, signal?: AbortSignal): Promise<DirectImageResponse> {
     const startedAt = Date.now();
-    const { plan, requestBody, apiKey } = await prepareDirectRequest(config, provider, endpoint, body);
-    const created = await requestDirectJSON(plan.url, apiKey, plan.contentType, requestBody, remainingTimeoutMs(startedAt, timeoutSeconds), true);
+    const { plan, requestBody, apiKey } = await prepareDirectRequest(config, provider, endpoint, body, signal);
+    const created = await requestDirectJSON(plan.url, apiKey, plan.contentType, requestBody, remainingTimeoutMs(startedAt, timeoutSeconds), true, signal);
     const directUrls = readDirectImageURLs(provider, created);
     if (directUrls.length) return directImageResponse(directUrls);
     const taskId = readDirectTaskId(provider, created);
@@ -26,8 +26,8 @@ export async function requestDirectImages(config: AiConfig, provider: DirectAIPr
 
     for (;;) {
         const waitMs = Math.min(DIRECT_IMAGE_POLL_INTERVAL_MS, remainingTimeoutMs(startedAt, timeoutSeconds));
-        await delay(waitMs);
-        const payload = await requestDirectJSON(directPollURL(config, provider, taskId), apiKey, "", undefined, remainingTimeoutMs(startedAt, timeoutSeconds), true);
+        await delay(waitMs, signal);
+        const payload = await requestDirectJSON(directPollURL(config, provider, taskId), apiKey, "", undefined, remainingTimeoutMs(startedAt, timeoutSeconds), true, signal);
         const result = readDirectImagePoll(provider, payload);
         if (result.error) throw new Error(result.error);
         if (result.urls.length) return directImageResponse(result.urls);
@@ -80,9 +80,10 @@ export async function pollDirectVideoTask(config: AiConfig, provider: DirectAIPr
     };
 }
 
-async function prepareDirectRequest(config: AiConfig, provider: DirectAIProvider, endpoint: "/images/generations" | "/images/edits" | "/videos", body: DirectRequestBody) {
+async function prepareDirectRequest(config: AiConfig, provider: DirectAIProvider, endpoint: "/images/generations" | "/images/edits" | "/videos", body: DirectRequestBody, signal?: AbortSignal) {
+    throwIfAborted(signal);
     const channel = requireDirectChannel(config);
-    const serialized = await serializeDirectBody(body);
+    const serialized = await serializeDirectBody(body, signal);
     assertSafeDirectBody(serialized.body);
     const plan = await apiPost<DirectRequestPlan>("/api/ai/direct-request", {
         channel: { protocol: channel.protocol, baseUrl: channel.baseUrl },
@@ -90,9 +91,10 @@ async function prepareDirectRequest(config: AiConfig, provider: DirectAIProvider
         endpoint,
         body: serialized.body,
     });
+    throwIfAborted(signal);
     if (plan.provider !== provider) throw new Error("前后端渠道识别结果不一致");
     const apiKey = channel.apiKey.trim();
-    const requestBody = await uploadAndReplaceReferences(plan, serialized.references, apiKey);
+    const requestBody = await uploadAndReplaceReferences(plan, serialized.references, apiKey, signal);
     return { plan, requestBody, apiKey };
 }
 
@@ -102,14 +104,14 @@ function requireDirectChannel(config: AiConfig) {
     return channel;
 }
 
-async function serializeDirectBody(body: DirectRequestBody): Promise<SerializedDirectBody> {
+async function serializeDirectBody(body: DirectRequestBody, signal?: AbortSignal): Promise<SerializedDirectBody> {
     const references: DirectReference[] = [];
     const runId = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const serialize = async (value: unknown, key = ""): Promise<unknown> => {
         if (isFile(value)) return registerDirectReference(value, key, runId, references);
         if (isBlob(value)) return registerDirectReference(new File([value], directReferenceFilename(referenceKind(value.type, key), value.type), { type: value.type || "application/octet-stream" }), key, runId, references);
         if (typeof value === "string" && (isMediaDataURL(value) || value.startsWith("blob:"))) {
-            const file = await directReferenceFileFromURL(value, key);
+            const file = await directReferenceFileFromURL(value, key, signal);
             return registerDirectReference(file, key, runId, references);
         }
         if (Array.isArray(value)) return Promise.all(value.map((item) => serialize(item, key)));
@@ -157,8 +159,8 @@ function appendDirectFormValue(result: Record<string, unknown>, counts: Map<stri
     (result[key] as unknown[]).push(value);
 }
 
-async function directReferenceFileFromURL(value: string, key: string) {
-    const response = await fetch(value);
+async function directReferenceFileFromURL(value: string, key: string, signal?: AbortSignal) {
+    const response = await fetch(value, { signal });
     if (!response.ok) throw new Error(`参考素材读取失败：${response.status}`);
     const blob = await response.blob();
     const type = blob.type || mediaTypeFromDataURL(value) || "application/octet-stream";
@@ -221,25 +223,25 @@ function assertSafeDirectBody(value: unknown) {
     if (isPlainRecord(value)) Object.values(value).forEach(assertSafeDirectBody);
 }
 
-async function uploadAndReplaceReferences(plan: DirectRequestPlan, references: DirectReference[], apiKey: string) {
+async function uploadAndReplaceReferences(plan: DirectRequestPlan, references: DirectReference[], apiKey: string, signal?: AbortSignal) {
     const retained = references.filter((reference) => containsDirectMarker(plan.body, reference.marker));
     const uploaded = new Map<string, string>();
     await Promise.all(retained.map(async (reference) => {
         const spec = plan.uploads?.[reference.kind];
         if (!spec) throw new Error(`${plan.provider} 不支持上传本地${directReferenceKindName(reference.kind)}`);
-        uploaded.set(reference.marker, await uploadDirectReference(spec, reference.file, apiKey));
+        uploaded.set(reference.marker, await uploadDirectReference(spec, reference.file, apiKey, signal));
     }));
     const replaced = replaceDirectMarkers(plan.body, uploaded);
     if (containsAnyDirectMarker(replaced)) throw new Error("参考素材地址替换失败");
     return replaced;
 }
 
-async function uploadDirectReference(spec: DirectUploadSpec, file: File, apiKey: string) {
+async function uploadDirectReference(spec: DirectUploadSpec, file: File, apiKey: string, signal?: AbortSignal) {
     const formData = new FormData();
     formData.append(spec.fileField, file, file.name);
     if (spec.fileNameField) formData.append(spec.fileNameField, file.name);
     Object.entries(spec.extraFields || {}).forEach(([key, value]) => formData.append(key, value));
-    const response = await fetch(spec.url, { method: "POST", headers: { Authorization: `Bearer ${apiKey}` }, body: formData });
+    const response = await fetch(spec.url, { method: "POST", headers: { Authorization: `Bearer ${apiKey}` }, body: formData, signal });
     const payload = await readDirectResponse(response);
     if (!response.ok) throw new Error(readDirectError(payload) || `参考素材上传失败：${response.status}`);
     const error = readDirectError(payload);
@@ -278,12 +280,15 @@ function replaceDirectMarkers(value: unknown, uploaded: Map<string, string>): un
     return value;
 }
 
-async function requestDirectJSON(url: string, apiKey: string, contentType: string, body?: unknown, timeoutMs?: number, retryImage = false) {
+async function requestDirectJSON(url: string, apiKey: string, contentType: string, body?: unknown, timeoutMs?: number, retryImage = false, signal?: AbortSignal) {
     const startedAt = Date.now();
     for (let attempt = 0; ; attempt += 1) {
+        throwIfAborted(signal);
         const remaining = timeoutMs ? timeoutMs - (Date.now() - startedAt) : undefined;
         if (remaining !== undefined && remaining <= 0) throw new Error("请求超时");
         const controller = new AbortController();
+        const abort = () => controller.abort(signal?.reason);
+        signal?.addEventListener("abort", abort, { once: true });
         const timeout = remaining ? window.setTimeout(() => controller.abort(), remaining) : 0;
         try {
             const response = await fetch(url, {
@@ -312,6 +317,9 @@ async function requestDirectJSON(url: string, apiKey: string, contentType: strin
                 return payload;
             }
         } catch (error) {
+            if (signal?.aborted) throw abortError(signal);
+            if (controller.signal.aborted) throw new Error("请求超时");
+            if (isAbortError(error)) throw error;
             if (error instanceof DirectAIRequestError) throw error;
             if (!retryImage) throw error;
             if (attempt >= DIRECT_IMAGE_MAX_RETRIES) {
@@ -319,9 +327,10 @@ async function requestDirectJSON(url: string, apiKey: string, contentType: strin
             }
         } finally {
             if (timeout) window.clearTimeout(timeout);
+            signal?.removeEventListener("abort", abort);
         }
         // 图片创建请求可能产生费用，按用户确认仅对无明确业务错误的临时故障重试。
-        await delay(DIRECT_IMAGE_RETRY_DELAY_MS * (attempt + 1));
+        await delay(DIRECT_IMAGE_RETRY_DELAY_MS * (attempt + 1), signal);
     }
 }
 
@@ -494,6 +503,30 @@ function remainingTimeoutMs(startedAt: number, timeoutSeconds: number) {
     return remaining;
 }
 
-function delay(ms: number) {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
+function isAbortError(error: unknown) {
+    return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+
+function abortError(signal?: AbortSignal) {
+    return signal?.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError");
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+    if (signal?.aborted) throw abortError(signal);
+}
+
+function delay(ms: number, signal?: AbortSignal) {
+    throwIfAborted(signal);
+    return new Promise<void>((resolve, reject) => {
+        const abort = () => {
+            window.clearTimeout(timer);
+            reject(abortError(signal));
+        };
+        const done = () => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+        };
+        const timer = window.setTimeout(done, ms);
+        signal?.addEventListener("abort", abort, { once: true });
+    });
 }

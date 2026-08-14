@@ -32,6 +32,7 @@ description: 当前后端主要数据表与字段说明
 - `canvas_projects`
 - `user_configs`
 - `storage_objects`
+- `generated_media`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -97,6 +98,29 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `created_at` | string | 创建时间 |
 | `deleted_at` | string | 预留字段；当前删除链路直接删除索引记录 |
 
+### generated_media
+
+生成图片的本地文件与云端对象关系表。数据库只保存元数据，不保存图片二进制或 base64；本地文件位于 `GENERATED_MEDIA_DIR`，上传云端成功后删除本地副本。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 主键，前端本地存储 key 使用 `local:<id>` |
+| `user_id` | string | 图片所有者，用于访问隔离 |
+| `relative_path` | string | 相对于 `GENERATED_MEDIA_DIR` 的文件路径 |
+| `file_name` | string | 原始文件名 |
+| `mime_type` | string | 图片 MIME 类型 |
+| `bytes` | number | 图片字节数 |
+| `width` | number | 图片像素宽度 |
+| `height` | number | 图片像素高度 |
+| `storage_object_id` | string | 云端上传成功后关联的 `storage_objects.id` |
+| `cloud_url` | string | 云端公开地址；为空时通过内容接口读取 |
+| `storage_status` | string | `local`、`cloud` 或 `cleaned` |
+| `storage_message` | string | 自动上传失败或本地清理提示 |
+| `created_at` | string | 记录创建时间 |
+| `updated_at` | string | 最后更新时间 |
+| `cleaned_at` | string | 本地文件清理时间，未清理时为空 |
+
+本地状态图片超过 `GENERATED_MEDIA_RETENTION_DAYS` 天后由后台定时任务删除文件并标记为 `cleaned`；云端状态不参与本地清理。
 ### prompts
 
 提示词表。用于保存公开提示词、内置 GitHub 系统提示词、分类和预览内容。
@@ -188,7 +212,7 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 
 ### image_generation_logs
 
-生图工作台成果历史表。当前先提供后端表和接口，前端生图工作台后续再接入；字段设计和软删除策略与 `video_generation_logs` 一致。
+生图工作台成果历史表。完整成果详情仍保存在 `payload_json`，列表接口只读取并返回精简的 `summary_json`，避免把 base64、任务详情和参考图原文重复返回给前端。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -197,7 +221,8 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `task_id` | string | 图片任务 ID，可为空 |
 | `image_id` | string | 图片结果 ID、存储 key 或 URL |
 | `status` | string | 记录状态 |
-| `payload_json` | text | 完整成果卡片 JSON。删除记录会清空该字段 |
+| `payload_json` | text | 完整成果卡片 JSON。删除记录会清空该字段，仅用于单条持久化 |
+| `summary_json` | text | 列表展示所需的精简 JSON，不包含图片二进制、base64 或完整任务详情 |
 | `created_at` | string | 创建时间 |
 | `updated_at` | string | 更新时间 |
 | `deleted_at` | string | 软删除时间，空字符串表示未删除 |

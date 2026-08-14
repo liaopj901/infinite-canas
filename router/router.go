@@ -76,6 +76,16 @@ func New() *gin.Engine {
 		handler.DeleteUserWorkflow(c.Writer, c.Request, c.Param("id"))
 	})
 	v1.POST("/storage/measure", gin.WrapF(handler.MeasureUserStorageProvider))
+	v1.POST("/generated-images", gin.WrapF(handler.SaveGeneratedImage))
+	v1.GET("/generated-images/:id/content", func(c *gin.Context) {
+		handler.GeneratedImageContent(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.POST("/generated-images/:id/upload", func(c *gin.Context) {
+		handler.UploadGeneratedImage(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.DELETE("/generated-images/:id", func(c *gin.Context) {
+		handler.DeleteGeneratedImage(c.Writer, c.Request, c.Param("id"))
+	})
 	v1.POST("/files", gin.WrapF(handler.UploadFile))
 	v1.DELETE("/files/:id", func(c *gin.Context) {
 		handler.DeleteFile(c.Writer, c.Request, c.Param("id"))

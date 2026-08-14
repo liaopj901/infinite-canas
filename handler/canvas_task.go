@@ -17,11 +17,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/service"
 )
+
+// canvasImageTaskRuns 只管理当前进程中的请求取消函数。删除数据库记录负责丢弃结果，取消 context 负责尽快断开仍在等待的上游请求。
+var canvasImageTaskRuns sync.Map
+
+type canvasImageTaskRun struct {
+	cancel context.CancelFunc
+}
 
 func CreateCanvasImageTask(w http.ResponseWriter, r *http.Request) {
 	user, ok := service.UserFromContext(r.Context())
@@ -73,8 +81,9 @@ func CreateCanvasImageTask(w http.ResponseWriter, r *http.Request) {
 		Fail(w, "AI 接口请求失败")
 		return
 	}
+	taskContext, taskRun := registerCanvasImageTaskRun(user.ID, task.ID)
 	OK(w, service.CanvasImageTaskResponse(task))
-	go runCanvasImageTask(task, user, body, contentType, task.ChannelID, task.UserChannelID)
+	go runCanvasImageTask(taskContext, taskRun, task, user, body, contentType, task.ChannelID, task.UserChannelID)
 }
 
 func GetCanvasImageTask(w http.ResponseWriter, r *http.Request, id string) {
@@ -143,6 +152,7 @@ func DeleteUserCanvasImageTask(w http.ResponseWriter, r *http.Request, id string
 		Fail(w, "图片任务不存在")
 		return
 	}
+	cancelCanvasImageTaskRun(user.ID, id)
 	if err := service.DeleteUserCanvasImageTask(user.ID, id); err != nil {
 		log.Printf("delete canvas image task failed: user=%s id=%s err=%v", user.ID, id, err)
 		Fail(w, "AI 接口请求失败")
@@ -247,14 +257,21 @@ func GetCanvasAudioTask(w http.ResponseWriter, r *http.Request, id string) {
 	OK(w, service.CanvasAudioTaskResponse(task))
 }
 
-func runCanvasImageTask(task model.CanvasImageTask, user model.AuthUser, body []byte, contentType string, channelID string, userChannelID string) {
+func runCanvasImageTask(taskContext context.Context, taskRun *canvasImageTaskRun, task model.CanvasImageTask, user model.AuthUser, body []byte, contentType string, channelID string, userChannelID string) {
+	defer finishCanvasImageTaskRun(user.ID, task.ID, taskRun)
+	if taskContext.Err() != nil {
+		return
+	}
 	current := taskTime()
 	task.Status = "processing"
 	task.Progress = 10
 	task.StartedAt = current
 	task, _ = service.SaveCanvasImageTask(task)
 
-	payload, status, responseContentType, err := executeCanvasAIRequest(user, task.Endpoint, body, contentType, channelID, userChannelID)
+	payload, status, responseContentType, err := executeCanvasAIRequest(taskContext, user, task.Endpoint, body, contentType, channelID, userChannelID)
+	if taskContext.Err() != nil {
+		return
+	}
 	if err != nil {
 		saveFailedCanvasImageTask(task, err.Error(), err.Error())
 		return
@@ -272,6 +289,9 @@ func runCanvasImageTask(task model.CanvasImageTask, user model.AuthUser, body []
 	imageURLs, mimeType, bytes, err := imageURLsFromAIResponse(payload, responseContentType, collectAll)
 	if err != nil {
 		saveFailedCanvasImageTask(task, err.Error(), string(payload))
+		return
+	}
+	if taskContext.Err() != nil {
 		return
 	}
 	task.Status = "completed"
@@ -299,7 +319,7 @@ func runCanvasAudioTask(task model.CanvasAudioTask, user model.AuthUser, body []
 	task.StartedAt = current
 	task, _ = service.SaveCanvasAudioTask(task)
 
-	payload, status, responseContentType, err := executeCanvasAIRequest(user, task.Endpoint, body, contentType, channelID, userChannelID)
+	payload, status, responseContentType, err := executeCanvasAIRequest(context.Background(), user, task.Endpoint, body, contentType, channelID, userChannelID)
 	if err != nil {
 		saveFailedCanvasAudioTask(task, err.Error(), err.Error())
 		return
@@ -337,9 +357,9 @@ func runCanvasAudioTask(task model.CanvasAudioTask, user model.AuthUser, body []
 	_, _ = service.SaveCanvasAudioTask(task)
 }
 
-func executeCanvasAIRequest(user model.AuthUser, endpoint string, body []byte, contentType string, channelID string, userChannelID string) ([]byte, int, string, error) {
+func executeCanvasAIRequest(requestContext context.Context, user model.AuthUser, endpoint string, body []byte, contentType string, channelID string, userChannelID string) ([]byte, int, string, error) {
 	request := httptest.NewRequest(http.MethodPost, "http://canvas.local/api/v1"+endpoint, bytes.NewReader(body))
-	request = request.WithContext(service.WithUser(context.Background(), user))
+	request = request.WithContext(service.WithUser(requestContext, user))
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
@@ -354,6 +374,33 @@ func executeCanvasAIRequest(user model.AuthUser, endpoint string, body []byte, c
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 32*1024*1024))
 	return payload, response.StatusCode, response.Header.Get("Content-Type"), nil
+}
+
+func registerCanvasImageTaskRun(userID string, taskID string) (context.Context, *canvasImageTaskRun) {
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &canvasImageTaskRun{cancel: cancel}
+	canvasImageTaskRuns.Store(canvasImageTaskRunKey(userID, taskID), run)
+	return ctx, run
+}
+
+func cancelCanvasImageTaskRun(userID string, taskID string) {
+	value, ok := canvasImageTaskRuns.LoadAndDelete(canvasImageTaskRunKey(userID, taskID))
+	if !ok {
+		return
+	}
+	value.(*canvasImageTaskRun).cancel()
+}
+
+func finishCanvasImageTaskRun(userID string, taskID string, run *canvasImageTaskRun) {
+	run.cancel()
+	key := canvasImageTaskRunKey(userID, taskID)
+	if current, ok := canvasImageTaskRuns.Load(key); ok && current == run {
+		canvasImageTaskRuns.Delete(key)
+	}
+}
+
+func canvasImageTaskRunKey(userID string, taskID string) string {
+	return strings.TrimSpace(userID) + "\x00" + strings.TrimSpace(taskID)
 }
 
 func saveFailedCanvasImageTask(task model.CanvasImageTask, message string, detail string) {

@@ -47,7 +47,7 @@ import { nanoid } from "nanoid";
 import { formatBytes, formatDuration, getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { ImageRequestError, batchCanvasImageTaskStatus, createCanvasImageTask, deleteCanvasImageTask, listCanvasImageTasks, requestEdit, requestGeneration, type CanvasImageTask } from "@/services/api/image";
 import { deleteImageGenerationLogs, fetchImageGenerationLogs, saveImageGenerationLogs } from "@/services/api/generation-logs";
-import { deleteStoredImages, imageToDataUrl, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadImage, uploadRemoteImageToServer } from "@/services/image-storage";
+import { deleteStoredImages, imageToDataUrl, loadStorageConfig, resolveImageUrl, saveGeneratedImage, shouldAutoSyncGeneratedMedia, uploadGeneratedImageToCloud, uploadImage, uploadRemoteImageToServer } from "@/services/image-storage";
 import { getAccountRecordStorageKey, getAccountStorageKey, getAccountOwnerId } from "@/lib/account-scope";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useUserStore } from "@/stores/use-user-store";
@@ -57,6 +57,8 @@ type GeneratedImage = {
     id: string;
     dataUrl: string;
     storageKey?: string;
+    storageStatus?: "local" | "cloud" | "cleaned";
+    storageMessage?: string;
     durationMs: number;
     width: number;
     height: number;
@@ -173,6 +175,8 @@ export default function ImagePage() {
     const accountHistorySyncEnabledRef = useRef(false);
     const saveLogChainRef = useRef<Promise<void>>(Promise.resolve());
     const pollingLogIdsRef = useRef(new Set<string>());
+    const generationAbortControllersRef = useRef(new Map<string, AbortController>());
+    const cancelledGenerationIdsRef = useRef(new Set<string>());
     const logsRef = useRef<GenerationLog[]>([]);
     const effectiveConfigRef = useRef(effectiveConfig);
 
@@ -263,7 +267,13 @@ export default function ImagePage() {
                 void syncBackendImageTasks(items, ownerId);
             });
         }
-        return () => { cancelled = true; };
+        return () => {
+            cancelled = true;
+            generationAbortControllersRef.current.forEach((controller) => controller.abort());
+            generationAbortControllersRef.current.clear();
+            cancelledGenerationIdsRef.current.clear();
+            pollingLogIdsRef.current.clear();
+        };
     }, [isUserReady, token, accountOwnerId]);
 
     useEffect(() => {
@@ -439,6 +449,35 @@ export default function ImagePage() {
         await submitGenerationBatch(snapshot);
     };
 
+    const discardPersistentGeneration = async (log: GenerationLog, ownerId: string, taskToken: string) => {
+        const previousSave = saveLogChainRef.current;
+        const discard = (async () => {
+            try {
+                await previousSave;
+            } catch {
+                // 取消必须排在既有保存之后执行，避免进行中的 saveLog 把已删除记录重新写回来。
+            }
+            const taskId = log.task?.parent_task_id || log.task?.id;
+            const task = taskId && !taskId.startsWith("client_image_task_") ? { ...log.task, id: taskId } as CanvasImageTask : null;
+            const remoteIds = Array.from(new Set([log.id, task?.id].filter((id): id is string => Boolean(id))));
+            await Promise.all([
+                task ? deleteCanvasImageTask(imageTaskConfig(), task).catch(() => undefined) : Promise.resolve(),
+                taskToken && remoteIds.length ? deleteImageGenerationLogs(taskToken, remoteIds).catch(() => undefined) : Promise.resolve(),
+                logStore.removeItem(imageLogStorageKey(log.id, ownerId)),
+            ]);
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
+            const storedLogs = await readStoredLogs(ownerId);
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
+            const cancelledKeys = new Set(imageLogIdentityKeys(log));
+            const nextLogs = storedLogs.filter((item) => !imageLogIdentityKeys(item).some((key) => cancelledKeys.has(key)));
+            logsRef.current = nextLogs;
+            setLogs(nextLogs);
+            await persistImageHistory(nextLogs, categories, ownerId, taskToken);
+        })();
+        saveLogChainRef.current = discard.then(() => undefined);
+        return discard;
+    };
+
     const submitPersistentGenerationBatch = async (snapshot: RequestSnapshot) => {
         const ownerId = accountOwnerId;
         const taskToken = token;
@@ -471,9 +510,10 @@ export default function ImagePage() {
 
         const settled = await Promise.allSettled(pendingLogs.map((log, index) => createPersistentImageTask(log, snapshot, index, taskCount, ownerId, taskToken)));
         if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
-        const createdCount = settled.filter((item) => item.status === "fulfilled").length;
+        const createdCount = settled.filter((item) => item.status === "fulfilled" && item.value).length;
+        const failedCount = settled.filter((item) => item.status === "rejected").length;
         if (createdCount) message.success(`已创建 ${createdCount} 个图片任务`);
-        if (createdCount < pendingLogs.length) message.warning(`${pendingLogs.length - createdCount} 个图片任务创建失败`);
+        if (failedCount) message.warning(`${failedCount} 个图片任务创建失败`);
     };
 
     const createPersistentImageTask = async (pendingLog: GenerationLog, snapshot: RequestSnapshot, index: number, taskCount: number, ownerId: string, taskToken: string) => {
@@ -485,10 +525,19 @@ export default function ImagePage() {
                 { source: "image-workbench", sourceId: pendingLog.id, clientTaskId: imageLogTaskId(pendingLog) },
             );
             const nextLog = { ...pendingLog, task, lastPolledAt: Date.now() };
+            if (cancelledGenerationIdsRef.current.has(pendingLog.id)) {
+                await discardPersistentGeneration(nextLog, ownerId, taskToken);
+                return null;
+            }
             if (!(await saveLog(nextLog, ownerId, taskToken))) return nextLog;
+            if (cancelledGenerationIdsRef.current.has(pendingLog.id)) {
+                await discardPersistentGeneration(nextLog, ownerId, taskToken);
+                return null;
+            }
             setResults((value) => updateResultByLogId(value, pendingLog.id, { taskLogId: nextLog.id, task, progress: task.progress, lastPolledAt: nextLog.lastPolledAt }));
             return nextLog;
         } catch (error) {
+            if (cancelledGenerationIdsRef.current.has(pendingLog.id) || isAbortError(error)) return null;
             const nextLog = { ...pendingLog, status: "失败" as const, durationMs: Date.now() - pendingLog.createdAt, failCount: 1, errors: [errorMessage(error)], errorDetails: [errorDetail(error)], lastPolledAt: Date.now() };
             if (!(await saveLog(nextLog, ownerId, taskToken))) return nextLog;
             setResults((value) => updateResultByLogId(value, pendingLog.id, { status: "failed", error: nextLog.errors[0], errorDetail: nextLog.errorDetails?.[0], durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
@@ -511,6 +560,8 @@ export default function ImagePage() {
 
         const tasks = taskIds.map(async (id, index) => {
             const taskStartedAt = performance.now();
+            const controller = new AbortController();
+            generationAbortControllersRef.current.set(id, controller);
             try {
                 const image = await runGenerationTask(id, {
                     ...snapshot,
@@ -519,17 +570,13 @@ export default function ImagePage() {
                         seedIndex: index,
                         seedCount: taskCount,
                     } as any,
-                }, ownerId, taskToken);
+                }, ownerId, taskToken, controller.signal);
 
-                if (!image) {
-                    throw new Error("接口没有返回图片");
-                }
+                if (!image) throw new Error("接口没有返回图片");
+                if (cancelledGenerationIdsRef.current.has(id)) throw createAbortError();
                 if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
 
-                // 更新结果状态
                 setResults((value) => updateResult(value, id, { image }));
-                
-                // 立即保存单张成功日志
                 await saveLog(
                     buildLog({
                         prompt: snapshot.text,
@@ -551,10 +598,9 @@ export default function ImagePage() {
                 if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
                 message.success("图片已生成");
             } catch (err) {
+                if (cancelledGenerationIdsRef.current.has(id) || isAbortError(err)) return;
                 const errMsg = errorMessage(err);
                 const errDetail = errorDetail(err);
-                
-                // 立即保存单张失败日志
                 await saveLog(
                     buildLog({
                         prompt: snapshot.text,
@@ -576,6 +622,8 @@ export default function ImagePage() {
                 if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
                 message.error(errMsg || "生成失败");
             } finally {
+                generationAbortControllersRef.current.delete(id);
+                cancelledGenerationIdsRef.current.delete(id);
                 // 任务完成，从进行中状态移除；切号后不能触碰新账号的结果列表。
                 if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) {
                     setResults((value) => value.filter((item) => item.id !== id));
@@ -638,14 +686,29 @@ export default function ImagePage() {
 
     const syncImage = async (image: GeneratedImage, index: number, ownerId = accountOwnerId, taskToken = token) => {
         const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
-        if (!isCurrentAccount() || image.storageKey?.startsWith("server:") || syncingImageIds.includes(image.id)) return null;
+        const isCleaned = image.storageStatus === "cleaned";
+        const isCloud = image.storageStatus === "cloud" || image.storageKey?.startsWith("server:");
+        if (!isCurrentAccount() || isCleaned || isCloud || syncingImageIds.includes(image.id)) return null;
         setSyncingImageIds((ids) => Array.from(new Set([...ids, image.id])));
         const hideLoading = message.loading("正在同步图片到云端存储...", 0);
         try {
-            const uploaded = await uploadRemoteImageToServer(image.dataUrl, "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl), taskToken, ownerId);
+            const filename = "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl);
+            const uploaded = image.storageKey?.startsWith("local:")
+                ? await uploadGeneratedImageToCloud(image.storageKey, taskToken, ownerId)
+                : await uploadRemoteImageToServer(image.dataUrl, filename, taskToken, ownerId);
             if (!isCurrentAccount()) return null;
             message.success("图片已同步到云端存储");
-            return { ...image, dataUrl: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || image.width, height: uploaded.height || image.height, bytes: uploaded.bytes || image.bytes, mimeType: uploaded.mimeType || image.mimeType };
+            return {
+                ...image,
+                dataUrl: uploaded.url,
+                storageKey: uploaded.storageKey,
+                storageStatus: uploaded.storageStatus || "cloud",
+                storageMessage: uploaded.storageMessage,
+                width: uploaded.width || image.width,
+                height: uploaded.height || image.height,
+                bytes: uploaded.bytes || image.bytes,
+                mimeType: uploaded.mimeType || image.mimeType,
+            };
         } catch (error) {
             if (!isCurrentAccount()) return null;
             const errorMessage = error instanceof Error ? error.message : "";
@@ -663,17 +726,37 @@ export default function ImagePage() {
 
     const autoSyncGeneratedImage = async (image: GeneratedImage, index: number, channelMode: AiConfig["channelMode"], ownerId = accountOwnerId, taskToken = token) => {
         const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
-        if (!isCurrentAccount() || image.storageKey) return image;
+        if (!isCurrentAccount() || image.storageKey || !taskToken) return image;
         const storageConfig = await loadStorageConfig().catch(() => null);
-        if (!isCurrentAccount() || !storageConfig || !shouldAutoSyncGeneratedMedia(storageConfig, channelMode)) return image;
+        if (!isCurrentAccount()) return image;
+        const autoUpload = Boolean(storageConfig) && shouldAutoSyncGeneratedMedia(storageConfig, channelMode);
         try {
-            const uploaded = await uploadRemoteImageToServer(image.dataUrl, "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl), taskToken, ownerId);
+            const saved = await saveGeneratedImage(
+                image.dataUrl,
+                "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl),
+                image.width,
+                image.height,
+                autoUpload,
+                taskToken,
+                ownerId,
+            );
             if (!isCurrentAccount()) return image;
-            return { ...image, dataUrl: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || image.width, height: uploaded.height || image.height, bytes: uploaded.bytes || image.bytes, mimeType: uploaded.mimeType || image.mimeType };
+            if (saved.storageMessage) message.warning(saved.storageMessage);
+            return {
+                ...image,
+                dataUrl: saved.url,
+                storageKey: saved.storageKey,
+                storageStatus: saved.storageStatus,
+                storageMessage: saved.storageMessage,
+                width: saved.width || image.width,
+                height: saved.height || image.height,
+                bytes: saved.bytes || image.bytes,
+                mimeType: saved.mimeType || image.mimeType,
+            };
         } catch (error) {
             if (!isCurrentAccount()) return image;
-            // 自动同步失败不能覆盖已生成结果，否则云存储故障会被误判为生图失败。
-            message.warning(`图片已生成，但自动同步失败：${errorMessage(error)}`);
+            // 本地落盘失败不能覆盖已生成结果，否则服务器存储故障会被误判为生图失败。
+            message.warning(`图片已生成，但服务器保存失败：${errorMessage(error)}`);
             return image;
         }
     };
@@ -809,7 +892,8 @@ export default function ImagePage() {
 
     const saveLog = async (log: GenerationLog, ownerId = accountOwnerId, taskToken = token) => {
         const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
-        if (!isCurrentAccount()) return false;
+        const isCancelled = () => imageLogIdentityKeys(log).some((id) => cancelledGenerationIdsRef.current.has(id));
+        if (!isCurrentAccount() || isCancelled()) return false;
         const prevChain = saveLogChainRef.current;
         const nextChain = (async () => {
             try {
@@ -817,18 +901,23 @@ export default function ImagePage() {
             } catch {
                 // Ignore previous errors so the chain doesn't break permanently
             }
-            if (!isCurrentAccount()) return false;
+            if (!isCurrentAccount() || isCancelled()) return false;
             const storedLogs = await readStoredLogs(ownerId);
-            if (!isCurrentAccount()) return false;
+            if (!isCurrentAccount() || isCancelled()) return false;
             const keys = new Set(imageLogIdentityKeys(log));
             const duplicateLogs = storedLogs.filter((item) => item.id !== log.id && imageLogIdentityKeys(item).some((key) => keys.has(key)));
             const nextLogs = dedupeGenerationLogs([log, ...storedLogs.filter((item) => item.id !== log.id)]);
             await Promise.all(duplicateLogs.map((item) => logStore.removeItem(imageLogStorageKey(item.id, ownerId))));
+            if (isCancelled()) return false;
             await logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(log));
+            if (isCancelled()) {
+                await logStore.removeItem(imageLogStorageKey(log.id, ownerId));
+                return false;
+            }
             if (!isCurrentAccount()) return false;
             setLogs(nextLogs);
             await persistImageHistory(nextLogs, categories, ownerId, taskToken);
-            return isCurrentAccount();
+            return isCurrentAccount() && !isCancelled();
         })();
         saveLogChainRef.current = nextChain.then(() => undefined);
         return nextChain;
@@ -914,11 +1003,11 @@ export default function ImagePage() {
             const taskById = new Map(tasks.map((task) => [task.id, task]));
             await Promise.all(
                 pendingLogs.map(async (log) => {
-                    if (!isCurrentAccount()) return;
+                    if (!isCurrentAccount() || cancelledGenerationIdsRef.current.has(log.id)) return;
                     const task = taskById.get(imageLogTaskId(log));
                     if (!task) {
                         const nextLog = { ...log, status: "失败" as const, durationMs: Date.now() - log.createdAt, failCount: 1, errors: ["图片任务不存在或未创建成功"], errorDetails: ["后端没有找到对应的图片任务"], lastPolledAt: Date.now() };
-                        if (!(await saveLog(nextLog, ownerId, taskToken))) return;
+                        if (cancelledGenerationIdsRef.current.has(log.id) || !(await saveLog(nextLog, ownerId, taskToken))) return;
                         setResults((value) => updateResultByLogId(value, log.id, { status: "failed", error: nextLog.errors[0], errorDetail: nextLog.errorDetails?.[0], durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                         return;
                     }
@@ -931,6 +1020,7 @@ export default function ImagePage() {
                                 return { ...item, images: [image], thumbnails: [image.dataUrl] };
                             }),
                         );
+                        if (cancelledGenerationIdsRef.current.has(log.id)) return;
                         const saved = await Promise.all(syncedLogs.map((item) => saveLog(item, ownerId, taskToken)));
                         if (!isCurrentAccount() || saved.some((value) => !value)) return;
                         setResults((value) => value.filter((item) => !imageResultMatchesLog(item, syncedLogs[0])));
@@ -942,7 +1032,7 @@ export default function ImagePage() {
                         const image = await autoSyncGeneratedImage(nextLog.images[0], 0, nextLog.config.channelMode, ownerId, taskToken);
                         nextLog = { ...nextLog, images: [image], thumbnails: [image.dataUrl] };
                     }
-                    if (!(await saveLog(nextLog, ownerId, taskToken))) return;
+                    if (cancelledGenerationIdsRef.current.has(log.id) || !(await saveLog(nextLog, ownerId, taskToken))) return;
                     if (nextLog.status === "生成中") {
                         setResults((value) => updateResultByLogId(value, log.id, { task, progress: task.progress, durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                     } else {
@@ -1084,23 +1174,45 @@ export default function ImagePage() {
         };
     };
 
-    const runGenerationTask = async (resultId: string, snapshot: RequestSnapshot, ownerId = accountOwnerId, taskToken = token) => {
+    const runGenerationTask = async (resultId: string, snapshot: RequestSnapshot, ownerId = accountOwnerId, taskToken = token, signal?: AbortSignal) => {
         const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         const itemStartedAt = performance.now();
         try {
-            const result = snapshot.references.length ? await requestEdit(snapshot.requestConfig, snapshot.text, snapshot.references) : await requestGeneration(snapshot.requestConfig, snapshot.text);
+            const result = snapshot.references.length ? await requestEdit(snapshot.requestConfig, snapshot.text, snapshot.references, signal) : await requestGeneration(snapshot.requestConfig, snapshot.text, signal);
+            if (cancelledGenerationIdsRef.current.has(resultId)) throw createAbortError();
             const image = result[0];
             if (!image) throw new Error("接口没有返回图片");
             const meta = await readImageMeta(image.dataUrl);
+            if (cancelledGenerationIdsRef.current.has(resultId)) throw createAbortError();
             const nextImage: GeneratedImage = { id: image.id, dataUrl: image.dataUrl, durationMs: performance.now() - itemStartedAt, width: meta.width, height: meta.height, bytes: getDataUrlByteSize(image.dataUrl), mimeType: meta.mimeType };
             const syncedImage = await autoSyncGeneratedImage(nextImage, 0, snapshot.requestConfig.channelMode, ownerId, taskToken);
+            if (cancelledGenerationIdsRef.current.has(resultId)) throw createAbortError();
             if (!isCurrentAccount()) return syncedImage;
             setResults((value) => updateResult(value, resultId, { status: "success", image: syncedImage, durationMs: syncedImage.durationMs }));
             return syncedImage;
         } catch (error) {
-            setResults((value) => updateResult(value, resultId, { status: "failed", error: errorMessage(error), errorDetail: errorDetail(error), durationMs: performance.now() - itemStartedAt }));
+            if (!cancelledGenerationIdsRef.current.has(resultId) && !isAbortError(error)) {
+                setResults((value) => updateResult(value, resultId, { status: "failed", error: errorMessage(error), errorDetail: errorDetail(error), durationMs: performance.now() - itemStartedAt }));
+            }
             throw error;
         }
+    };
+
+    const cancelGeneration = async (result: GenerationResult) => {
+        if (result.status !== "pending") return;
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const log = logsRef.current.find((item) => imageResultMatchesLog(result, item));
+        const cancelledIds = new Set([...imageResultIdentityKeys(result), ...(log ? imageLogIdentityKeys(log) : [])]);
+        cancelledIds.forEach((id) => {
+            cancelledGenerationIdsRef.current.add(id);
+            generationAbortControllersRef.current.get(id)?.abort();
+            generationAbortControllersRef.current.delete(id);
+            pollingLogIdsRef.current.delete(id);
+        });
+        setResults((value) => value.filter((item) => item.id !== result.id && (!log || !imageResultMatchesLog(item, log))));
+        if (log) await discardPersistentGeneration(log, ownerId, taskToken);
+        if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) message.success("已取消生成");
     };
 
     const retryResult = (result: GenerationResult) => {
@@ -1262,6 +1374,7 @@ export default function ImagePage() {
                             onSyncResult={syncResultImage}
                             onSyncLog={syncLogImage}
                             onRetry={retryResult}
+                            onCancelGeneration={(result) => void cancelGeneration(result)}
                         />
                     </>
                 ) : (
@@ -1298,6 +1411,7 @@ export default function ImagePage() {
                             onSyncResult={syncResultImage}
                             onSyncLog={syncLogImage}
                             onRetry={retryResult}
+                            onCancelGeneration={(result) => void cancelGeneration(result)}
                         />
                         <WorkbenchPanel
                             layout="bottom"
@@ -1711,6 +1825,7 @@ function ResultsPanel({
     onSyncResult,
     onSyncLog,
     onRetry,
+    onCancelGeneration,
 }: {
     className?: string;
     results: GenerationResult[];
@@ -1743,6 +1858,7 @@ function ResultsPanel({
     onSyncResult: (resultId: string, image: GeneratedImage, index: number) => void;
     onSyncLog: (log: GenerationLog, image: GeneratedImage, index: number) => void;
     onRetry: (result: GenerationResult) => void;
+    onCancelGeneration: (result: GenerationResult) => void;
 }) {
     const { message } = App.useApp();
     const [creatingCategory, setCreatingCategory] = useState(false);
@@ -1822,7 +1938,13 @@ function ResultsPanel({
                         ) : result.status === "failed" ? (
                             <FailedImageCard key={result.id} result={result} error={result.error || "生成失败"} onCopyPrompt={onCopyPrompt} onRetry={() => onRetry(result)} />
                         ) : (
-                            <PendingImageCard key={result.id} result={result} now={now} onCopyPrompt={onCopyPrompt} />
+                            <PendingImageCard
+                                key={result.id}
+                                result={result}
+                                now={now}
+                                onCopyPrompt={onCopyPrompt}
+                                onCancel={result.workflowTaskId && !result.task ? undefined : () => onCancelGeneration(result)}
+                            />
                         ),
                     )}
                     {resultViewMode === "category" ? (
@@ -1991,15 +2113,25 @@ function ResultImageCard({
     syncing: boolean;
     onSync: (image: GeneratedImage) => void;
 }) {
+    const cleaned = image.storageStatus === "cleaned";
+    const cloud = image.storageStatus === "cloud" || image.storageKey?.startsWith("server:");
+    const local = image.storageStatus === "local" || image.storageKey?.startsWith("local:");
     return (
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
             <div className="relative aspect-[4/3] bg-stone-100 dark:bg-stone-900">
                 <div className="absolute right-1.5 top-1.5 z-10 flex gap-1">
-                    {!image.storageKey?.startsWith("server:") ? <Tag className="m-0 text-[10px]" color="gold">临时URL</Tag> : null}
+                    {cleaned ? <Tag className="m-0 text-[10px]" color="default">已清理</Tag> : cloud ? <Tag className="m-0 text-[10px]" color="blue">云端</Tag> : local ? <Tag className="m-0 text-[10px]" color="gold">服务器本地</Tag> : <Tag className="m-0 text-[10px]" color="gold">临时URL</Tag>}
                     <Tag className="m-0 text-[10px]" color="blue">新生成</Tag>
                 </div>
                 <ReferenceThumbnailOverlay references={result.references} className="left-1.5 top-1.5" />
-                <Image src={image.dataUrl} alt={`生成结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                {cleaned ? (
+                    <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-stone-500 dark:text-stone-400">
+                        <AlertCircle className="size-7" />
+                        <span>{image.storageMessage || "图片已被清理"}</span>
+                    </div>
+                ) : (
+                    <Image src={image.dataUrl} alt={`生成结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                )}
             </div>
             <TaskInfo result={result} onCopyPrompt={onCopyPrompt} />
             <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-2 border-t border-stone-200 px-2.5 py-2 dark:border-stone-800">
@@ -2011,17 +2143,17 @@ function ResultImageCard({
                     <span>{formatDuration(image.durationMs)}</span>
                 </div>
                 <div className="flex shrink-0 gap-1">
-                    <Button size="small" title="同步到云端存储" icon={<CloudUpload className="size-3.5" />} loading={syncing} disabled={image.storageKey?.startsWith("server:")} onClick={() => onSync(image)} />
-                    <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => void onSaveAsset(image, index)} />
-                    <Button size="small" icon={<PenLine className="size-3.5" />} onClick={() => void onEdit(image, index)} />
-                    <Button size="small" icon={<Download className="size-3.5" />} onClick={() => onDownload(image, index)} />
+                    <Button size="small" title="同步到云端存储" icon={<CloudUpload className="size-3.5" />} loading={syncing} disabled={cleaned || cloud} onClick={() => onSync(image)} />
+                    <Button size="small" icon={<FolderPlus className="size-3.5" />} disabled={cleaned} onClick={() => void onSaveAsset(image, index)} />
+                    <Button size="small" icon={<PenLine className="size-3.5" />} disabled={cleaned} onClick={() => void onEdit(image, index)} />
+                    <Button size="small" icon={<Download className="size-3.5" />} disabled={cleaned} onClick={() => onDownload(image, index)} />
                 </div>
             </div>
         </div>
     );
 }
 
-function PendingImageCard({ result, now, onCopyPrompt }: { result: GenerationResult; now: number; onCopyPrompt: (text: string) => void | Promise<void> }) {
+function PendingImageCard({ result, now, onCopyPrompt, onCancel }: { result: GenerationResult; now: number; onCopyPrompt: (text: string) => void | Promise<void>; onCancel?: () => void }) {
     return (
         <div className="overflow-hidden rounded-lg border border-dashed border-stone-300 bg-stone-50 dark:border-stone-700 dark:bg-stone-900">
             <div className="relative aspect-[4/3]">
@@ -2039,6 +2171,11 @@ function PendingImageCard({ result, now, onCopyPrompt }: { result: GenerationRes
                 </div>
             </div>
             <TaskInfo result={{ ...result, durationMs: Math.max(0, now - result.createdAt) }} onCopyPrompt={onCopyPrompt} />
+            {onCancel ? (
+                <div className="flex justify-end border-t border-stone-200 p-3 dark:border-stone-800">
+                    <Button size="small" danger onClick={onCancel}>取消生成</Button>
+                </div>
+            ) : null}
         </div>
     );
 }
@@ -2146,8 +2283,11 @@ function HistoryLogCard({
     syncing: boolean;
     onSync: (image: GeneratedImage) => void;
 }) {
+    const firstImage = log.images[0];
     const displayImages = log.images.filter((image) => Boolean(image.dataUrl));
-    const firstImage = displayImages[0];
+    const cleaned = firstImage?.storageStatus === "cleaned";
+    const cloud = firstImage?.storageStatus === "cloud" || firstImage?.storageKey?.startsWith("server:");
+    const local = firstImage?.storageStatus === "local" || firstImage?.storageKey?.startsWith("local:");
     const [expanded, setExpanded] = useState(false);
     const [categoryOpen, setCategoryOpen] = useState(false);
     const [categoryName, setCategoryName] = useState("");
@@ -2183,14 +2323,26 @@ function HistoryLogCard({
                     {selected ? <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={onDelete} /> : null}
                 </div>
                 <div className="absolute right-1.5 top-1.5 z-10 flex gap-1">
-                    {firstImage && !firstImage.storageKey?.startsWith("server:") ? <Tag className="m-0 text-[10px]" color="gold">临时URL</Tag> : null}
+                    {firstImage ? (cleaned ? <Tag className="m-0 text-[10px]" color="default">已清理</Tag> : cloud ? <Tag className="m-0 text-[10px]" color="blue">云端</Tag> : local ? <Tag className="m-0 text-[10px]" color="gold">服务器本地</Tag> : <Tag className="m-0 text-[10px]" color="gold">临时URL</Tag>) : null}
                     <Tag className="m-0 text-[10px]" color={log.status === "生成中" ? "processing" : log.failCount ? "red" : "blue"}>
                         {log.status === "生成中" ? "生成中" : log.failCount ? `失败 ${log.failCount}` : "成功"}
                     </Tag>
                     <Tag className="m-0 text-[10px]">{log.imageCount} 张</Tag>
                 </div>
                 {firstImage ? (
-                    <Image src={firstImage.dataUrl} alt={`历史结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                    cleaned ? (
+                        <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-stone-500 dark:text-stone-400">
+                            <AlertCircle className="size-7" />
+                            <span>{firstImage.storageMessage || "图片已被清理"}</span>
+                        </div>
+                    ) : firstImage.dataUrl ? (
+                        <Image src={firstImage.dataUrl} alt={`历史结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                    ) : (
+                        <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-red-500">
+                            <AlertCircle className="size-7" />
+                            <span>{log.errors[0] || "没有可显示的图片"}</span>
+                        </div>
+                    )
                 ) : (
                     <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-red-500">
                         <AlertCircle className="size-7" />
@@ -2282,10 +2434,10 @@ function HistoryLogCard({
                 </div>
                 {firstImage ? (
                     <div className="flex shrink-0 gap-1">
-                        <Button size="small" title="同步到云端存储" icon={<CloudUpload className="size-3.5" />} loading={syncing} disabled={firstImage.storageKey?.startsWith("server:")} onClick={() => closeThen(() => onSync(firstImage))} />
-                        <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => closeThen(() => void onSaveAsset(firstImage, index))} />
-                        <Button size="small" icon={<PenLine className="size-3.5" />} onClick={() => closeThen(() => void onEdit(firstImage, index))} />
-                        <Button size="small" icon={<Download className="size-3.5" />} onClick={() => closeThen(() => onDownload(firstImage, index))} />
+                        <Button size="small" title="同步到云端存储" icon={<CloudUpload className="size-3.5" />} loading={syncing} disabled={cleaned || cloud} onClick={() => closeThen(() => onSync(firstImage))} />
+                        <Button size="small" icon={<FolderPlus className="size-3.5" />} disabled={cleaned} onClick={() => closeThen(() => void onSaveAsset(firstImage, index))} />
+                        <Button size="small" icon={<PenLine className="size-3.5" />} disabled={cleaned} onClick={() => closeThen(() => void onEdit(firstImage, index))} />
+                        <Button size="small" icon={<Download className="size-3.5" />} disabled={cleaned} onClick={() => closeThen(() => onDownload(firstImage, index))} />
                     </div>
                 ) : null}
             </div>
@@ -2622,6 +2774,14 @@ function parseImageTaskTime(value: unknown) {
     return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function isAbortError(error: unknown) {
+    return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+
+function createAbortError() {
+    return new DOMException("The operation was aborted.", "AbortError");
+}
+
 function errorMessage(error: unknown) {
     return error instanceof Error ? error.message : "生成失败";
 }
@@ -2752,11 +2912,21 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
     );
     const images = await Promise.all(
         (log.images || []).map(async (item) => {
+            // 服务端清理状态必须覆盖浏览器内存中的旧 Blob URL，否则页面会继续展示已删除文件。
+            if (item.storageStatus === "cleaned") {
+                return { ...item, dataUrl: "", storageMessage: item.storageMessage || "图片已被清理" };
+            }
             const dataUrl = await resolveImageUrl(item.storageKey, item.dataUrl);
-            return { ...item, dataUrl };
+            const cleaned = !dataUrl && item.storageKey?.startsWith("local:");
+            return {
+                ...item,
+                dataUrl,
+                storageStatus: cleaned ? "cleaned" as const : item.storageStatus,
+                storageMessage: cleaned ? item.storageMessage || "图片已被清理" : item.storageMessage,
+            };
         }),
     );
-    const visibleImages = images.filter((image) => Boolean(image.dataUrl));
+    const visibleImages = images.filter((image) => Boolean(image.dataUrl) || image.storageStatus === "cleaned");
     const config = normalizeLogConfig(log);
     return {
         id: log.id || nanoid(),
@@ -2775,7 +2945,7 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         quality: log.quality || config.quality || "",
         status: log.status || "成功",
         images: visibleImages,
-        thumbnails: visibleImages.map((image) => image.dataUrl),
+        thumbnails: visibleImages.filter((image) => Boolean(image.dataUrl)).map((image) => image.dataUrl),
         errors: log.errors || [],
         errorDetails: log.errorDetails || [],
         categoryIds: Array.isArray(log.categoryIds) ? log.categoryIds : [],

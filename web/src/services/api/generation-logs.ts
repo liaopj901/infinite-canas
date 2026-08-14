@@ -21,7 +21,7 @@ export async function fetchImageGenerationLogs<T>(token: string) {
 }
 
 export async function saveImageGenerationLogs<T>(token: string, logs: T[]) {
-    return apiPost<T[]>("/api/v1/generation-logs/images", { logs }, token);
+    return apiPost<{ saved: boolean }>("/api/v1/generation-logs/images", { logs }, token);
 }
 
 export async function deleteImageGenerationLogs(token: string, ids: string[]) {

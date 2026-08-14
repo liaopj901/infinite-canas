@@ -15,7 +15,7 @@ import { formatBytes, formatDuration, getDataUrlByteSize, readImageMeta } from "
 import { createCanvasImageTask, requestEdit, requestGeneration, requestImageQuestion, type CanvasImageTask } from "@/services/api/image";
 import { saveImageGenerationLogs } from "@/services/api/generation-logs";
 import { deleteUserWorkflow, draftUserWorkflow, fetchUserConfig, fetchUserWorkflows, saveUserWorkflow, type CreativeWorkflowRecord } from "@/services/api/user-config";
-import { deleteStoredImages, imageToDataUrl, uploadImage } from "@/services/image-storage";
+import { deleteStoredImages, imageToDataUrl, loadStorageConfig, saveGeneratedImage, shouldAutoSyncGeneratedMedia, uploadImage } from "@/services/image-storage";
 import { defaultConfig, localChannelForActiveModel, normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useUserStore } from "@/stores/use-user-store";
@@ -87,6 +87,8 @@ export type WorkflowRunResult = {
     prompt: string;
     imageUrl: string;
     storageKey: string;
+    storageStatus?: "local" | "cloud" | "cleaned";
+    storageMessage?: string;
     width: number;
     height: number;
     bytes: number;
@@ -164,6 +166,8 @@ type ImageHistoryLog = {
         id: string;
         dataUrl: string;
         storageKey: string;
+        storageStatus?: "local" | "cloud" | "cleaned";
+        storageMessage?: string;
         durationMs: number;
         width: number;
         height: number;
@@ -888,19 +892,41 @@ export function CreativeWorkflowWorkspace({
             const flattened = images.flat();
             if (!flattened.length) throw new Error("接口没有返回图片");
             const durationMs = performance.now() - performanceStartedAt;
+            const storageConfig = taskToken ? await loadStorageConfig().catch(() => null) : null;
+            const autoUpload = Boolean(storageConfig) && shouldAutoSyncGeneratedMedia(storageConfig, runConfig.channelMode);
             const storedImages = await Promise.all(
-                flattened.map(async (image) => {
+                flattened.map(async (image, index) => {
                     const meta = await readImageMeta(image.dataUrl);
+                    let saved = null;
+                    if (taskToken) {
+                        try {
+                            saved = await saveGeneratedImage(
+                                image.dataUrl,
+                                `workflow-image-${index + 1}.${meta.mimeType === "image/jpeg" ? "jpg" : meta.mimeType === "image/webp" ? "webp" : "png"}`,
+                                meta.width,
+                                meta.height,
+                                autoUpload,
+                                taskToken,
+                                ownerId,
+                            );
+                            if (saved.storageMessage) message.warning(saved.storageMessage);
+                        } catch (error) {
+                            // 本地落盘失败仍保留浏览器内的生成结果，避免存储故障把工作流误判为失败。
+                            message.warning(`图片已生成，但服务器保存失败：${error instanceof Error ? error.message : "未知错误"}`);
+                        }
+                    }
                     return {
                         id: image.id,
-                        dataUrl: image.dataUrl,
-                        displayUrl: image.dataUrl,
-                        storageKey: "",
+                        dataUrl: saved?.url || image.dataUrl,
+                        displayUrl: saved?.url || image.dataUrl,
+                        storageKey: saved?.storageKey || "",
+                        storageStatus: saved?.storageStatus,
+                        storageMessage: saved?.storageMessage,
                         durationMs,
-                        width: meta.width,
-                        height: meta.height,
-                        bytes: getDataUrlByteSize(image.dataUrl),
-                        mimeType: meta.mimeType,
+                        width: saved?.width || meta.width,
+                        height: saved?.height || meta.height,
+                        bytes: saved?.bytes || getDataUrlByteSize(image.dataUrl),
+                        mimeType: saved?.mimeType || meta.mimeType,
                     };
                 }),
             );
@@ -2162,8 +2188,11 @@ async function ensureWorkflowCategory(name: string, ownerId = getAccountOwnerId(
 function serializeHistoryLog(log: ImageHistoryLog): ImageHistoryLog {
     return {
         ...log,
-        images: log.images.map((image) => ({ ...image, dataUrl: image.dataUrl?.startsWith("http") ? image.dataUrl : "" })),
-        thumbnails: log.images.map((image) => (image.dataUrl?.startsWith("http") ? image.dataUrl : "")),
+        images: log.images.map((image) => ({
+            ...image,
+            dataUrl: image.storageKey ? "" : image.dataUrl?.startsWith("http") ? image.dataUrl : "",
+        })),
+        thumbnails: log.images.map((image) => (image.storageKey ? "" : image.dataUrl?.startsWith("http") ? image.dataUrl : "")),
     };
 }
 

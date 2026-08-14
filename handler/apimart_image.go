@@ -215,6 +215,9 @@ func copyAPIMartImageResponse(w http.ResponseWriter, response *http.Response, re
 	}
 
 	payload, _ := io.ReadAll(response.Body)
+	if handleCanceledAIRequest(request, onFailure) {
+		return true
+	}
 	if imageURLs, ok := readAPIMartDirectImageURLs(payload); ok {
 		writeAPIMartImagesResponse(w, response.StatusCode, imageURLs, logContext)
 		return true
@@ -229,6 +232,9 @@ func copyAPIMartImageResponse(w http.ResponseWriter, response *http.Response, re
 	}
 
 	imageURLs, errorMessage := pollAPIMartImageTask(request, channel, taskID)
+	if handleCanceledAIRequest(request, onFailure) {
+		return true
+	}
 	if errorMessage != "" {
 		if onFailure != nil {
 			onFailure()

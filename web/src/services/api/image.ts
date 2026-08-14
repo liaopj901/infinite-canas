@@ -287,9 +287,9 @@ function readAxiosError(error: unknown, fallback: string) {
     return error instanceof Error ? error.message : fallback;
 }
 
-async function fetchErrorDetail(response: Response, fallback: string) {
+async function fetchErrorDetail(response: Response, fallback: string, signal?: AbortSignal) {
     try {
-        const text = await response.text();
+        const text = await readResponseText(response, signal);
         if (!text.trim()) return { message: `${fallback}：${response.status}`, detail: `${response.status} ${response.statusText}` };
         try {
             const payload = JSON.parse(text) as { error?: { message?: string }; msg?: string; message?: string };
@@ -297,7 +297,8 @@ async function fetchErrorDetail(response: Response, fallback: string) {
         } catch {
             return { message: text.trim() || `${fallback}：${response.status}`, detail: text };
         }
-    } catch {
+    } catch (error) {
+        if (isAbortError(error) || signal?.aborted) throw abortError(signal);
         return { message: `${fallback}：${response.status}`, detail: `${response.status} ${response.statusText}` };
     }
 }
@@ -316,16 +317,49 @@ function timeoutError(timeoutSeconds: number) {
     return `请求超时：超过 ${timeoutSeconds} 秒仍未完成，请稍后重试。`;
 }
 
-async function withTimeout<T>(timeoutSeconds: number, run: (signal: AbortSignal) => Promise<T>) {
+function isAbortError(error: unknown) {
+    return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+
+function abortError(signal?: AbortSignal) {
+    return signal?.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError");
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+    if (signal?.aborted) throw abortError(signal);
+}
+
+async function abortableDelay(ms: number, signal?: AbortSignal) {
+    throwIfAborted(signal);
+    await new Promise<void>((resolve, reject) => {
+        const abort = () => {
+            window.clearTimeout(timer);
+            reject(abortError(signal));
+        };
+        const done = () => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+        };
+        const timer = window.setTimeout(done, ms);
+        signal?.addEventListener("abort", abort, { once: true });
+    });
+}
+
+async function withTimeout<T>(timeoutSeconds: number, run: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal) {
     const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason);
+    throwIfAborted(signal);
+    signal?.addEventListener("abort", abort, { once: true });
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000);
     try {
         return await run(controller.signal);
     } catch (error) {
+        if (signal?.aborted) throw abortError(signal);
         if (controller.signal.aborted) throw new Error(timeoutError(timeoutSeconds));
         throw error;
     } finally {
         window.clearTimeout(timeoutId);
+        signal?.removeEventListener("abort", abort);
     }
 }
 
@@ -337,24 +371,58 @@ function retryDelay(attempt: number) {
     return 700 * attempt;
 }
 
-async function readKnownRetryError(response: Response) {
-    const text = await response.clone().text();
-    if (!text.trim()) return { message: "", detail: `${response.status} ${response.statusText}` };
+async function readKnownRetryError(response: Response, signal?: AbortSignal) {
     try {
-        const payload = JSON.parse(text) as { error?: { message?: string }; msg?: string; message?: string };
-        return { message: payload.error?.message || payload.msg || payload.message || "", detail: payload };
-    } catch {
-        return { message: "", detail: text };
+        const text = await readResponseText(response.clone(), signal);
+        if (!text.trim()) return { message: "", detail: `${response.status} ${response.statusText}` };
+        try {
+            const payload = JSON.parse(text) as { error?: { message?: string }; msg?: string; message?: string };
+            return { message: payload.error?.message || payload.msg || payload.message || "", detail: payload };
+        } catch {
+            return { message: "", detail: text };
+        }
+    } catch (error) {
+        if (isAbortError(error) || signal?.aborted) await response.body?.cancel().catch(() => undefined);
+        throw error;
     }
 }
 
-async function requestWithTransientRetry(run: () => Promise<Response>, enabled: boolean, retries = 3) {
+async function readResponseText(response: Response, signal?: AbortSignal) {
+    // fetch 返回响应头后仍可能继续下载响应体；直接持有 reader 才能让用户取消立即停止后续传输。
+    if (!response.body) return "";
+    throwIfAborted(signal);
+    const reader = response.body.getReader();
+    const abort = () => void reader.cancel(abortError(signal)).catch(() => undefined);
+    signal?.addEventListener("abort", abort, { once: true });
+    const decoder = new TextDecoder();
+    let text = "";
+    try {
+        for (;;) {
+            throwIfAborted(signal);
+            const { value, done } = await reader.read();
+            if (done) break;
+            text += decoder.decode(value, { stream: true });
+        }
+        throwIfAborted(signal);
+        return text + decoder.decode();
+    } finally {
+        signal?.removeEventListener("abort", abort);
+    }
+}
+
+async function readResponseJSON<T>(response: Response, signal?: AbortSignal): Promise<T> {
+    const text = await readResponseText(response, signal);
+    return JSON.parse(text) as T;
+}
+
+async function requestWithTransientRetry(run: () => Promise<Response>, enabled: boolean, retries = 3, signal?: AbortSignal) {
     let lastError: unknown;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
+        throwIfAborted(signal);
         try {
             const response = await run();
             if (!enabled || !isTransientStatus(response.status)) return response;
-            const error = await readKnownRetryError(response);
+            const error = await readKnownRetryError(response, signal);
             if (error.message) return response;
             await response.body?.cancel();
             if (attempt === retries) {
@@ -362,6 +430,7 @@ async function requestWithTransientRetry(run: () => Promise<Response>, enabled: 
             }
             lastError = new Error(`上游接口临时不可用：${response.status}`);
         } catch (error) {
+            if (isAbortError(error) || signal?.aborted) throw abortError(signal);
             if (error instanceof ImageRequestError) throw error;
             lastError = error;
             if (!enabled) throw error;
@@ -369,7 +438,7 @@ async function requestWithTransientRetry(run: () => Promise<Response>, enabled: 
                 throw new ImageRequestError(`上游网络异常，已重试 ${retries} 次`, error instanceof Error ? error.message : error);
             }
         }
-        await new Promise((resolve) => window.setTimeout(resolve, retryDelay(attempt + 1)));
+        await abortableDelay(retryDelay(attempt + 1), signal);
     }
     throw lastError instanceof Error ? lastError : new Error("请求失败");
 }
@@ -385,9 +454,12 @@ function parseServerSentEventBlock(block: string) {
     return JSON.parse(data) as Record<string, unknown>;
 }
 
-async function readJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void) {
+async function readJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void, signal?: AbortSignal) {
     if (!response.body) throw new ImageRequestError("接口未返回可读取的流式响应", `${response.status} ${response.statusText}`);
+    throwIfAborted(signal);
     const reader = response.body.getReader();
+    const abort = () => void reader.cancel(abortError(signal)).catch(() => undefined);
+    signal?.addEventListener("abort", abort, { once: true });
     const decoder = new TextDecoder();
     let buffer = "";
     const events: Record<string, unknown>[] = [];
@@ -408,28 +480,34 @@ async function readJsonServerSentEvents(response: Response, onEvent: (event: Rec
         onEvent(event);
     };
 
-    while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let separatorIndex = buffer.search(/\r?\n\r?\n/);
-        while (separatorIndex >= 0) {
-            const separator = buffer.match(/\r?\n\r?\n/)?.[0] || "\n\n";
-            processBlock(buffer.slice(0, separatorIndex));
-            buffer = buffer.slice(separatorIndex + separator.length);
-            separatorIndex = buffer.search(/\r?\n\r?\n/);
+    try {
+        while (true) {
+            throwIfAborted(signal);
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let separatorIndex = buffer.search(/\r?\n\r?\n/);
+            while (separatorIndex >= 0) {
+                const separator = buffer.match(/\r?\n\r?\n/)?.[0] || "\n\n";
+                processBlock(buffer.slice(0, separatorIndex));
+                buffer = buffer.slice(separatorIndex + separator.length);
+                separatorIndex = buffer.search(/\r?\n\r?\n/);
+            }
         }
+        throwIfAborted(signal);
+        buffer += decoder.decode();
+        if (buffer.trim()) processBlock(buffer);
+        return events;
+    } finally {
+        signal?.removeEventListener("abort", abort);
     }
-    buffer += decoder.decode();
-    if (buffer.trim()) processBlock(buffer);
-    return events;
 }
 
 function isEventStreamResponse(response: Response) {
     return response.headers.get("Content-Type")?.toLowerCase().includes("text/event-stream") ?? false;
 }
 
-async function parseImagesStreamResponse(response: Response, mime: string): Promise<GeneratedImage[]> {
+async function parseImagesStreamResponse(response: Response, mime: string, signal?: AbortSignal): Promise<GeneratedImage[]> {
     const imageItems = new Map<string, Record<string, unknown>>();
     let resultPayload: ImageApiResponse | null = null;
     const events = await readJsonServerSentEvents(response, (event) => {
@@ -442,13 +520,13 @@ async function parseImagesStreamResponse(response: Response, mime: string): Prom
                 typeof event.image_index === "number" || typeof event.image_index === "string" ? String(event.image_index) : `event-${imageItems.size}`;
             imageItems.set(imageIndex, event);
         }
-    });
+    }, signal);
     if (resultPayload) return parseImagePayload(resultPayload, mime);
     if (imageItems.size) return parseImagePayload({ data: Array.from(imageItems.values()) }, mime);
     throw new ImageRequestError("流式接口未返回最终图片数据", events);
 }
 
-async function parseResponsesStreamResponse(response: Response, mime: string): Promise<GeneratedImage[]> {
+async function parseResponsesStreamResponse(response: Response, mime: string, signal?: AbortSignal): Promise<GeneratedImage[]> {
     let completedPayload: ResponsesApiResponse | null = null;
     const output: Record<string, unknown>[] = [];
     const partialImages: string[] = [];
@@ -466,7 +544,7 @@ async function parseResponsesStreamResponse(response: Response, mime: string): P
         if (item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, unknown>).type === "image_generation_call") {
             output.push(item as Record<string, unknown>);
         }
-    });
+    }, signal);
     try {
         return parseResponsesPayload(completedPayload || { output }, mime);
     } catch (error) {
@@ -626,7 +704,8 @@ function withSystemMessage(config: AiConfig, messages: ChatCompletionMessage[]) 
     return systemPrompt ? [{ role: "system" as const, content: systemPrompt }, ...messages] : messages;
 }
 
-async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, params: ImageRequestParams): Promise<GeneratedImage[]> {
+async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, params: ImageRequestParams, abortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    throwIfAborted(abortSignal);
     const mime = IMAGE_MIME;
 
     // 针对 Agnes 渠道文生图模型定制精简 Payload，避免传入官方文档未声明的 seed 参数。
@@ -645,25 +724,28 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
             () =>
                 requestWithTransientRetry(
                     () =>
-                        withTimeout(params.timeoutSeconds, (signal) =>
+                        withTimeout(params.timeoutSeconds, (requestSignal) =>
                             fetch(aiApiUrl(config, "/images/generations"), {
                                 method: "POST",
                                 headers: aiHeaders(config, "application/json"),
                                 body: JSON.stringify(body),
-                                signal,
+                                signal: requestSignal,
                             }),
-                        ),
+                        abortSignal),
                     !usesAccountProxy(config),
+                    3,
+                    abortSignal,
                 ),
             async (response) => {
                 if (config.streamImages && isEventStreamResponse(response)) {
-                    const images = await parseImagesStreamResponse(response, mime);
+                    const images = await parseImagesStreamResponse(response, mime, abortSignal);
                     return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
                 }
-                const payload = (await response.json()) as ImageApiResponse;
+                const payload = await readResponseJSON<ImageApiResponse>(response, abortSignal);
                 const images = parseImagePayload(payload, mime);
                 return { images, responseBody: stringifyLogPayload(payload) };
             },
+            abortSignal,
         );
     }
 
@@ -682,7 +764,7 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
     const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
     if (directProvider) {
         const { requestDirectImages } = await import("@/services/api/direct-ai");
-        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/generations", body, params.timeoutSeconds), mime);
+        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/generations", body, params.timeoutSeconds, abortSignal), mime);
     }
 
     return requestAndParseImages(
@@ -693,24 +775,27 @@ async function requestImageGenerationSingle(config: AiConfig & { seedIndex?: num
         () =>
             requestWithTransientRetry(
                 () =>
-                    withTimeout(params.timeoutSeconds, (signal) =>
+                    withTimeout(params.timeoutSeconds, (requestSignal) =>
                         fetch(aiApiUrl(config, "/images/generations"), {
                             method: "POST",
                             headers: aiHeaders(config, "application/json"),
                             body: JSON.stringify(body),
-                            signal,
+                            signal: requestSignal,
                         }),
-                    ),
+                    abortSignal),
                 !usesAccountProxy(config),
+                3,
+                abortSignal,
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
-                const images = await parseImagesStreamResponse(response, mime);
+                const images = await parseImagesStreamResponse(response, mime, abortSignal);
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
-            const payload = (await response.json()) as ImageApiResponse;
+            const payload = await readResponseJSON<ImageApiResponse>(response, abortSignal);
             return { images: parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
         },
+        abortSignal,
     );
 }
 
@@ -730,9 +815,10 @@ async function createGrokImageEditBody(config: AiConfig, prompt: string, referen
     return body;
 }
 
-async function requestGrokImageEditSingle(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams): Promise<GeneratedImage[]> {
+async function requestGrokImageEditSingle(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams, abortSignal?: AbortSignal): Promise<GeneratedImage[]> {
     const mime = IMAGE_MIME;
     const body = await createGrokImageEditBody(config, prompt, references, params);
+    throwIfAborted(abortSignal);
     return requestAndParseImages(
         config,
         "/images/edits",
@@ -740,28 +826,33 @@ async function requestGrokImageEditSingle(config: AiConfig, prompt: string, refe
         params.timeoutSeconds,
         () =>
             requestWithTransientRetry(() =>
-                withTimeout(params.timeoutSeconds, (signal) =>
+                withTimeout(params.timeoutSeconds, (requestSignal) =>
                     fetch(aiApiUrl(config, "/images/edits"), {
                         method: "POST",
                         headers: aiHeaders(config, "application/json"),
                         body: JSON.stringify(body),
-                        signal,
+                        signal: requestSignal,
                     }),
-                ),
+                abortSignal),
+                true,
+                3,
+                abortSignal,
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
-                const images = await parseImagesStreamResponse(response, mime);
+                const images = await parseImagesStreamResponse(response, mime, abortSignal);
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
-            const payload = (await response.json()) as ImageApiResponse;
+            const payload = await readResponseJSON<ImageApiResponse>(response, abortSignal);
             return { images: parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
         },
+        abortSignal,
     );
 }
 
-async function requestImageEditSingle(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams): Promise<GeneratedImage[]> {
-    if (isGrokImageModel(config.model)) return requestGrokImageEditSingle(config, prompt, references, params);
+async function requestImageEditSingle(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams, abortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    throwIfAborted(abortSignal);
+    if (isGrokImageModel(config.model)) return requestGrokImageEditSingle(config, prompt, references, params, abortSignal);
 
     const mime = IMAGE_MIME;
     const formData = new FormData();
@@ -776,12 +867,13 @@ async function requestImageEditSingle(config: AiConfig, prompt: string, referenc
         formData.set("partial_images", String(params.streamPartialImages));
     }
     const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
+    throwIfAborted(abortSignal);
     files.forEach((file) => formData.append("image", file));
 
     const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
     if (directProvider) {
         const { requestDirectImages } = await import("@/services/api/direct-ai");
-        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/edits", formData, params.timeoutSeconds), mime);
+        return parseImagePayload(await requestDirectImages(config, directProvider, "/images/edits", formData, params.timeoutSeconds, abortSignal), mime);
     }
 
     return requestAndParseImages(
@@ -792,24 +884,27 @@ async function requestImageEditSingle(config: AiConfig, prompt: string, referenc
         () =>
             requestWithTransientRetry(
                 () =>
-                    withTimeout(params.timeoutSeconds, (signal) =>
+                    withTimeout(params.timeoutSeconds, (requestSignal) =>
                         fetch(aiApiUrl(config, "/images/edits"), {
                             method: "POST",
                             headers: aiHeaders(config),
                             body: formData,
-                            signal,
+                            signal: requestSignal,
                         }),
-                    ),
+                    abortSignal),
                 !usesAccountProxy(config),
+                3,
+                abortSignal,
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
-                const images = await parseImagesStreamResponse(response, mime);
+                const images = await parseImagesStreamResponse(response, mime, abortSignal);
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
-            const payload = (await response.json()) as ImageApiResponse;
+            const payload = await readResponseJSON<ImageApiResponse>(response, abortSignal);
             return { images: parseImagePayload(payload, mime), responseBody: stringifyLogPayload(payload) };
         },
+        abortSignal,
     );
 }
 
@@ -841,7 +936,8 @@ function createResponsesInput(config: AiConfig, prompt: string, inputImageDataUr
     ];
 }
 
-async function requestResponsesSingle(config: AiConfig, prompt: string, inputImageDataUrls: string[], params: ImageRequestParams): Promise<GeneratedImage[]> {
+async function requestResponsesSingle(config: AiConfig, prompt: string, inputImageDataUrls: string[], params: ImageRequestParams, abortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    throwIfAborted(abortSignal);
     const mime = IMAGE_MIME;
     const body: Record<string, unknown> = {
         model: config.model,
@@ -859,44 +955,49 @@ async function requestResponsesSingle(config: AiConfig, prompt: string, inputIma
         () =>
             requestWithTransientRetry(
                 () =>
-                    withTimeout(params.timeoutSeconds, (signal) =>
+                    withTimeout(params.timeoutSeconds, (requestSignal) =>
                         fetch(aiApiUrl(config, "/responses"), {
                             method: "POST",
                             headers: aiHeaders(config, "application/json"),
                             body: JSON.stringify(body),
-                            signal,
+                            signal: requestSignal,
                         }),
-                    ),
+                    abortSignal),
                 !usesAccountProxy(config),
+                3,
+                abortSignal,
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
-                const images = await parseResponsesStreamResponse(response, mime);
+                const images = await parseResponsesStreamResponse(response, mime, abortSignal);
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
-            const payload = (await response.json()) as ResponsesApiResponse;
+            const payload = await readResponseJSON<ResponsesApiResponse>(response, abortSignal);
             return { images: parseResponsesPayload(payload, mime), responseBody: stringifyLogPayload(payload) };
         },
+        abortSignal,
     );
 }
 
-async function requestAndParseImages(config: AiConfig, endpoint: string, requestBody: unknown, timeoutSeconds: number, fetchResponse: () => Promise<Response>, parseResponse: (response: Response) => Promise<ParsedImageResponse>) {
+async function requestAndParseImages(config: AiConfig, endpoint: string, requestBody: unknown, timeoutSeconds: number, fetchResponse: () => Promise<Response>, parseResponse: (response: Response) => Promise<ParsedImageResponse>, signal?: AbortSignal) {
     const startedAt = Date.now();
     let logged = false;
     try {
         const response = await fetchResponse();
+        throwIfAborted(signal);
         if (!response.ok) {
-            const error = await fetchErrorDetail(response, "请求失败");
+            const error = await fetchErrorDetail(response, "请求失败", signal);
             logged = true;
             void writeLocalAICallLog(config, endpoint, startedAt, response.status, timeoutSeconds, stringifyLogPayload(requestBody), stringifyLogPayload(error.detail || error.message), error.message);
             throw new ImageRequestError(error.message, error.detail);
         }
         const parsed = await parseResponse(response);
+        throwIfAborted(signal);
         logged = true;
         void writeLocalAICallLog(config, endpoint, startedAt, response.status, timeoutSeconds, stringifyLogPayload(requestBody), parsed.responseBody, "");
         return parsed.images;
     } catch (error) {
-        if (!logged) {
+        if (!logged && !isAbortError(error)) {
             const status = error instanceof ImageRequestError ? error.status || 0 : 0;
             void writeLocalAICallLog(config, endpoint, startedAt, status, timeoutSeconds, stringifyLogPayload(requestBody), "", error instanceof ImageRequestError ? error.detail || error.message : error instanceof Error ? error.message : "请求失败");
         }
@@ -904,41 +1005,45 @@ async function requestAndParseImages(config: AiConfig, endpoint: string, request
     }
 }
 
-async function requestImages(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[]): Promise<GeneratedImage[]> {
+async function requestImages(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], abortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    throwIfAborted(abortSignal);
     const params = createImageRequestParams(config);
     const inputImageDataUrls = references.length ? await Promise.all(references.map((image) => imageToDataUrl(image))) : [];
+    throwIfAborted(abortSignal);
     const useConcurrentSingleRequests = config.apiMode === "responses" || config.codexCli || config.streamImages;
     if (params.n > 1 && useConcurrentSingleRequests) {
-        const results = await Promise.allSettled(Array.from({ length: params.n }, () => requestImages({ ...config, count: "1" }, prompt, references)));
+        const results = await Promise.allSettled(Array.from({ length: params.n }, () => requestImages({ ...config, count: "1" }, prompt, references, abortSignal)));
         const images = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
         if (images.length) return images;
         const firstError = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
         throw firstError?.reason || new Error("所有并发请求均失败");
     }
     if (references.length && isAgnesImageModel(config.model)) {
-        return requestAgnesImageEdit(config, prompt, references, params);
+        return requestAgnesImageEdit(config, prompt, references, params, abortSignal);
     }
-    if (config.apiMode === "responses") return requestResponsesSingle(config, prompt, inputImageDataUrls, params);
-    return references.length ? requestImageEditSingle(config, prompt, references, params) : requestImageGenerationSingle(config, prompt, params);
+    if (config.apiMode === "responses") return requestResponsesSingle(config, prompt, inputImageDataUrls, params, abortSignal);
+    return references.length ? requestImageEditSingle(config, prompt, references, params, abortSignal) : requestImageGenerationSingle(config, prompt, params, abortSignal);
 }
 
-export async function requestGeneration(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string) {
+export async function requestGeneration(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, signal?: AbortSignal) {
     try {
-        const images = await requestImages(config, prompt, []);
+        const images = await requestImages(config, prompt, [], signal);
         refreshRemoteUser(config);
         return images;
     } catch (error) {
+        if (isAbortError(error)) throw error;
         if (error instanceof ImageRequestError) throw error;
         throw new Error(error instanceof Error ? error.message : "请求失败");
     }
 }
 
-export async function requestEdit(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[]) {
+export async function requestEdit(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], signal?: AbortSignal) {
     try {
-        const images = await requestImages(config, prompt, references);
+        const images = await requestImages(config, prompt, references, signal);
         refreshRemoteUser(config);
         return images;
     } catch (error) {
+        if (isAbortError(error)) throw error;
         if (error instanceof ImageRequestError) throw error;
         throw new Error(error instanceof Error ? error.message : "请求失败");
     }
@@ -1233,7 +1338,8 @@ function publicHttpUrl(value?: string) {
     }
 }
 
-async function requestAgnesImageEdit(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], params: ImageRequestParams): Promise<GeneratedImage[]> {
+async function requestAgnesImageEdit(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], params: ImageRequestParams, abortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    throwIfAborted(abortSignal);
     const mime = IMAGE_MIME;
 
     // 获取所有参考图的公共 HTTP 链接或降级为 base64 数组，完美对齐 extra_body.image
@@ -1247,6 +1353,7 @@ async function requestAgnesImageEdit(config: AiConfig & { seedIndex?: number; se
             return imageToDataUrl(ref);
         })
     );
+    throwIfAborted(abortSignal);
 
     const body: Record<string, unknown> = {
         model: config.model,
@@ -1265,25 +1372,28 @@ async function requestAgnesImageEdit(config: AiConfig & { seedIndex?: number; se
         () =>
             requestWithTransientRetry(
                 () =>
-                    withTimeout(params.timeoutSeconds, (signal) =>
+                    withTimeout(params.timeoutSeconds, (requestSignal) =>
                         fetch(aiApiUrl(config, "/images/generations"), {
                             method: "POST",
                             headers: aiHeaders(config, "application/json"),
                             body: JSON.stringify(body),
-                            signal,
+                            signal: requestSignal,
                         }),
-                    ),
+                    abortSignal),
                 !usesAccountProxy(config),
+                3,
+                abortSignal,
             ),
         async (response) => {
             if (config.streamImages && isEventStreamResponse(response)) {
-                const images = await parseImagesStreamResponse(response, mime);
+                const images = await parseImagesStreamResponse(response, mime, abortSignal);
                 return { images, responseBody: summarizeGeneratedImages(images, "event-stream") };
             }
-            const payload = (await response.json()) as ImageApiResponse;
+            const payload = await readResponseJSON<ImageApiResponse>(response, abortSignal);
             const images = parseImagePayload(payload, mime);
             return { images, responseBody: stringifyLogPayload(payload) };
         },
+        abortSignal,
     );
 }
 

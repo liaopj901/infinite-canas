@@ -78,13 +78,13 @@ func CurrentUserImageGenerationLogs(ctx context.Context) ([]json.RawMessage, err
 	if err != nil {
 		return nil, err
 	}
-	return imageGenerationPayloads(logs), nil
+	return imageGenerationPayloads(user.ID, logs)
 }
 
-func SaveCurrentUserImageGenerationLogs(ctx context.Context, raws []json.RawMessage) ([]json.RawMessage, error) {
+func SaveCurrentUserImageGenerationLogs(ctx context.Context, raws []json.RawMessage) error {
 	user, ok := UserFromContext(ctx)
 	if !ok || user.ID == "" {
-		return nil, errors.New("请先登录")
+		return errors.New("请先登录")
 	}
 	cleanupGenerationLogs()
 	logs := make([]model.ImageGenerationLog, 0, len(raws))
@@ -94,10 +94,7 @@ func SaveCurrentUserImageGenerationLogs(ctx context.Context, raws []json.RawMess
 			logs = append(logs, log)
 		}
 	}
-	if err := repository.UpsertImageGenerationLogs(user.ID, logs); err != nil {
-		return nil, err
-	}
-	return CurrentUserImageGenerationLogs(ctx)
+	return repository.UpsertImageGenerationLogs(user.ID, logs)
 }
 
 func DeleteCurrentUserImageGenerationLog(ctx context.Context, id string) error {
@@ -128,14 +125,35 @@ func videoGenerationPayloads(logs []model.VideoGenerationLog) []json.RawMessage 
 	return result
 }
 
-func imageGenerationPayloads(logs []model.ImageGenerationLog) []json.RawMessage {
-	result := make([]json.RawMessage, 0, len(logs))
+func imageGenerationPayloads(userID string, logs []model.ImageGenerationLog) ([]json.RawMessage, error) {
+	records := make([]map[string]any, 0, len(logs))
+	localIDs := make([]string, 0)
 	for _, log := range logs {
-		if strings.TrimSpace(log.PayloadJSON) != "" {
-			result = append(result, json.RawMessage(log.PayloadJSON))
+		if strings.TrimSpace(log.SummaryJSON) == "" {
+			continue
 		}
+		record := parseGenerationLogRecord(json.RawMessage(log.SummaryJSON))
+		records = append(records, record)
+		localIDs = append(localIDs, generationLogLocalMediaIDs(record)...)
 	}
-	return result
+	media, err := repository.ListGeneratedMediaByIDs(userID, localIDs)
+	if err != nil {
+		return nil, err
+	}
+	mediaByID := make(map[string]model.GeneratedMedia, len(media))
+	for _, item := range media {
+		mediaByID[item.ID] = item
+	}
+	result := make([]json.RawMessage, 0, len(records))
+	for _, record := range records {
+		reconcileGenerationLogMedia(record, mediaByID)
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, raw)
+	}
+	return result, nil
 }
 
 func videoGenerationLogFromPayload(raw json.RawMessage) model.VideoGenerationLog {
@@ -174,9 +192,161 @@ func imageGenerationLogFromPayload(raw json.RawMessage) model.ImageGenerationLog
 		ImageID:     firstGenerationLogValue(generationLogString(image["id"]), generationLogString(image["storageKey"]), generationLogString(image["url"]), generationLogString(record["imageId"])),
 		Status:      generationLogString(record["status"]),
 		PayloadJSON: string(raw),
+		SummaryJSON: imageGenerationSummary(raw),
 		CreatedAt:   createdAt,
 		UpdatedAt:   current,
 		DeletedAt:   "",
+	}
+}
+
+func imageGenerationSummary(raw json.RawMessage) string {
+	record := parseGenerationLogRecord(raw)
+	summary := selectGenerationLogFields(record, []string{
+		"id", "createdAt", "title", "prompt", "time", "model", "durationMs", "successCount", "failCount",
+		"imageCount", "size", "quality", "status", "errors", "categoryIds", "workflowId", "workflowName",
+		"workflowTaskId", "lastPolledAt",
+	})
+	if config := generationLogRecord(record["config"]); len(config) > 0 {
+		summary["config"] = selectGenerationLogFields(config, []string{
+			"channelMode", "model", "imageModel", "activeChannelId", "imageChannelId", "quality", "size", "count",
+			"apiMode", "streamImages", "streamPartialImages", "responseFormatB64Json", "codexCli",
+		})
+	}
+	if images := compactGenerationLogImages(record["images"]); len(images) > 0 {
+		summary["images"] = images
+	} else {
+		summary["images"] = []map[string]any{}
+	}
+	if references := compactGenerationLogReferences(record["references"]); len(references) > 0 {
+		// 重试只需要引用标识和存储键；大体积 data URL 不应进入列表接口。
+		summary["references"] = references
+	}
+	if task := compactGenerationLogTask(record["task"]); len(task) > 0 {
+		summary["task"] = task
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+func selectGenerationLogFields(record map[string]any, fields []string) map[string]any {
+	result := make(map[string]any, len(fields))
+	for _, field := range fields {
+		if value, exists := record[field]; exists && value != nil {
+			result[field] = value
+		}
+	}
+	return result
+}
+
+func compactGenerationLogImages(value any) []map[string]any {
+	items, _ := value.([]any)
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		image := generationLogRecord(item)
+		if len(image) == 0 {
+			continue
+		}
+		compact := selectGenerationLogFields(image, []string{
+			"id", "dataUrl", "storageKey", "durationMs", "width", "height", "bytes", "mimeType", "storageStatus", "storageMessage",
+		})
+		if dataURL := generationLogString(compact["dataUrl"]); strings.HasPrefix(dataURL, "data:") || strings.HasPrefix(dataURL, "blob:") {
+			delete(compact, "dataUrl")
+		}
+		result = append(result, compact)
+	}
+	return result
+}
+
+func compactGenerationLogReferences(value any) []map[string]any {
+	items, _ := value.([]any)
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		reference := generationLogRecord(item)
+		if len(reference) == 0 {
+			continue
+		}
+		compact := selectGenerationLogFields(reference, []string{"id", "name", "type", "storageKey", "source", "temporary", "dataUrl"})
+		if dataURL := generationLogString(compact["dataUrl"]); strings.HasPrefix(dataURL, "data:") || strings.HasPrefix(dataURL, "blob:") {
+			delete(compact, "dataUrl")
+		}
+		result = append(result, compact)
+	}
+	return result
+}
+
+func compactGenerationLogTask(value any) map[string]any {
+	task := generationLogRecord(value)
+	if len(task) == 0 {
+		return map[string]any{}
+	}
+	compact := selectGenerationLogFields(task, []string{
+		"id", "parent_task_id", "source", "source_id", "node_id", "channelId", "userChannelId", "channelName", "model",
+		"prompt", "status", "progress", "url", "image_url", "image_urls", "storageKey", "width", "height", "mimeType", "bytes",
+		"started_at", "startedAt", "created_at", "createdAt", "completed_at", "error", "error_detail",
+	})
+	for _, field := range []string{"url", "image_url"} {
+		if generationLogInlineURL(generationLogString(compact[field])) {
+			delete(compact, field)
+		}
+	}
+	if values, ok := compact["image_urls"].([]any); ok {
+		urls := make([]string, 0, len(values))
+		for _, value := range values {
+			url := generationLogString(value)
+			if url != "" && !generationLogInlineURL(url) {
+				urls = append(urls, url)
+			}
+		}
+		compact["image_urls"] = urls
+	}
+	return compact
+}
+
+func generationLogInlineURL(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(value, "data:") || strings.HasPrefix(value, "blob:")
+}
+
+func generationLogLocalMediaIDs(record map[string]any) []string {
+	items, _ := record["images"].([]any)
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		key := generationLogString(generationLogRecord(item)["storageKey"])
+		if strings.HasPrefix(key, "local:") {
+			ids = append(ids, strings.TrimPrefix(key, "local:"))
+		}
+	}
+	return ids
+}
+
+func reconcileGenerationLogMedia(record map[string]any, mediaByID map[string]model.GeneratedMedia) {
+	items, _ := record["images"].([]any)
+	for _, item := range items {
+		image := generationLogRecord(item)
+		key := generationLogString(image["storageKey"])
+		if !strings.HasPrefix(key, "local:") {
+			continue
+		}
+		id := strings.TrimPrefix(key, "local:")
+		media, exists := mediaByID[id]
+		if !exists {
+			image["dataUrl"] = ""
+			image["storageStatus"] = model.GeneratedMediaStatusCleaned
+			image["storageMessage"] = ErrGeneratedMediaCleaned.Error()
+			continue
+		}
+		view := generatedMediaView(media)
+		image["dataUrl"] = view.URL
+		image["storageKey"] = view.StorageKey
+		image["storageStatus"] = view.StorageStatus
+		image["storageMessage"] = view.StorageMessage
+		image["width"] = view.Width
+		image["height"] = view.Height
+		image["bytes"] = view.Bytes
+		image["mimeType"] = view.MimeType
 	}
 }
 
@@ -273,4 +443,3 @@ func migrateUserImageGenerationLogs(userID string) error {
 	_, err = repository.SaveUserConfig(config)
 	return err
 }
-

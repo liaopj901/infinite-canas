@@ -81,12 +81,11 @@ func SaveUserImageGenerationLogs(w http.ResponseWriter, r *http.Request) {
 		Fail(w, "历史记录不能为空")
 		return
 	}
-	logs, err := service.SaveCurrentUserImageGenerationLogs(r.Context(), request.Logs)
-	if err != nil {
+	if err := service.SaveCurrentUserImageGenerationLogs(r.Context(), request.Logs); err != nil {
 		FailError(w, err)
 		return
 	}
-	OK(w, logs)
+	OK(w, map[string]bool{"saved": true})
 }
 
 func DeleteUserImageGenerationLog(w http.ResponseWriter, r *http.Request, id string) {

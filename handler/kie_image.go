@@ -995,6 +995,9 @@ func isKIEImageEndpoint(endpoint string) bool {
 }
 
 func copyKIECreateImageResponse(w http.ResponseWriter, request *http.Request, payload []byte, statusCode int, channel model.ModelChannel, logContext aiLogContext, onFailure func()) bool {
+	if handleCanceledAIRequest(request, onFailure) {
+		return true
+	}
 	var result struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -1011,6 +1014,9 @@ func copyKIECreateImageResponse(w http.ResponseWriter, request *http.Request, pa
 	}
 
 	imageURLs, errorMessage, responseBody := pollKIEImageTask(request, channel, result.Data.TaskID)
+	if handleCanceledAIRequest(request, onFailure) {
+		return true
+	}
 	if errorMessage != "" {
 		if onFailure != nil {
 			onFailure()

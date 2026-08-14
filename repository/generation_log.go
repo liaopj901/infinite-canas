@@ -117,7 +117,8 @@ func ListImageGenerationLogs(userID string, limit int) ([]model.ImageGenerationL
 		limit = 500
 	}
 	var logs []model.ImageGenerationLog
-	err = db.Where("user_id = ? AND deleted_at = ?", userID, "").Order("created_at DESC").Limit(limit).Find(&logs).Error
+	err = db.Select("id", "user_id", "task_id", "image_id", "status", "summary_json", "created_at", "updated_at", "deleted_at").
+		Where("user_id = ? AND deleted_at = ?", userID, "").Order("created_at DESC").Limit(limit).Find(&logs).Error
 	return logs, err
 }
 
@@ -181,6 +182,7 @@ func SoftDeleteImageGenerationLog(userID string, id string, deletedAt string) er
 		"deleted_at":   deletedAt,
 		"updated_at":   deletedAt,
 		"payload_json": "",
+		"summary_json": "",
 	}).Error
 }
 
@@ -199,6 +201,7 @@ func SoftDeleteImageGenerationLogs(userID string, ids []string, deletedAt string
 			"deleted_at":   deletedAt,
 			"updated_at":   deletedAt,
 			"payload_json": "",
+			"summary_json": "",
 		}).Error
 }
 
@@ -254,4 +257,3 @@ func generationLogIdentityValues(values ...string) []string {
 	}
 	return result
 }
-

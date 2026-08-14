@@ -173,7 +173,8 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 			return
 		}
 	}
-	request, err := http.NewRequest(http.MethodPost, service.BuildModelChannelURL(channel, upstreamPath), bytes.NewReader(body))
+	// 必须继承客户端 context；用户取消请求时才能终止服务端仍在等待的上游连接。
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, service.BuildModelChannelURL(channel, upstreamPath), bytes.NewReader(body))
 	if err != nil {
 		log.Printf("AI proxy build request failed: url=%s err=%v", service.BuildModelChannelURL(channel, upstreamPath), err)
 		Fail(w, "AI 接口请求失败")
@@ -225,6 +226,9 @@ type aiLogContext struct {
 func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.ModelChannel, logContext aiLogContext, onFailure func()) {
 	response, err := doAIRequestWithRetry(request, channel, logContext.ImageRequest)
 	if err != nil {
+		if handleCanceledAIRequest(request, onFailure) {
+			return
+		}
 		log.Printf("AI proxy request failed: url=%s err=%v", request.URL.String(), err)
 		if onFailure != nil {
 			onFailure()
@@ -234,9 +238,15 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.
 		return
 	}
 	defer response.Body.Close()
+	if handleCanceledAIRequest(request, onFailure) {
+		return
+	}
 
 	if response.StatusCode >= http.StatusBadRequest {
 		payload, _ := io.ReadAll(io.LimitReader(response.Body, 256*1024))
+		if handleCanceledAIRequest(request, onFailure) {
+			return
+		}
 		log.Printf("AI upstream error: url=%s status=%d body=%s", request.URL.String(), response.StatusCode, strings.TrimSpace(string(payload)))
 		if onFailure != nil {
 			onFailure()
@@ -275,7 +285,21 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.
 	}
 	w.WriteHeader(response.StatusCode)
 	responseBody := copyAIResponseBody(w, response.Body)
+	if handleCanceledAIRequest(request, onFailure) {
+		return
+	}
 	saveAIProxyLog(logContext, response.StatusCode, responseBody, "")
+}
+
+func handleCanceledAIRequest(request *http.Request, onFailure func()) bool {
+	if request.Context().Err() == nil {
+		return false
+	}
+	// 用户主动取消不应落成失败调用日志，但已扣除的站内额度必须按无结果请求退回。
+	if onFailure != nil {
+		onFailure()
+	}
+	return true
 }
 
 func doAIRequestWithRetry(request *http.Request, channel model.ModelChannel, retryImage bool) (*http.Response, error) {
@@ -292,6 +316,9 @@ func doAIRequestWithRetry(request *http.Request, channel model.ModelChannel, ret
 		}
 		response, err := client.Do(current)
 		if err != nil {
+			if request.Context().Err() != nil {
+				return nil, request.Context().Err()
+			}
 			if attempt >= maxRetries {
 				if retryImage {
 					return nil, &imageUpstreamRetryError{err: err}
@@ -311,6 +338,9 @@ func doAIRequestWithRetry(request *http.Request, channel model.ModelChannel, ret
 		response.Body.Close()
 		if readErr != nil {
 			return nil, readErr
+		}
+		if request.Context().Err() != nil {
+			return nil, request.Context().Err()
 		}
 		response.Body = io.NopCloser(bytes.NewReader(payload))
 		if !shouldRetryImageUpstream(retryImage, response.StatusCode, payload) || attempt >= maxRetries {

@@ -12,6 +12,8 @@ import { useUserStore } from "@/stores/use-user-store";
 export type UploadedImage = {
     url: string;
     storageKey: string;
+    storageStatus?: "local" | "cloud" | "cleaned";
+    storageMessage?: string;
     width: number;
     height: number;
     bytes: number;
@@ -191,12 +193,89 @@ export async function uploadRemoteImageToServer(url: string, filename: string, r
     return { ...payload.data, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
 }
 
+export async function saveGeneratedImage(
+    input: string | Blob,
+    filename: string,
+    width: number,
+    height: number,
+    autoUpload: boolean,
+    requestToken = useUserStore.getState().token,
+    requestOwnerId = getAccountOwnerId(),
+): Promise<UploadedImage> {
+    if (!requestToken) throw new Error("保存生成图片需要先登录");
+    const blob = await loadImageBlob(input);
+    const config = await loadStorageConfig().catch(() => null);
+    const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
+    const formData = new FormData();
+    formData.append("file", blob, filename || `image-${nanoid()}.${imageExtension(blob.type)}`);
+    formData.append("width", String(width || 0));
+    formData.append("height", String(height || 0));
+    formData.append("autoUpload", String(autoUpload));
+    if (userProvider) formData.append("provider", JSON.stringify(toProviderPayload(userProvider)));
+    const response = await fetch("/api/v1/generated-images", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${requestToken}` },
+        body: formData,
+    });
+    const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedImage } | null;
+    if (!response.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "生成图片保存失败");
+    if (getAccountOwnerId() !== requestOwnerId || useUserStore.getState().token !== requestToken) return payload.data;
+    const url = await resolveImageUrl(payload.data.storageKey, payload.data.url);
+    return {
+        ...payload.data,
+        url,
+        width: payload.data.width || width,
+        height: payload.data.height || height,
+        bytes: payload.data.bytes || blob.size,
+        mimeType: payload.data.mimeType || blob.type || "image/png",
+    };
+}
+
+export async function uploadGeneratedImageToCloud(
+    storageKey: string,
+    requestToken = useUserStore.getState().token,
+    requestOwnerId = getAccountOwnerId(),
+): Promise<UploadedImage> {
+    if (!storageKey.startsWith("local:")) throw new Error("图片不在服务器本地存储中");
+    if (!requestToken) throw new Error("上传云端需要先登录");
+    const id = storageKey.slice("local:".length);
+    const config = await loadStorageConfig().catch(() => null);
+    const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
+    const response = await fetch(`/api/v1/generated-images/${encodeURIComponent(id)}/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${requestToken}` },
+        body: JSON.stringify(userProvider ? { provider: toProviderPayload(userProvider) } : {}),
+    });
+    const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedImage } | null;
+    if (!response.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "图片上传云端失败");
+    const localUrl = objectUrls.get(storageKey);
+    if (localUrl) URL.revokeObjectURL(localUrl);
+    objectUrls.delete(storageKey);
+    if (getAccountOwnerId() !== requestOwnerId || useUserStore.getState().token !== requestToken) return payload.data;
+    const url = await resolveImageUrl(payload.data.storageKey, payload.data.url);
+    return { ...payload.data, url };
+}
+
 export function clearStorageConfigCache() {
     storageConfigPromise = null;
 }
 
 export async function resolveImageUrl(storageKey?: string, fallback = "") {
     if (!storageKey) return fallback;
+    if (storageKey.startsWith("local:")) {
+        const ownerId = getAccountOwnerId();
+        const token = useUserStore.getState().token;
+        const id = storageKey.slice("local:".length);
+        const cached = objectUrls.get(storageKey);
+        if (cached) return cached;
+        if (!token || !id) return "";
+        const response = await fetch(`/api/v1/generated-images/${encodeURIComponent(id)}/content`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+        if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return "";
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        objectUrls.set(storageKey, url);
+        return url;
+    }
     if (storageKey.startsWith("server:")) {
         const ownerId = getAccountOwnerId();
         const token = useUserStore.getState().token;
@@ -326,6 +405,10 @@ export async function deleteStoredImages(keys: Iterable<string>, request: Storag
                 await deleteServerImage(key, ownerId, token);
                 return;
             }
+            if (key.startsWith("local:")) {
+                await deleteLocalGeneratedImage(key, ownerId, token);
+                return;
+            }
             const url = objectUrls.get(key);
             if (url) URL.revokeObjectURL(url);
             objectUrls.delete(key);
@@ -345,11 +428,11 @@ export async function cleanupUnusedImages(usedData: unknown) {
 
 export function collectImageStorageKeys(value: unknown, keys = new Set<string>()) {
     if (typeof value === "string") {
-        if (value.startsWith("image:") || value.startsWith("server:")) keys.add(value);
+        if (value.startsWith("image:") || value.startsWith("server:") || value.startsWith("local:")) keys.add(value);
         return keys;
     }
     if (!value || typeof value !== "object") return keys;
-    if ("storageKey" in value && typeof value.storageKey === "string" && (value.storageKey.startsWith("image:") || value.storageKey.startsWith("server:"))) keys.add(value.storageKey);
+    if ("storageKey" in value && typeof value.storageKey === "string" && (value.storageKey.startsWith("image:") || value.storageKey.startsWith("server:") || value.storageKey.startsWith("local:"))) keys.add(value.storageKey);
     Object.values(value).forEach((item) => (Array.isArray(item) ? item.forEach((child) => collectImageStorageKeys(child, keys)) : collectImageStorageKeys(item, keys)));
     return keys;
 }
@@ -450,6 +533,32 @@ export function toProviderPayload(provider: UserStorageProvider) {
         publicBaseUrl: provider.publicBaseUrl,
         pathPrefix: provider.pathPrefix,
     };
+}
+
+async function loadImageBlob(input: string | Blob) {
+    if (input instanceof Blob) return input;
+    const response = await fetch(getProxyUrl(input));
+    if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { msg?: string } | null;
+        throw new Error(payload?.msg || `代理图片拉取失败：${response.status}`);
+    }
+    return response.blob();
+}
+
+async function deleteLocalGeneratedImage(storageKey: string, ownerId = getAccountOwnerId(), token = useUserStore.getState().token) {
+    const id = storageKey.slice("local:".length);
+    const url = objectUrls.get(storageKey);
+    if (url) URL.revokeObjectURL(url);
+    objectUrls.delete(storageKey);
+    if (!id || !token) return;
+    const provider = loadUserStorageProvider(ownerId);
+    const response = await fetch(`/api/v1/generated-images/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(provider ? { provider: toProviderPayload(provider) } : {}),
+    });
+    const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string } | null;
+    if (!response.ok || payload?.code !== 0) throw new Error(payload?.msg || "删除本地生成图片失败");
 }
 
 async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId(), token = useUserStore.getState().token) {
