@@ -6,6 +6,7 @@ import { useAssetStore, mergeAssets } from "@/stores/use-asset-store";
 import { useUserStore } from "@/stores/use-user-store";
 import { fetchUserConfig, syncUserAssetData, syncUserImageHistory } from "./api/user-config";
 import { saveVideoGenerationLogs } from "./api/generation-logs";
+import { getAccountOwnerId, getAccountRecordStorageKey, getAccountStorageKey } from "@/lib/account-scope";
 
 export async function checkLocalAssetsExist(): Promise<boolean> {
     const imageStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
@@ -37,6 +38,7 @@ export async function migrateLocalAssetsToCloud(
     onProgress: (current: number, total: number) => void
 ): Promise<void> {
     const token = useUserStore.getState().token;
+    const ownerId = getAccountOwnerId();
     if (!token) throw new Error("请先登录");
 
     // 先拉取云端已存的数据
@@ -144,9 +146,9 @@ export async function migrateLocalAssetsToCloud(
                     storeName: "app_state",
                 })
                 .setItem(
-                    "infinite-canvas:canvas_store",
+                    getAccountStorageKey("infinite-canvas:canvas_store", ownerId),
                     JSON.stringify({
-                        state: finalCanvas,
+                        state: { ...finalCanvas, ownerId },
                         version: 0,
                     }),
                 );
@@ -175,7 +177,7 @@ export async function migrateLocalAssetsToCloud(
             const finalAssets = { assets: mergedAssets };
             // Save locally
             await localforage.createInstance({ name: "infinite-canvas", storeName: "app_state" })
-                .setItem("infinite-canvas:asset_store", JSON.stringify({ state: finalAssets }));
+                .setItem(getAccountStorageKey("infinite-canvas:asset_store", ownerId), JSON.stringify({ state: { ...finalAssets, ownerId } }));
             // Set in Zustand store
             useAssetStore.setState(finalAssets);
             // Sync to server
@@ -189,10 +191,10 @@ export async function migrateLocalAssetsToCloud(
     const imageLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
     const imageCategoryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_categories" });
     const localLogs: any[] = [];
-    await imageLogStore.iterate((value) => {
-        localLogs.push(value);
+    await imageLogStore.iterate((value, key) => {
+        if (key.startsWith(getAccountStorageKey("infinite-canvas:image_generation_logs", ownerId) + ":")) localLogs.push(value);
     });
-    const localCategories = (await imageCategoryStore.getItem<any[]>("infinite-canvas:image_generation_categories")) || [];
+    const localCategories = (await imageCategoryStore.getItem<any[]>(getAccountStorageKey("infinite-canvas:image_generation_categories", ownerId))) || [];
 
     if (localLogs.length > 0 || localCategories.length > 0) {
         try {
@@ -201,11 +203,16 @@ export async function migrateLocalAssetsToCloud(
             const nextLogsData = JSON.parse(replacedLogsStr);
 
             // Save locally
-            await imageLogStore.clear();
+            const imageLogPrefix = getAccountStorageKey("infinite-canvas:image_generation_logs", ownerId) + ":";
+            const ownedImageLogKeys: string[] = [];
+            await imageLogStore.iterate((_value, key) => {
+                if (key.startsWith(imageLogPrefix)) ownedImageLogKeys.push(key);
+            });
+            await Promise.all(ownedImageLogKeys.map((key) => imageLogStore.removeItem(key)));
             await Promise.all(
-                nextLogsData.logs.map((log: any) => imageLogStore.setItem(log.id, log))
+                nextLogsData.logs.map((log: any) => imageLogStore.setItem(getAccountRecordStorageKey("infinite-canvas:image_generation_logs", log.id, ownerId), log))
             );
-            await imageCategoryStore.setItem("infinite-canvas:image_generation_categories", nextLogsData.categories);
+            await imageCategoryStore.setItem(getAccountStorageKey("infinite-canvas:image_generation_categories", ownerId), nextLogsData.categories);
 
             // Sync to server
             await syncUserImageHistory(token, { logs: nextLogsData.logs, categories: nextLogsData.categories });
@@ -217,8 +224,8 @@ export async function migrateLocalAssetsToCloud(
     // 7. Update Video Generation Logs
     const videoLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
     const localVideoLogs: any[] = [];
-    await videoLogStore.iterate((value) => {
-        localVideoLogs.push(value);
+    await videoLogStore.iterate((value, key) => {
+        if (key.startsWith(getAccountStorageKey("infinite-canvas:video_generation_logs", ownerId) + ":")) localVideoLogs.push(value);
     });
 
     if (localVideoLogs.length > 0) {
@@ -228,9 +235,14 @@ export async function migrateLocalAssetsToCloud(
             const nextVideoLogsData = JSON.parse(replacedVideoLogsStr);
 
             // Save locally
-            await videoLogStore.clear();
+            const videoLogPrefix = getAccountStorageKey("infinite-canvas:video_generation_logs", ownerId) + ":";
+            const ownedVideoLogKeys: string[] = [];
+            await videoLogStore.iterate((_value, key) => {
+                if (key.startsWith(videoLogPrefix)) ownedVideoLogKeys.push(key);
+            });
+            await Promise.all(ownedVideoLogKeys.map((key) => videoLogStore.removeItem(key)));
             await Promise.all(
-                nextVideoLogsData.logs.map((log: any) => videoLogStore.setItem(log.id, log))
+                nextVideoLogsData.logs.map((log: any) => videoLogStore.setItem(getAccountRecordStorageKey("infinite-canvas:video_generation_logs", log.id, ownerId), log))
             );
 
             // Sync to server

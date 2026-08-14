@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { usePathname, useRouter } from "next/navigation";
 
 import { AppTopNav } from "@/components/layout/app-top-nav";
@@ -18,7 +18,6 @@ export default function UserLayout({ children }: { children: ReactNode }) {
     const isPublicSettingsReady = useConfigStore((state) => state.isPublicSettingsReady);
     const user = useUserStore((state) => state.user);
     const isReady = useUserStore((state) => state.isReady);
-    const wasLoggedOutRef = useRef(false);
     const isPublicPage = publicPaths.has(pathname);
     const isAlwaysProtected = protectedPrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
     const isProtectedPage = isAlwaysProtected || (!isPublicPage && publicSettings?.auth.requireLogin === true);
@@ -30,30 +29,35 @@ export default function UserLayout({ children }: { children: ReactNode }) {
     }, [isAccessReady, isProtectedPage, pathname, router, user]);
 
     useEffect(() => {
-        if (!isReady) return;
-        if (!user) {
-            wasLoggedOutRef.current = true;
-            return;
-        }
-        const syncCanvasAfterLogin = wasLoggedOutRef.current;
+        if (!isReady || !user) return;
+        const ownerId = user.id;
         const token = useUserStore.getState().token;
         if (!token) return;
-        wasLoggedOutRef.current = false;
+        let cancelled = false;
+        const isCurrentAccount = () =>
+            !cancelled &&
+            (useUserStore.getState().user?.id || "guest") === ownerId &&
+            useUserStore.getState().token === token;
+
         fetchUserConfig(token).then(async (config) => {
+            if (!isCurrentAccount()) return;
             const syncEnabled = config.syncCapabilities?.userData === true;
-            const { useCanvasStore } = await import("@/app/(user)/canvas/stores/use-canvas-store");
+            const { rehydrateCanvasForCurrentAccount, useCanvasStore } = await import("@/app/(user)/canvas/stores/use-canvas-store");
+            const { rehydrateAssetsForCurrentAccount, useAssetStore } = await import("@/stores/use-asset-store");
+            await Promise.all([rehydrateCanvasForCurrentAccount(), rehydrateAssetsForCurrentAccount()]);
+            if (!isCurrentAccount()) return;
             const canvasStore = useCanvasStore.getState();
             canvasStore.setSyncEnabled(syncEnabled);
-            if (
-                syncCanvasAfterLogin &&
-                syncEnabled &&
-                canvasStore.hydrated
-            ) {
+            if (syncEnabled && canvasStore.hydrated) {
                 void canvasStore.syncWithRemote(token, true);
             }
-            const { useAssetStore } = await import("@/stores/use-asset-store");
+            if (!isCurrentAccount()) return;
             void useAssetStore.getState().hydrateAccountAssets(token, syncEnabled);
-        }).catch(() => { });
+        }).catch(() => undefined);
+
+        return () => {
+            cancelled = true;
+        };
     }, [isReady, user]);
 
     return (

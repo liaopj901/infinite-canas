@@ -48,6 +48,7 @@ import { formatBytes, formatDuration, getDataUrlByteSize, readImageMeta } from "
 import { ImageRequestError, batchCanvasImageTaskStatus, createCanvasImageTask, deleteCanvasImageTask, listCanvasImageTasks, requestEdit, requestGeneration, type CanvasImageTask } from "@/services/api/image";
 import { deleteImageGenerationLogs, fetchImageGenerationLogs, saveImageGenerationLogs } from "@/services/api/generation-logs";
 import { deleteStoredImages, imageToDataUrl, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadImage, uploadRemoteImageToServer } from "@/services/image-storage";
+import { getAccountRecordStorageKey, getAccountStorageKey, getAccountOwnerId } from "@/lib/account-scope";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
@@ -129,6 +130,14 @@ const IMAGE_TASK_POLL_INTERVAL_MS = 10000;
 const WORKFLOW_BUTTON_POSITION_KEY = "infinite-canvas:workflow-button-position";
 const logStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
 const categoryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_categories" });
+
+function imageLogStorageKey(id: string, ownerId = getAccountOwnerId()) {
+    return getAccountRecordStorageKey(LOG_STORE_KEY, id, ownerId);
+}
+
+function imageCategoryStorageKey(ownerId = getAccountOwnerId()) {
+    return getAccountStorageKey(CATEGORY_STORE_KEY, ownerId);
+}
 export default function ImagePage() {
     const { message, modal } = App.useApp();
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -139,6 +148,7 @@ export default function ImagePage() {
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const token = useUserStore((state) => state.token);
+    const accountOwnerId = useUserStore((state) => state.user?.id || "guest");
     const isUserReady = useUserStore((state) => state.isReady);
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
@@ -187,7 +197,6 @@ export default function ImagePage() {
     };
 
     useEffect(() => {
-        void refreshCategories();
         try {
             const storedLayout = window.localStorage?.getItem(WORKBENCH_LAYOUT_KEY);
             if (storedLayout === "side" || storedLayout === "bottom") setWorkbenchLayoutState(storedLayout);
@@ -228,12 +237,34 @@ export default function ImagePage() {
 
     useEffect(() => {
         if (!isUserReady) return;
+        let cancelled = false;
+        const ownerId = accountOwnerId;
+        const isCurrentAccount = () => !cancelled && getAccountOwnerId() === ownerId && useUserStore.getState().token === token;
+
+        // 账号切换后先清空旧账号的内存快照，不能等新账号请求返回后才清理。
+        logsRef.current = [];
+        pollingLogIdsRef.current.clear();
+        accountHistorySyncEnabledRef.current = false;
+        setLogs([]);
+        setCategories([]);
+        setResults([]);
+        setSyncingImageIds([]);
+        setSelectedLogIds([]);
+        setPreviewLog(null);
+
         if (token) {
-            void loadAccountImageHistory(token).then((items) => syncBackendImageTasks(items || logsRef.current));
-            return;
+            void loadAccountImageHistory(token, ownerId).then((items) => {
+                if (!isCurrentAccount()) return;
+                void syncBackendImageTasks(items || logsRef.current, ownerId);
+            });
+        } else {
+            void refreshLogs(ownerId).then((items) => {
+                if (!isCurrentAccount()) return;
+                void syncBackendImageTasks(items, ownerId);
+            });
         }
-        void refreshLogs().then((items) => syncBackendImageTasks(items));
-    }, [isUserReady, token]);
+        return () => { cancelled = true; };
+    }, [isUserReady, token, accountOwnerId]);
 
     useEffect(() => {
         if (!pendingCount && !pendingLogCount) return;
@@ -359,6 +390,8 @@ export default function ImagePage() {
     };
 
     const removeReference = async (id: string) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const reference = references.find((item) => item.id === id);
         setReferences((value) => value.filter((ref) => ref.id !== id));
         if (!reference || !shouldDeleteReferenceFile(reference, logs, results)) {
@@ -367,7 +400,7 @@ export default function ImagePage() {
         }
         if (reference?.storageKey) {
             try {
-                await deleteStoredImages([reference.storageKey]);
+                await deleteStoredImages([reference.storageKey], { ownerId, token: taskToken });
             } catch (error) {
                 message.error(error instanceof Error ? error.message : "参考图文件删除失败");
             }
@@ -407,6 +440,8 @@ export default function ImagePage() {
     };
 
     const submitPersistentGenerationBatch = async (snapshot: RequestSnapshot) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         setPreviewLog(null);
         const taskCount = Math.max(1, Number(snapshot.displayConfig.count) || 1);
         const pendingLogs = Array.from({ length: taskCount }, (_, index) => {
@@ -434,13 +469,14 @@ export default function ImagePage() {
         setResults((value) => mergePendingLogResults(value, pendingLogs));
         setNow(Date.now());
 
-        const settled = await Promise.allSettled(pendingLogs.map((log, index) => createPersistentImageTask(log, snapshot, index, taskCount)));
+        const settled = await Promise.allSettled(pendingLogs.map((log, index) => createPersistentImageTask(log, snapshot, index, taskCount, ownerId, taskToken)));
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const createdCount = settled.filter((item) => item.status === "fulfilled").length;
         if (createdCount) message.success(`已创建 ${createdCount} 个图片任务`);
         if (createdCount < pendingLogs.length) message.warning(`${pendingLogs.length - createdCount} 个图片任务创建失败`);
     };
 
-    const createPersistentImageTask = async (pendingLog: GenerationLog, snapshot: RequestSnapshot, index: number, taskCount: number) => {
+    const createPersistentImageTask = async (pendingLog: GenerationLog, snapshot: RequestSnapshot, index: number, taskCount: number, ownerId: string, taskToken: string) => {
         try {
             const task = await createCanvasImageTask(
                 { ...snapshot.requestConfig, seedIndex: index, seedCount: taskCount, count: "1" } as AiConfig & { seedIndex?: number; seedCount?: number },
@@ -449,17 +485,19 @@ export default function ImagePage() {
                 { source: "image-workbench", sourceId: pendingLog.id, clientTaskId: imageLogTaskId(pendingLog) },
             );
             const nextLog = { ...pendingLog, task, lastPolledAt: Date.now() };
-            await saveLog(nextLog);
+            if (!(await saveLog(nextLog, ownerId, taskToken))) return nextLog;
             setResults((value) => updateResultByLogId(value, pendingLog.id, { taskLogId: nextLog.id, task, progress: task.progress, lastPolledAt: nextLog.lastPolledAt }));
             return nextLog;
         } catch (error) {
             const nextLog = { ...pendingLog, status: "失败" as const, durationMs: Date.now() - pendingLog.createdAt, failCount: 1, errors: [errorMessage(error)], errorDetails: [errorDetail(error)], lastPolledAt: Date.now() };
-            await saveLog(nextLog);
+            if (!(await saveLog(nextLog, ownerId, taskToken))) return nextLog;
             setResults((value) => updateResultByLogId(value, pendingLog.id, { status: "failed", error: nextLog.errors[0], errorDetail: nextLog.errorDetails?.[0], durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
             throw error;
         }
     };
     const submitGenerationBatch = async (snapshot: RequestSnapshot) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         if (usesBackendImageTasks(snapshot.requestConfig)) {
             await submitPersistentGenerationBatch(snapshot);
             return;
@@ -481,11 +519,12 @@ export default function ImagePage() {
                         seedIndex: index,
                         seedCount: taskCount,
                     } as any,
-                });
+                }, ownerId, taskToken);
 
                 if (!image) {
                     throw new Error("接口没有返回图片");
                 }
+                if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
 
                 // 更新结果状态
                 setResults((value) => updateResult(value, id, { image }));
@@ -506,7 +545,10 @@ export default function ImagePage() {
                         errorDetails: [],
                         categoryIds: activeResultCategoryId ? [activeResultCategoryId] : [],
                     }),
+                    ownerId,
+                    taskToken,
                 );
+                if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
                 message.success("图片已生成");
             } catch (err) {
                 const errMsg = errorMessage(err);
@@ -528,11 +570,16 @@ export default function ImagePage() {
                         errorDetails: [errDetail],
                         categoryIds: activeResultCategoryId ? [activeResultCategoryId] : [],
                     }),
+                    ownerId,
+                    taskToken,
                 );
+                if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
                 message.error(errMsg || "生成失败");
             } finally {
-                // 任务完成，从进行中状态移除
-                setResults((value) => value.filter((item) => item.id !== id));
+                // 任务完成，从进行中状态移除；切号后不能触碰新账号的结果列表。
+                if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) {
+                    setResults((value) => value.filter((item) => item.id !== id));
+                }
             }
         });
 
@@ -589,15 +636,18 @@ export default function ImagePage() {
         message.success("已加入我的素材");
     };
 
-    const syncImage = async (image: GeneratedImage, index: number) => {
-        if (image.storageKey?.startsWith("server:") || syncingImageIds.includes(image.id)) return null;
+    const syncImage = async (image: GeneratedImage, index: number, ownerId = accountOwnerId, taskToken = token) => {
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount() || image.storageKey?.startsWith("server:") || syncingImageIds.includes(image.id)) return null;
         setSyncingImageIds((ids) => Array.from(new Set([...ids, image.id])));
         const hideLoading = message.loading("正在同步图片到云端存储...", 0);
         try {
-            const uploaded = await uploadRemoteImageToServer(image.dataUrl, "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl));
+            const uploaded = await uploadRemoteImageToServer(image.dataUrl, "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl), taskToken, ownerId);
+            if (!isCurrentAccount()) return null;
             message.success("图片已同步到云端存储");
             return { ...image, dataUrl: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || image.width, height: uploaded.height || image.height, bytes: uploaded.bytes || image.bytes, mimeType: uploaded.mimeType || image.mimeType };
         } catch (error) {
+            if (!isCurrentAccount()) return null;
             const errorMessage = error instanceof Error ? error.message : "";
             if (errorMessage.includes("服务端对象存储未启用") || errorMessage.includes("用户对象存储配置不完整")) {
                 message.error("未添加云存储");
@@ -607,18 +657,21 @@ export default function ImagePage() {
             return null;
         } finally {
             hideLoading();
-            setSyncingImageIds((ids) => ids.filter((id) => id !== image.id));
+            if (isCurrentAccount()) setSyncingImageIds((ids) => ids.filter((id) => id !== image.id));
         }
     };
 
-    const autoSyncGeneratedImage = async (image: GeneratedImage, index: number, channelMode: AiConfig["channelMode"]) => {
-        if (image.storageKey) return image;
+    const autoSyncGeneratedImage = async (image: GeneratedImage, index: number, channelMode: AiConfig["channelMode"], ownerId = accountOwnerId, taskToken = token) => {
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount() || image.storageKey) return image;
         const storageConfig = await loadStorageConfig().catch(() => null);
-        if (!storageConfig || !shouldAutoSyncGeneratedMedia(storageConfig, channelMode)) return image;
+        if (!isCurrentAccount() || !storageConfig || !shouldAutoSyncGeneratedMedia(storageConfig, channelMode)) return image;
         try {
-            const uploaded = await uploadRemoteImageToServer(image.dataUrl, "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl));
+            const uploaded = await uploadRemoteImageToServer(image.dataUrl, "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl), taskToken, ownerId);
+            if (!isCurrentAccount()) return image;
             return { ...image, dataUrl: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || image.width, height: uploaded.height || image.height, bytes: uploaded.bytes || image.bytes, mimeType: uploaded.mimeType || image.mimeType };
         } catch (error) {
+            if (!isCurrentAccount()) return image;
             // 自动同步失败不能覆盖已生成结果，否则云存储故障会被误判为生图失败。
             message.warning(`图片已生成，但自动同步失败：${errorMessage(error)}`);
             return image;
@@ -632,14 +685,17 @@ export default function ImagePage() {
     };
 
     const syncLogImage = async (log: GenerationLog, image: GeneratedImage, index: number) => {
-        const synced = await syncImage(image, index);
-        if (!synced) return;
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const synced = await syncImage(image, index, ownerId, taskToken);
+        if (!synced || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const nextLog = { ...log, images: log.images.map((item) => item.id === image.id ? synced : item) };
-        await logStore.setItem(log.id, serializeLog(nextLog));
+        await logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(nextLog));
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const nextLogs = logs.map((item) => item.id === log.id ? nextLog : item);
         setLogs(nextLogs);
-        await persistImageHistory(nextLogs, categories);
-        if (previewLog?.id === log.id) setPreviewLog(nextLog);
+        await persistImageHistory(nextLogs, categories, ownerId, taskToken);
+        if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken && previewLog?.id === log.id) setPreviewLog(nextLog);
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
@@ -685,8 +741,8 @@ export default function ImagePage() {
         setPreviewLog(null);
     };
 
-    const deleteBackendImageTasks = async (items: GenerationLog[]) => {
-        if (!token) return;
+    const deleteBackendImageTasks = async (items: GenerationLog[], ownerId = accountOwnerId, taskToken = token) => {
+        if (!taskToken || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const tasks = Array.from(
             new Map(
                 items.flatMap((item) => {
@@ -700,32 +756,34 @@ export default function ImagePage() {
         await Promise.all(tasks.map((task) => deleteCanvasImageTask(imageTaskConfig(), task).catch(() => undefined)));
     };
 
-    const deleteAccountImageLogs = async (items: GenerationLog[]) => {
-        if (!token) return;
+    const deleteAccountImageLogs = async (items: GenerationLog[], ownerId = accountOwnerId, taskToken = token) => {
+        if (!taskToken || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const ids = Array.from(new Set(items.flatMap((item) => [item.id, item.task?.id].filter((id): id is string => Boolean(id)))));
         if (!ids.length) return;
-        await deleteImageGenerationLogs(token, ids).catch(() => undefined);
+        await deleteImageGenerationLogs(taskToken, ids).catch(() => undefined);
     };
 
     const deleteSelectedLogs = () => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         const deletedLogs = logs.filter((log) => selectedLogIds.includes(log.id));
         const nextLogs = logs.filter((log) => !selectedLogIds.includes(log.id));
         const imageKeys = disposableLogStorageKeys(deletedLogs, nextLogs);
-        void Promise.all([deleteBackendImageTasks(deletedLogs), deleteAccountImageLogs(deletedLogs), deleteStoredImages(imageKeys), ...deletedLogs.map((log) => logStore.removeItem(log.id))]).then(async () => {
+        void Promise.all([deleteBackendImageTasks(deletedLogs, ownerId, taskToken), deleteAccountImageLogs(deletedLogs, ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), ...deletedLogs.map((log) => logStore.removeItem(imageLogStorageKey(log.id, ownerId)))]).then(async () => {
+            if (!isCurrentAccount()) return;
             setLogs(nextLogs);
             setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
-            await persistImageHistory(nextLogs, categories);
-            await refreshLogs();
+            await persistImageHistory(nextLogs, categories, ownerId, taskToken);
+            if (!isCurrentAccount()) return;
+            await refreshLogs(ownerId, taskToken);
         });
-        if (previewLog && selectedLogIds.includes(previewLog.id)) {
-            setPreviewLog(null);
-            setResults((value) => value.filter((item) => item.status === "pending"));
-        }
-        setSelectedLogIds([]);
-        setDeleteConfirmOpen(false);
     };
 
     const deleteLog = (log: GenerationLog) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         modal.confirm({
             title: "删除生成结果",
             content: "确定删除这条生成结果吗？",
@@ -733,20 +791,25 @@ export default function ImagePage() {
             cancelText: "取消",
             okButtonProps: { danger: true },
             onOk: async () => {
+                if (!isCurrentAccount()) return;
                 const nextLogs = logs.filter((item) => item.id !== log.id);
                 const imageKeys = disposableLogStorageKeys([log], nextLogs);
-                await Promise.all([deleteBackendImageTasks([log]), deleteAccountImageLogs([log]), deleteStoredImages(imageKeys), logStore.removeItem(log.id)]);
+                await Promise.all([deleteBackendImageTasks([log], ownerId, taskToken), deleteAccountImageLogs([log], ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), logStore.removeItem(imageLogStorageKey(log.id, ownerId))]);
+                if (!isCurrentAccount()) return;
                 setLogs(nextLogs);
                 setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
-                await persistImageHistory(nextLogs, categories);
+                await persistImageHistory(nextLogs, categories, ownerId, taskToken);
+                if (!isCurrentAccount()) return;
                 setSelectedLogIds((value) => value.filter((id) => id !== log.id));
                 if (previewLog?.id === log.id) setPreviewLog(null);
-                await refreshLogs();
+                await refreshLogs(ownerId, taskToken);
             },
         });
     };
 
-    const saveLog = async (log: GenerationLog) => {
+    const saveLog = async (log: GenerationLog, ownerId = accountOwnerId, taskToken = token) => {
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount()) return false;
         const prevChain = saveLogChainRef.current;
         const nextChain = (async () => {
             try {
@@ -754,35 +817,52 @@ export default function ImagePage() {
             } catch {
                 // Ignore previous errors so the chain doesn't break permanently
             }
-            const storedLogs = await readStoredLogs();
+            if (!isCurrentAccount()) return false;
+            const storedLogs = await readStoredLogs(ownerId);
+            if (!isCurrentAccount()) return false;
             const keys = new Set(imageLogIdentityKeys(log));
             const duplicateLogs = storedLogs.filter((item) => item.id !== log.id && imageLogIdentityKeys(item).some((key) => keys.has(key)));
             const nextLogs = dedupeGenerationLogs([log, ...storedLogs.filter((item) => item.id !== log.id)]);
+            await Promise.all(duplicateLogs.map((item) => logStore.removeItem(imageLogStorageKey(item.id, ownerId))));
+            await logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(log));
+            if (!isCurrentAccount()) return false;
             setLogs(nextLogs);
-            await Promise.all(duplicateLogs.map((item) => logStore.removeItem(item.id)));
-            await logStore.setItem(log.id, serializeLog(log));
-            await persistImageHistory(nextLogs, categories);
+            await persistImageHistory(nextLogs, categories, ownerId, taskToken);
+            return isCurrentAccount();
         })();
-        saveLogChainRef.current = nextChain;
-        await nextChain;
+        saveLogChainRef.current = nextChain.then(() => undefined);
+        return nextChain;
     };
 
-    const refreshLogs = async () => {
-        const nextLogs = await readStoredLogs();
+    const refreshLogs = async (ownerId = getAccountOwnerId(), currentToken = useUserStore.getState().token) => {
+        const nextLogs = await readStoredLogs(ownerId);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== currentToken) return logsRef.current;
         setLogs(nextLogs);
         return nextLogs;
     };
-    const refreshCategories = async () => setCategories(await readStoredCategories());
+    const refreshCategories = async (ownerId = getAccountOwnerId()) => {
+        const currentToken = useUserStore.getState().token;
+        const nextCategories = await readStoredCategories(ownerId);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== currentToken) return categories;
+        setCategories(nextCategories);
+        return nextCategories;
+    };
 
-    const loadAccountImageHistory = async (currentToken: string) => {
+    const loadAccountImageHistory = async (currentToken: string, ownerId = getAccountOwnerId()) => {
         try {
             accountHistorySyncEnabledRef.current = true;
-            const localLogs = await readStoredLogs();
-            const storedCategories = await readStoredCategories();
+            const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === currentToken;
+            const localLogs = await readStoredLogs(ownerId);
+            if (!isCurrentAccount()) return undefined;
+            const storedCategories = await readStoredCategories(ownerId);
+            if (!isCurrentAccount()) return undefined;
             const remoteLogs = await fetchImageGenerationLogs<GenerationLog>(currentToken);
+            if (!isCurrentAccount()) return undefined;
             const mergedLogs = await mergeGenerationLogs(remoteLogs, localLogs);
+            if (!isCurrentAccount()) return undefined;
             const categorized = withWorkflowLogCategories(mergedLogs, storedCategories);
-            await replaceStoredImageHistory(categorized.logs, categorized.categories);
+            await replaceStoredImageHistory(categorized.logs, categorized.categories, ownerId);
+            if (!isCurrentAccount()) return undefined;
             setCategories(categorized.categories);
             setLogs(categorized.logs);
             return categorized.logs;
@@ -792,25 +872,27 @@ export default function ImagePage() {
         }
     };
 
-    const persistImageHistory = async (nextLogs: GenerationLog[], _nextCategories: GenerationCategory[]) => {
-        if (!token || !accountHistorySyncEnabledRef.current) return;
-        await saveImageGenerationLogs(token, nextLogs.map(serializeLog)).catch(() => {
-            accountHistorySyncEnabledRef.current = false;
+    const persistImageHistory = async (nextLogs: GenerationLog[], _nextCategories: GenerationCategory[], ownerId = accountOwnerId, taskToken = token) => {
+        if (!taskToken || !accountHistorySyncEnabledRef.current || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
+        await saveImageGenerationLogs(taskToken, nextLogs.map(serializeLog)).catch(() => {
+            if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) accountHistorySyncEnabledRef.current = false;
         });
     };
 
-    const syncBackendImageTasks = async (baseLogs?: GenerationLog[]) => {
+    const syncBackendImageTasks = async (baseLogs?: GenerationLog[], ownerId = getAccountOwnerId()) => {
         const currentConfig = imageTaskConfig();
-        if (!token) return baseLogs || logsRef.current;
+        if (!token || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return baseLogs || logsRef.current;
         try {
             const tasks = await listCanvasImageTasks(currentConfig, ["image-workbench", "workflow"]);
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return baseLogs || logsRef.current;
             const recoverableTasks = tasks.filter(isRecoverableImageTask);
             if (!recoverableTasks.length) return baseLogs || logsRef.current;
-            const currentLogs = baseLogs || (await readStoredLogs());
+            const currentLogs = baseLogs || (await readStoredLogs(ownerId));
             const mergedLogs = mergeBackendImageTasks(currentLogs, recoverableTasks, currentConfig);
             const taskIds = new Set(recoverableTasks.flatMap(imageTaskIdentityKeys));
             const recoveredLogs = mergedLogs.filter((log) => imageLogIdentityKeys(log).some((key) => taskIds.has(key)));
-            await Promise.all(recoveredLogs.map((log) => logStore.setItem(log.id, serializeLog(log))));
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return baseLogs || logsRef.current;
+            await Promise.all(recoveredLogs.map((log) => logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(log))));
             setLogs(mergedLogs);
             setResults((value) => mergePendingLogResults(value, recoveredLogs));
             return mergedLogs;
@@ -820,18 +902,23 @@ export default function ImagePage() {
     };
 
     const pollImageTaskLogsOnce = async (pendingLogs: GenerationLog[]) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         const ids = pendingLogs.map(imageLogTaskId).filter(Boolean);
-        if (!ids.length) return;
+        if (!ids.length || !isCurrentAccount()) return;
         pendingLogs.forEach((log) => pollingLogIdsRef.current.add(log.id));
         try {
             const tasks = await batchCanvasImageTaskStatus(imageTaskConfig(), ids);
+            if (!isCurrentAccount()) return;
             const taskById = new Map(tasks.map((task) => [task.id, task]));
             await Promise.all(
                 pendingLogs.map(async (log) => {
+                    if (!isCurrentAccount()) return;
                     const task = taskById.get(imageLogTaskId(log));
                     if (!task) {
                         const nextLog = { ...log, status: "失败" as const, durationMs: Date.now() - log.createdAt, failCount: 1, errors: ["图片任务不存在或未创建成功"], errorDetails: ["后端没有找到对应的图片任务"], lastPolledAt: Date.now() };
-                        await saveLog(nextLog);
+                        if (!(await saveLog(nextLog, ownerId, taskToken))) return;
                         setResults((value) => updateResultByLogId(value, log.id, { status: "failed", error: nextLog.errors[0], errorDetail: nextLog.errorDetails?.[0], durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                         return;
                     }
@@ -840,21 +927,22 @@ export default function ImagePage() {
                         const syncedLogs = await Promise.all(
                             nextLogs.map(async (item, index) => {
                                 if (item.status !== "成功" || !item.images.length) return item;
-                                const image = await autoSyncGeneratedImage(item.images[0], index, item.config.channelMode);
+                                const image = await autoSyncGeneratedImage(item.images[0], index, item.config.channelMode, ownerId, taskToken);
                                 return { ...item, images: [image], thumbnails: [image.dataUrl] };
                             }),
                         );
-                        await Promise.all(syncedLogs.map(saveLog));
+                        const saved = await Promise.all(syncedLogs.map((item) => saveLog(item, ownerId, taskToken)));
+                        if (!isCurrentAccount() || saved.some((value) => !value)) return;
                         setResults((value) => value.filter((item) => !imageResultMatchesLog(item, syncedLogs[0])));
                         return;
                     }
 
                     let nextLog = imageLogFromTask(log, task);
                     if (nextLog.status === "成功" && nextLog.images.length) {
-                        const image = await autoSyncGeneratedImage(nextLog.images[0], 0, nextLog.config.channelMode);
+                        const image = await autoSyncGeneratedImage(nextLog.images[0], 0, nextLog.config.channelMode, ownerId, taskToken);
                         nextLog = { ...nextLog, images: [image], thumbnails: [image.dataUrl] };
                     }
-                    await saveLog(nextLog);
+                    if (!(await saveLog(nextLog, ownerId, taskToken))) return;
                     if (nextLog.status === "生成中") {
                         setResults((value) => updateResultByLogId(value, log.id, { task, progress: task.progress, durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                     } else {
@@ -868,35 +956,45 @@ export default function ImagePage() {
     };
 
     const createCategory = async (name: string) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const trimmedName = name.trim();
         if (!trimmedName) {
             message.error("请输入分类名称");
             return null;
         }
         const existing = categories.find((item) => item.name === trimmedName);
-        if (existing) return existing;
+        if (existing || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return existing || null;
         const nextCategory = { id: nanoid(), name: trimmedName, createdAt: Date.now() };
         const nextCategories = [...categories, nextCategory];
         setCategories(nextCategories);
-        await categoryStore.setItem(CATEGORY_STORE_KEY, nextCategories);
-        await persistImageHistory(logs, nextCategories);
+        await categoryStore.setItem(imageCategoryStorageKey(ownerId), nextCategories);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return null;
+        await persistImageHistory(logs, nextCategories, ownerId, taskToken);
         return nextCategory;
     };
 
     const renameCategory = async (category: GenerationCategory, name: string) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const trimmedName = name.trim();
         if (!trimmedName) {
             message.error("请输入分类名称");
             return;
         }
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const nextCategories = categories.map((item) => (item.id === category.id ? { ...item, name: trimmedName } : item));
         setCategories(nextCategories);
-        await categoryStore.setItem(CATEGORY_STORE_KEY, nextCategories);
-        await persistImageHistory(logs, nextCategories);
-        message.success("已重命名分类");
+        await categoryStore.setItem(imageCategoryStorageKey(ownerId), nextCategories);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
+        await persistImageHistory(logs, nextCategories, ownerId, taskToken);
+        if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) message.success("已重命名分类");
     };
 
     const deleteCategory = (category: GenerationCategory) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         modal.confirm({
             title: "删除分类",
             content: `确定删除分类「${category.name}」吗？分类内的生成结果会移至未分类。`,
@@ -904,26 +1002,32 @@ export default function ImagePage() {
             cancelText: "取消",
             okButtonProps: { danger: true },
             onOk: async () => {
+                if (!isCurrentAccount()) return;
                 const nextCategories = categories.filter((item) => item.id !== category.id);
                 const nextLogs = logs.map((log) => ({ ...log, categoryIds: log.categoryIds.filter((id) => id !== category.id) }));
                 setCategories(nextCategories);
                 setLogs(nextLogs);
-                await categoryStore.setItem(CATEGORY_STORE_KEY, nextCategories);
-                await Promise.all(nextLogs.map((log) => logStore.setItem(log.id, serializeLog(log))));
-                await persistImageHistory(nextLogs, nextCategories);
-                message.success("已删除分类");
+                await categoryStore.setItem(imageCategoryStorageKey(ownerId), nextCategories);
+                await Promise.all(nextLogs.map((log) => logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(log))));
+                if (!isCurrentAccount()) return;
+                await persistImageHistory(nextLogs, nextCategories, ownerId, taskToken);
+                if (isCurrentAccount()) message.success("已删除分类");
             },
         });
     };
 
     const updateLogCategories = async (log: GenerationLog, categoryIds: string[]) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const nextLog = { ...log, categoryIds };
         const nextLogs = logs.map((item) => (item.id === log.id ? nextLog : item));
         setLogs(nextLogs);
-        await logStore.setItem(log.id, serializeLog(nextLog));
-        await persistImageHistory(nextLogs, categories);
-        await refreshLogs();
-        message.success(categoryIds.length ? "已更新分类" : "已移至未分类");
+        await logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(nextLog));
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
+        await persistImageHistory(nextLogs, categories, ownerId, taskToken);
+        await refreshLogs(ownerId, taskToken);
+        if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) message.success(categoryIds.length ? "已更新分类" : "已移至未分类");
     };
 
     const toggleLogCategory = async (log: GenerationLog, categoryId: string) => {
@@ -980,7 +1084,8 @@ export default function ImagePage() {
         };
     };
 
-    const runGenerationTask = async (resultId: string, snapshot: RequestSnapshot) => {
+    const runGenerationTask = async (resultId: string, snapshot: RequestSnapshot, ownerId = accountOwnerId, taskToken = token) => {
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         const itemStartedAt = performance.now();
         try {
             const result = snapshot.references.length ? await requestEdit(snapshot.requestConfig, snapshot.text, snapshot.references) : await requestGeneration(snapshot.requestConfig, snapshot.text);
@@ -988,7 +1093,8 @@ export default function ImagePage() {
             if (!image) throw new Error("接口没有返回图片");
             const meta = await readImageMeta(image.dataUrl);
             const nextImage: GeneratedImage = { id: image.id, dataUrl: image.dataUrl, durationMs: performance.now() - itemStartedAt, width: meta.width, height: meta.height, bytes: getDataUrlByteSize(image.dataUrl), mimeType: meta.mimeType };
-            const syncedImage = await autoSyncGeneratedImage(nextImage, 0, snapshot.requestConfig.channelMode);
+            const syncedImage = await autoSyncGeneratedImage(nextImage, 0, snapshot.requestConfig.channelMode, ownerId, taskToken);
+            if (!isCurrentAccount()) return syncedImage;
             setResults((value) => updateResult(value, resultId, { status: "success", image: syncedImage, durationMs: syncedImage.durationMs }));
             return syncedImage;
         } catch (error) {
@@ -1077,7 +1183,7 @@ export default function ImagePage() {
         });
         setResultViewMode("all");
         setActiveResultCategoryId(null);
-        void Promise.all([refreshLogs(), refreshCategories()]).then(() => {
+        void Promise.all([refreshLogs(accountOwnerId), refreshCategories(accountOwnerId)]).then(() => {
             setResults((value) => value.filter((item) => item.workflowTaskId !== task.taskId));
         });
     };
@@ -1251,12 +1357,16 @@ export default function ImagePage() {
                     onWorkflowTaskSuccess={handleWorkflowTaskSuccess}
                     onWorkflowTaskFailure={handleWorkflowTaskFailure}
                     onGenerationLogSaved={() => {
+                        const ownerId = accountOwnerId;
+                        const taskToken = token;
                         void (async () => {
-                            const nextCategories = await readStoredCategories();
-                            const nextLogs = await readStoredLogs();
+                            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
+                            const nextCategories = await readStoredCategories(ownerId);
+                            const nextLogs = await readStoredLogs(ownerId);
+                            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
                             setCategories(nextCategories);
                             setLogs(nextLogs);
-                            await persistImageHistory(nextLogs, nextCategories);
+                            await persistImageHistory(nextLogs, nextCategories, ownerId, taskToken);
                         })();
                     }}
                 />
@@ -2526,12 +2636,12 @@ function errorDetail(error: unknown) {
     }
 }
 
-async function readStoredLogs() {
+async function readStoredLogs(ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined") return [];
     try {
         const values: GenerationLog[] = [];
-        await logStore.iterate<GenerationLog, void>((value) => {
-            values.push(value);
+        await logStore.iterate<GenerationLog, void>((value, key) => {
+            if (typeof key === "string" && key.startsWith(getAccountStorageKey(LOG_STORE_KEY, ownerId) + ":")) values.push(value);
         });
         const logs = await Promise.all(values.map(normalizeLog));
         return dedupeGenerationLogs(logs);
@@ -2540,21 +2650,25 @@ async function readStoredLogs() {
     }
 }
 
-async function readStoredCategories() {
+async function readStoredCategories(ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined") return [];
     try {
-        const value = await categoryStore.getItem<GenerationCategory[]>(CATEGORY_STORE_KEY);
+        const value = await categoryStore.getItem<GenerationCategory[]>(imageCategoryStorageKey(ownerId));
         return Array.isArray(value) ? value.filter((item) => item.id && item.name).sort((a, b) => a.createdAt - b.createdAt) : [];
     } catch {
         return [];
     }
 }
 
-async function replaceStoredImageHistory(logs: GenerationLog[], categories: GenerationCategory[]) {
+async function replaceStoredImageHistory(logs: GenerationLog[], categories: GenerationCategory[], ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined") return;
-    await logStore.clear();
-    await Promise.all(logs.map((log) => logStore.setItem(log.id, serializeLog(log))));
-    await categoryStore.setItem(CATEGORY_STORE_KEY, categories);
+    const ownedKeys: string[] = [];
+    await logStore.iterate<GenerationLog, void>((_value, key) => {
+        if (typeof key === "string" && key.startsWith(getAccountStorageKey(LOG_STORE_KEY, ownerId) + ":")) ownedKeys.push(key);
+    });
+    await Promise.all(ownedKeys.map((key) => logStore.removeItem(key)));
+    await Promise.all(logs.map((log) => logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(log))));
+    await categoryStore.setItem(imageCategoryStorageKey(ownerId), categories);
 }
 
 function withWorkflowLogCategories(logs: GenerationLog[], categories: GenerationCategory[]) {

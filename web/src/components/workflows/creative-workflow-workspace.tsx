@@ -19,6 +19,7 @@ import { deleteStoredImages, imageToDataUrl, uploadImage } from "@/services/imag
 import { defaultConfig, localChannelForActiveModel, normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useUserStore } from "@/stores/use-user-store";
+import { getAccountRecordStorageKey, getAccountStorageKey } from "@/lib/account-scope";
 import type { ReferenceImage } from "@/types/image";
 
 type WorkflowVariableType = "text" | "textarea" | "number" | "select" | "boolean";
@@ -188,6 +189,18 @@ const workflowStore = localforage.createInstance({ name: "infinite-canvas", stor
 const imageLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
 const categoryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_categories" });
 
+function workflowStorageKey(ownerId = getAccountOwnerId()) {
+    return getAccountStorageKey(WORKFLOW_STORE_KEY, ownerId);
+}
+
+function workflowImageLogStorageKey(id: string, ownerId = getAccountOwnerId()) {
+    return getAccountRecordStorageKey("infinite-canvas:image_generation_logs", id, ownerId);
+}
+
+function workflowCategoryStorageKey(ownerId = getAccountOwnerId()) {
+    return getAccountStorageKey(CATEGORY_STORE_KEY, ownerId);
+}
+
 const variableTypeOptions: Array<{ value: WorkflowVariableType; label: string }> = [
     { value: "text", label: "短文本" },
     { value: "textarea", label: "长文本" },
@@ -222,6 +235,7 @@ export function CreativeWorkflowWorkspace({
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const token = useUserStore((state) => state.token);
+    const accountOwnerId = useUserStore((state) => state.user?.id || "guest");
     const isUserReady = useUserStore((state) => state.isReady);
     const [workflows, setWorkflows] = useState<CreativeWorkflow[]>([]);
     const [editingWorkflow, setEditingWorkflow] = useState<CreativeWorkflow | null>(null);
@@ -272,8 +286,13 @@ export function CreativeWorkflowWorkspace({
 
     useEffect(() => {
         if (!isUserReady) return;
-        void refreshWorkflows();
-    }, [isUserReady, token]);
+        setWorkflows([]);
+        setRunningWorkflow(null);
+        setSeriesDrafts([]);
+        setWorkflowTasks([]);
+        setRunResults([]);
+        void refreshWorkflows(accountOwnerId);
+    }, [isUserReady, token, accountOwnerId]);
 
     useEffect(() => {
         if (!agentTextModel && effectiveConfig.textModel) setAgentTextModel(effectiveConfig.textModel);
@@ -288,45 +307,60 @@ export function CreativeWorkflowWorkspace({
 
     useEffect(() => {
         if (!runningWorkflow || runningWorkflow.mode !== "multi_image_series" || !seriesDraftsLoadedRef.current) return;
-        void workflowStore.setItem(seriesDraftStorageKey(runningWorkflow.id), seriesDrafts);
-    }, [runningWorkflow?.id, runningWorkflow?.mode, seriesDrafts]);
+        const ownerId = accountOwnerId;
+        if (getAccountOwnerId() !== ownerId) return;
+        void workflowStore.setItem(seriesDraftStorageKey(runningWorkflow.id, ownerId), seriesDrafts);
+    }, [accountOwnerId, runningWorkflow?.id, runningWorkflow?.mode, seriesDrafts]);
 
-    const refreshWorkflows = async () => {
-        if (token) {
+    const refreshWorkflows = async (ownerId = accountOwnerId) => {
+        const currentToken = token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === currentToken;
+        if (currentToken) {
             try {
-                const config = await fetchUserConfig(token);
+                const config = await fetchUserConfig(currentToken);
+                if (!isCurrentAccount()) return;
                 workflowSyncEnabledRef.current = config.syncCapabilities?.workflows === true;
                 if (!workflowSyncEnabledRef.current) throw new Error("workflow sync unavailable");
-                const remote = await fetchUserWorkflows<CreativeWorkflow>(token);
+                const remote = await fetchUserWorkflows<CreativeWorkflow>(currentToken);
+                if (!isCurrentAccount()) return;
                 const workflows = remote.map(recordToWorkflow).sort((a, b) => b.updatedAt - a.updatedAt);
                 if (workflows.length) {
+                    await workflowStore.setItem(workflowStorageKey(ownerId), workflows);
+                    if (!isCurrentAccount()) return;
                     setWorkflows(workflows);
-                    await workflowStore.setItem(WORKFLOW_STORE_KEY, workflows);
                     return;
                 }
-                const local = await workflowStore.getItem<CreativeWorkflow[]>(WORKFLOW_STORE_KEY);
+                const local = await workflowStore.getItem<CreativeWorkflow[]>(workflowStorageKey(ownerId));
+                if (!isCurrentAccount()) return;
                 const seed = local?.length ? local.map(normalizeWorkflow) : createStarterWorkflows(effectiveConfig);
-                const saved = await Promise.all(seed.map((workflow) => saveUserWorkflow(token, workflowToRecord(normalizeWorkflow(workflow)))));
-                setWorkflows(saved.map(recordToWorkflow).sort((a, b) => b.updatedAt - a.updatedAt));
+                const saved = await Promise.all(seed.map((workflow) => saveUserWorkflow(currentToken, workflowToRecord(normalizeWorkflow(workflow)))));
+                if (!isCurrentAccount()) return;
+                const normalized = saved.map(recordToWorkflow).sort((a, b) => b.updatedAt - a.updatedAt);
+                await workflowStore.setItem(workflowStorageKey(ownerId), normalized);
+                if (!isCurrentAccount()) return;
+                setWorkflows(normalized);
                 return;
             } catch {
+                if (!isCurrentAccount()) return;
                 // Use local workflows when account sync is unavailable.
             }
         }
-        const stored = await workflowStore.getItem<CreativeWorkflow[]>(WORKFLOW_STORE_KEY);
+        const stored = await workflowStore.getItem<CreativeWorkflow[]>(workflowStorageKey(ownerId));
+        if (!isCurrentAccount()) return;
         if (stored?.length) {
             setWorkflows(stored.map(normalizeWorkflow).sort((a, b) => b.updatedAt - a.updatedAt));
             return;
         }
         const seed = createStarterWorkflows(effectiveConfig);
+        if (!isCurrentAccount()) return;
         setWorkflows(seed);
-        await workflowStore.setItem(WORKFLOW_STORE_KEY, seed);
+        await workflowStore.setItem(workflowStorageKey(ownerId), seed);
     };
 
     const saveWorkflows = async (items: CreativeWorkflow[]) => {
         const sorted = [...items].sort((a, b) => b.updatedAt - a.updatedAt);
         setWorkflows(sorted);
-        await workflowStore.setItem(WORKFLOW_STORE_KEY, sorted);
+        await workflowStore.setItem(workflowStorageKey(accountOwnerId), sorted);
     };
 
     const openRunner = (workflow: CreativeWorkflow) => {
@@ -336,7 +370,10 @@ export function CreativeWorkflowWorkspace({
         setWorkflowReferences([]);
         setSeriesDrafts([]);
         if (workflow.mode === "multi_image_series") {
-            void workflowStore.getItem<SeriesPromptDraft[]>(seriesDraftStorageKey(workflow.id)).then((drafts) => {
+            const ownerId = accountOwnerId;
+            const currentToken = token;
+            void workflowStore.getItem<SeriesPromptDraft[]>(seriesDraftStorageKey(workflow.id, ownerId)).then((drafts) => {
+                if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== currentToken) return;
                 setSeriesDrafts((drafts || []).map(normalizeSeriesDraft));
                 seriesDraftsLoadedRef.current = true;
             });
@@ -680,6 +717,8 @@ export function CreativeWorkflowWorkspace({
         const performanceStartedAt = performance.now();
         const count = Math.max(1, Math.min(10, countOverride || Number(runConfig.count) || 1));
         const taskId = nanoid();
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const taskConfig = { ...workflow.config, model, imageModel: model, imageChannelId: runtime.channelId, apiMode: runtime.apiMode, count: String(count) };
         onWorkflowTaskStarted?.({
             taskId,
@@ -716,14 +755,17 @@ export function CreativeWorkflowWorkspace({
         ]);
         message.success(seriesTitle ? `${seriesTitle} 已开始生成` : "工作流任务已开始");
         if (runConfig.channelMode === "remote" || (runConfig.channelMode === "local" && token)) {
-            return createWorkflowImageTasks({ taskId, workflow, prompt: promptSnapshot, inputSnapshot, references: referencesSnapshot, runConfig, taskConfig, model, count, startedAt, seriesDraftId, seriesTitle, seriesIndex });
+            return createWorkflowImageTasks({ taskId, workflow, prompt: promptSnapshot, inputSnapshot, references: referencesSnapshot, runConfig, taskConfig, model, count, startedAt, ownerId, taskToken, seriesDraftId, seriesTitle, seriesIndex });
         }
-        return executeWorkflowTask({ taskId, workflow, prompt: promptSnapshot, inputSnapshot, references: referencesSnapshot, runConfig, taskConfig, model, count, startedAt, performanceStartedAt, seriesDraftId, seriesTitle, seriesIndex });
+        return executeWorkflowTask({ taskId, workflow, prompt: promptSnapshot, inputSnapshot, references: referencesSnapshot, runConfig, taskConfig, model, count, startedAt, performanceStartedAt, ownerId, taskToken, seriesDraftId, seriesTitle, seriesIndex });
     };
 
-    const saveWorkflowTaskLog = async (log: ImageHistoryLog) => {
-        await imageLogStore.setItem(log.id, serializeHistoryLog(log));
-        if (token) await saveImageGenerationLogs(token, [serializeHistoryLog(log)]).catch(() => undefined);
+    const saveWorkflowTaskLog = async (log: ImageHistoryLog, ownerId: string, taskToken: string) => {
+        const serialized = serializeHistoryLog(log);
+        await imageLogStore.setItem(workflowImageLogStorageKey(log.id, ownerId), serialized);
+        if (taskToken && getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) {
+            await saveImageGenerationLogs(taskToken, [serialized]).catch(() => undefined);
+        }
     };
 
     const createWorkflowImageTasks = async ({
@@ -737,6 +779,8 @@ export function CreativeWorkflowWorkspace({
         model,
         count,
         startedAt,
+        ownerId,
+        taskToken,
         seriesDraftId,
         seriesTitle,
         seriesIndex,
@@ -751,11 +795,13 @@ export function CreativeWorkflowWorkspace({
         model: string;
         count: number;
         startedAt: number;
+        ownerId: string;
+        taskToken: string;
         seriesDraftId?: string;
         seriesTitle?: string;
         seriesIndex?: number;
     }) => {
-        const category = await ensureWorkflowCategory(workflow.name);
+        const category = await ensureWorkflowCategory(workflow.name, ownerId);
         const taskLogs = Array.from({ length: count }, (_, index) => {
             const id = nanoid();
             const clientTaskId = `client_workflow_image_task_${taskId}_${index}`;
@@ -780,14 +826,15 @@ export function CreativeWorkflowWorkspace({
             taskLogs.map(async (log, index) => {
                 try {
                     const task = await createCanvasImageTask({ ...runConfig, seedIndex: index, seedCount: count, count: "1" }, prompt, references, { source: "workflow", sourceId: log.id, clientTaskId: log.task?.id || `${taskId}:${index}` });
-                    await saveWorkflowTaskLog({ ...log, task, lastPolledAt: Date.now() });
+                    await saveWorkflowTaskLog({ ...log, task, lastPolledAt: Date.now() }, ownerId, taskToken);
                 } catch (error) {
                     const messageText = error instanceof Error ? error.message : "工作流图片任务创建失败";
-                    await saveWorkflowTaskLog({ ...log, status: "失败", durationMs: Date.now() - startedAt, failCount: 1, errors: [messageText], lastPolledAt: Date.now() });
+                    await saveWorkflowTaskLog({ ...log, status: "失败", durationMs: Date.now() - startedAt, failCount: 1, errors: [messageText], lastPolledAt: Date.now() }, ownerId, taskToken);
                     throw error;
                 }
             }),
         );
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         onGenerationLogSaved?.();
         const createdCount = settled.filter((item) => item.status === "fulfilled").length;
         if (!createdCount) {
@@ -813,6 +860,8 @@ export function CreativeWorkflowWorkspace({
         count,
         startedAt,
         performanceStartedAt,
+        ownerId,
+        taskToken,
         seriesDraftId,
         seriesTitle,
         seriesIndex,
@@ -828,6 +877,8 @@ export function CreativeWorkflowWorkspace({
         count: number;
         startedAt: number;
         performanceStartedAt: number;
+        ownerId: string;
+        taskToken: string;
         seriesDraftId?: string;
         seriesTitle?: string;
         seriesIndex?: number;
@@ -853,7 +904,7 @@ export function CreativeWorkflowWorkspace({
                     };
                 }),
             );
-            const category = await ensureWorkflowCategory(workflow.name);
+            const category = await ensureWorkflowCategory(workflow.name, ownerId);
             const log = buildImageHistoryLog({
                 workflow,
                 prompt,
@@ -867,15 +918,20 @@ export function CreativeWorkflowWorkspace({
                 seriesTitle,
                 seriesIndex,
             });
-            await imageLogStore.setItem(log.id, serializeHistoryLog(log));
+            await imageLogStore.setItem(workflowImageLogStorageKey(log.id, ownerId), serializeHistoryLog(log));
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
             onGenerationLogSaved?.();
             const finishedAt = Date.now();
             setWorkflows((value) => {
                 const next = value.map((item) => (item.id === workflow.id ? { ...item, lastRunAt: finishedAt, updatedAt: finishedAt } : item)).sort((a, b) => b.updatedAt - a.updatedAt);
-                void workflowStore.setItem(WORKFLOW_STORE_KEY, next);
+                if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) {
+                    void workflowStore.setItem(workflowStorageKey(ownerId), next);
+                }
                 return next;
             });
-            if (token && workflowSyncEnabledRef.current && workflow.editable !== false) void saveUserWorkflow(token, workflowToRecord({ ...workflow, lastRunAt: finishedAt, updatedAt: finishedAt })).catch(() => {});
+            if (taskToken && workflowSyncEnabledRef.current && workflow.editable !== false && getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) {
+                void saveUserWorkflow(taskToken, workflowToRecord({ ...workflow, lastRunAt: finishedAt, updatedAt: finishedAt })).catch(() => {});
+            }
             setRunningWorkflow((value) => (value?.id === workflow.id ? { ...value, lastRunAt: finishedAt, updatedAt: finishedAt } : value));
             const nextResults = storedImages.map((image) => ({
                 id: image.id,
@@ -911,6 +967,7 @@ export function CreativeWorkflowWorkspace({
             onWorkflowTaskSuccess?.({ taskId, images: nextResults, durationMs, endedAt: finishedAt });
             message.success("工作流运行完成，结果已写入生图历史");
         } catch (error) {
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
             const finishedAt = Date.now();
             const messageText = error instanceof Error ? error.message : "工作流运行失败";
             if (seriesDraftId) {
@@ -1942,8 +1999,8 @@ function extractJSONText(content: string) {
     return "";
 }
 
-function seriesDraftStorageKey(workflowId: string) {
-    return `${SERIES_DRAFT_STORE_PREFIX}${workflowId}`;
+function seriesDraftStorageKey(workflowId: string, ownerId = getAccountOwnerId()) {
+    return `${getAccountStorageKey(SERIES_DRAFT_STORE_PREFIX, ownerId)}${workflowId}`;
 }
 
 function normalizeSeriesDraft(draft: SeriesPromptDraft): SeriesPromptDraft {
@@ -2091,14 +2148,14 @@ function buildImageHistoryLog({
     };
 }
 
-async function ensureWorkflowCategory(name: string) {
+async function ensureWorkflowCategory(name: string, ownerId = getAccountOwnerId()) {
     const trimmed = name.trim();
     if (!trimmed) return null;
-    const categories = (await categoryStore.getItem<GenerationCategory[]>(CATEGORY_STORE_KEY)) || [];
+    const categories = (await categoryStore.getItem<GenerationCategory[]>(workflowCategoryStorageKey(ownerId))) || [];
     const existing = categories.find((item) => item.name === trimmed);
     if (existing) return existing;
     const nextCategory = { id: nanoid(), name: trimmed, createdAt: Date.now() };
-    await categoryStore.setItem(CATEGORY_STORE_KEY, [...categories, nextCategory]);
+    await categoryStore.setItem(workflowCategoryStorageKey(ownerId), [...categories, nextCategory]);
     return nextCategory;
 }
 

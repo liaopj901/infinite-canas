@@ -17,10 +17,12 @@ import { collectImageStorageKeys, deleteStoredImages, loadStorageConfig, resolve
 import { resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
+import { getAccountOwnerId } from "@/lib/account-scope";
 import { canvasThemes, type CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { UserStatusActions } from "@/components/layout/user-status-actions";
 import { isKIEKlingV3Config } from "@/components/video-settings-panel";
 import { useAssetStore } from "@/stores/use-asset-store";
+import { useUserStore } from "@/stores/use-user-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { cropDataUrl, splitDataUrl, upscaleDataUrl } from "../utils/canvas-image-data";
 import { fitNodeSize, nodeSizeFromRatio } from "../utils/canvas-node-size";
@@ -329,6 +331,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const cleanupAssetImages = useAssetStore((state) => state.cleanupImages);
+    const accountOwnerId = useUserStore((state) => state.user?.id || "guest");
     const hydrated = useCanvasStore((state) => state.hydrated);
     const createProject = useCanvasStore((state) => state.createProject);
     const openProject = useCanvasStore((state) => state.openProject);
@@ -473,6 +476,10 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
     useEffect(() => {
         if (!hydrated) return;
         setProjectLoaded(false);
+        setNodes([]);
+        setConnections([]);
+        setChatSessions([]);
+        setSelectedNodeIds(new Set());
         setInitialAgentRequest(null);
         consumedAgentRequestProjectRef.current = null;
         const project = openProject(projectId);
@@ -480,10 +487,12 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             router.replace("/canvas");
             return;
         }
+        const ownerId = accountOwnerId;
 
         const restore = async () => {
             const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes));
             const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
+            if ((useUserStore.getState().user?.id || "guest") !== ownerId) return;
             setNodes(restoredNodes);
             setConnections(project.connections);
             setChatSessions(restoredSessions);
@@ -511,7 +520,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             setProjectLoaded(true);
         };
         void restore();
-    }, [hydrated, openProject, projectId, router]);
+    }, [accountOwnerId, hydrated, openProject, projectId, router]);
 
     useEffect(() => {
         if (!projectLoaded || applyingHistoryRef.current || historyPausedRef.current) return;
@@ -1923,6 +1932,10 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
     const uploadNodeMediaToCloud = useCallback(async (node: CanvasNodeData, automatic = false) => {
         if ((node.type !== CanvasNodeType.Video && node.type !== CanvasNodeType.Audio) || !node.metadata?.content || node.metadata.storageKey?.startsWith("server:") || uploadingMediaNodeIdsRef.current.has(node.id)) return;
+        const ownerId = accountOwnerId;
+        const taskToken = useUserStore.getState().token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount()) return;
         uploadingMediaNodeIdsRef.current.add(node.id);
         const isAudio = node.type === CanvasNodeType.Audio;
         const mediaName = isAudio ? "音频" : "视频";
@@ -1930,7 +1943,8 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         try {
             const mediaUrl = await resolveMediaUrl(node.metadata.storageKey, node.metadata.content);
             const filename = `canvas-${node.type}-${node.id}.${isAudio ? audioExtension(node.metadata.mimeType) : "mp4"}`;
-            const uploaded = await uploadRemoteMediaToServer(mediaUrl, filename);
+            const uploaded = await uploadRemoteMediaToServer(mediaUrl, filename, taskToken, ownerId);
+            if (!isCurrentAccount()) return;
             setNodes((nodes) => nodes.map((item) => (item.id === node.id ? {
                 ...item,
                 metadata: {
@@ -1958,15 +1972,20 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             hideLoading();
             uploadingMediaNodeIdsRef.current.delete(node.id);
         }
-    }, [message]);
+    }, [accountOwnerId, message]);
 
     const uploadNodeImageToCloud = useCallback(async (node: CanvasNodeData, automatic = false) => {
         if (!isCanvasImageNodeType(node.type) || !node.metadata?.content || node.metadata.storageKey?.startsWith("server:") || uploadingImageNodeIdsRef.current.has(node.id)) return;
+        const ownerId = accountOwnerId;
+        const taskToken = useUserStore.getState().token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount()) return;
         uploadingImageNodeIdsRef.current.add(node.id);
         const hideLoading = automatic ? () => undefined : message.loading("正在上传图片至云存储...", 0);
         try {
             const imageUrl = await resolveImageUrl(node.metadata.storageKey, node.metadata.content);
-            const uploaded = await uploadRemoteImageToServer(imageUrl, "canvas-image-" + node.id + ".png");
+            const uploaded = await uploadRemoteImageToServer(imageUrl, "canvas-image-" + node.id + ".png", taskToken, ownerId);
+            if (!isCurrentAccount()) return;
             setNodes((nodes) => nodes.map((item) => (item.id === node.id ? {
                 ...item,
                 metadata: {
@@ -1994,7 +2013,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             hideLoading();
             uploadingImageNodeIdsRef.current.delete(node.id);
         }
-    }, [message]);
+    }, [accountOwnerId, message]);
 
     useEffect(() => {
         if (!projectLoaded) return;
@@ -4513,7 +4532,8 @@ async function hydrateCanvasImages(nodes: CanvasNodeData[]) {
             if (!isCanvasImageNodeType(node.type) || !content) return node;
             if (node.metadata?.storageKey) return { ...node, metadata: { ...node.metadata, content: await resolveImageUrl(node.metadata.storageKey, content) } };
             if (!content.startsWith("data:image/")) return node;
-            return { ...node, metadata: { ...node.metadata, ...imageMetadata(await uploadImage(content)) } };
+            // 恢复历史数据只补齐本地 storageKey，不能在页面打开时隐式创建新的云端对象。
+            return { ...node, metadata: { ...node.metadata, ...imageMetadata(await uploadImage(content, { localOnly: true })) } };
         }),
     );
 }
@@ -4522,7 +4542,8 @@ async function hydrateAssistantImages(sessions: CanvasAssistantSession[]) {
     const hydrateItem = async <T extends { dataUrl?: string; storageKey?: string }>(item: T) => {
         if (item.storageKey) return { ...item, dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl) };
         if (item.dataUrl?.startsWith("data:image/")) {
-            const image = await uploadImage(item.dataUrl);
+            // 恢复历史数据只补齐本地 storageKey，不能在页面打开时隐式创建新的云端对象。
+            const image = await uploadImage(item.dataUrl, { localOnly: true });
             return { ...item, dataUrl: image.url, storageKey: image.storageKey };
         }
         return item;

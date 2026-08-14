@@ -25,6 +25,7 @@ import { useAssetStore } from "@/stores/use-asset-store";
 import { normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig, type VideoElementItem, type VideoElementReference } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useUserStore } from "@/stores/use-user-store";
+import { getAccountOwnerId, getAccountRecordStorageKey, getAccountStorageKey } from "@/lib/account-scope";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
@@ -96,7 +97,12 @@ type WorkbenchLayout = "side" | "bottom";
 type AssetPickerTarget = "general" | "image" | "video" | "audio" | "firstFrame" | "lastFrame" | "element";
 
 const WORKBENCH_LAYOUT_KEY = "infinite-canvas:video-workbench-layout";
+const VIDEO_LOG_STORE_KEY = "infinite-canvas:video_generation_logs";
 const logStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
+
+function videoLogStorageKey(id: string, ownerId = getAccountOwnerId()) {
+    return getAccountRecordStorageKey(VIDEO_LOG_STORE_KEY, id, ownerId);
+}
 export default function VideoPage() {
     const { message } = App.useApp();
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -117,6 +123,7 @@ export default function VideoPage() {
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const token = useUserStore((state) => state.token);
+    const accountOwnerId = useUserStore((state) => state.user?.id || "guest");
     const isUserReady = useUserStore((state) => state.isReady);
     const [prompt, setPrompt] = useState("");
     const [negativePrompt, setNegativePrompt] = useState("");
@@ -189,7 +196,6 @@ export default function VideoPage() {
     }, [pendingLogCount]);
 
     useEffect(() => {
-        void refreshLogs().then((items) => syncBackendVideoTasks(items));
         try {
             const storedLayout = window.localStorage?.getItem(WORKBENCH_LAYOUT_KEY);
             if (storedLayout === "side" || storedLayout === "bottom") setWorkbenchLayoutState(storedLayout);
@@ -211,9 +217,33 @@ export default function VideoPage() {
     }, [logs]);
 
     useEffect(() => {
-        if (!isUserReady || !token) return;
-        void loadAccountVideoHistory(token).then((items) => syncBackendVideoTasks(items || logsRef.current));
-    }, [isUserReady, token]);
+        if (!isUserReady) return;
+        let cancelled = false;
+        const ownerId = accountOwnerId;
+        const isCurrentAccount = () => !cancelled && getAccountOwnerId() === ownerId && useUserStore.getState().token === token;
+
+        // 账号切换后先清空旧账号的内存快照，避免新账号请求完成前继续展示旧历史。
+        logsRef.current = [];
+        pollingLogIdsRef.current.clear();
+        setLogs([]);
+        setResults([]);
+        setSyncingVideoIds([]);
+        setSelectedLogIds([]);
+        setPreviewLog(null);
+
+        void refreshLogs(ownerId).then((items) => {
+            if (!isCurrentAccount()) return;
+            if (token) {
+                void loadAccountVideoHistory(token, ownerId).then((remoteItems) => {
+                    if (!isCurrentAccount()) return;
+                    void syncBackendVideoTasks(remoteItems || items, ownerId);
+                });
+                return;
+            }
+            void syncBackendVideoTasks(items, ownerId);
+        });
+        return () => { cancelled = true; };
+    }, [isUserReady, token, accountOwnerId]);
 
     const setWorkbenchLayout = (layout: WorkbenchLayout) => {
         setWorkbenchLayoutState(layout);
@@ -507,44 +537,52 @@ export default function VideoPage() {
     };
 
     const removeReference = async (id: string) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const reference = references.find((item) => item.id === id);
         setReferences((value) => value.filter((ref) => ref.id !== id));
         if (!reference?.storageKey || referenceUsedByGeneration(reference, logs, results)) return;
         try {
-            await deleteStoredImages([reference.storageKey]);
+            await deleteStoredImages([reference.storageKey], { ownerId, token: taskToken });
         } catch (error) {
             message.error(error instanceof Error ? error.message : "参考图文件删除失败");
         }
     };
 
     const removeFrameReference = async (slot: "first" | "last") => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const reference = slot === "first" ? firstFrame : lastFrame;
         slot === "first" ? setFirstFrame(null) : setLastFrame(null);
         if (!reference?.storageKey || referenceUsedByGeneration(reference, logs, results)) return;
         try {
-            await deleteStoredImages([reference.storageKey]);
+            await deleteStoredImages([reference.storageKey], { ownerId, token: taskToken });
         } catch (error) {
             message.error(error instanceof Error ? error.message : "首尾帧文件删除失败");
         }
     };
 
     const removeVideoReference = async (id: string) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const reference = videoReferences.find((item) => item.id === id);
         setVideoReferences((value) => value.filter((ref) => ref.id !== id));
         if (!reference?.storageKey || mediaReferenceUsedByGeneration(reference.storageKey, logs, results)) return;
         try {
-            await deleteStoredMedia([reference.storageKey]);
+            await deleteStoredMedia([reference.storageKey], { ownerId, token: taskToken });
         } catch (error) {
             message.error(error instanceof Error ? error.message : "参考视频文件删除失败");
         }
     };
 
     const removeAudioReference = async (id: string) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         const reference = audioReferences.find((item) => item.id === id);
         setAudioReferences((value) => value.filter((ref) => ref.id !== id));
         if (!reference?.storageKey || mediaReferenceUsedByGeneration(reference.storageKey, logs, results)) return;
         try {
-            await deleteStoredMedia([reference.storageKey]);
+            await deleteStoredMedia([reference.storageKey], { ownerId, token: taskToken });
         } catch (error) {
             message.error(error instanceof Error ? error.message : "参考音频文件删除失败");
         }
@@ -605,6 +643,8 @@ export default function VideoPage() {
     };
 
     const submitGenerationSnapshot = async (snapshot: { text: string; model: string; config: AiConfig; references: ReferenceImage[]; firstFrame?: ReferenceImage | null; lastFrame?: ReferenceImage | null; videoReferences: ReferenceVideo[]; audioReferences: ReferenceAudio[]; taskCount: number }) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
         setRunning(true);
         setPreviewLog(null);
         setNow(Date.now());
@@ -613,39 +653,45 @@ export default function VideoPage() {
             const task: VideoResponse = { id: clientTaskId, task_id: clientTaskId, model: snapshot.model, status: "queued", progress: 0, created_at: Date.now(), size: snapshot.config.size, seconds: snapshot.config.videoSeconds };
             return buildLog({ prompt: snapshot.text, model: snapshot.model, config: snapshot.config, references: snapshot.references, firstFrame: snapshot.firstFrame, lastFrame: snapshot.lastFrame, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences, durationMs: 0, status: "生成中", task, taskCount: snapshot.taskCount, lastPolledAt: Date.now() });
         });
-        await Promise.all(pendingLogs.map((log) => logStore.setItem(log.id, serializeLog(log))));
+        await Promise.all(pendingLogs.map((log) => logStore.setItem(videoLogStorageKey(log.id, ownerId), serializeLog(log))));
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         setLogs((value) => sortVideoLogs([...pendingLogs, ...value]));
         setResults((value) => sortVideoResults([...pendingLogs.map((log) => createResultFromLog(log, "pending")), ...value]));
         try {
-            const settled = await Promise.allSettled(pendingLogs.map((log) => runVideoTask(log, snapshot)));
+            const settled = await Promise.allSettled(pendingLogs.map((log) => runVideoTask(log, snapshot, ownerId, taskToken)));
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
             const nextLogs = settled
                 .map((item) => (item.status === "fulfilled" ? item.value : null))
                 .filter((item): item is NonNullable<typeof item> => Boolean(item));
-            const storedLogs = await readStoredLogs();
+            const storedLogs = await readStoredLogs(ownerId);
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
             setLogs(storedLogs);
             const createdCount = nextLogs.filter((item) => item.status === "生成中").length;
             const failedCount = nextLogs.filter((item) => item.status === "失败").length;
             createdCount ? message.success(`已创建 ${createdCount} 个视频任务`) : message.error("视频任务创建失败");
             if (failedCount) message.warning(`${failedCount} 个视频任务创建失败`);
         } finally {
-            setRunning(false);
+            if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken) setRunning(false);
         }
     };
 
-    const runVideoTask = async (pendingLog: GenerationLog, snapshot: { text: string; model: string; config: AiConfig; references: ReferenceImage[]; firstFrame?: ReferenceImage | null; lastFrame?: ReferenceImage | null; videoReferences: ReferenceVideo[]; audioReferences: ReferenceAudio[]; taskCount: number }) => {
+    const runVideoTask = async (pendingLog: GenerationLog, snapshot: { text: string; model: string; config: AiConfig; references: ReferenceImage[]; firstFrame?: ReferenceImage | null; lastFrame?: ReferenceImage | null; videoReferences: ReferenceVideo[]; audioReferences: ReferenceAudio[]; taskCount: number }, ownerId = accountOwnerId, taskToken = token) => {
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         try {
             const created = await createVideoGenerationTask(snapshot.config, snapshot.text, { references: snapshot.references, firstFrame: snapshot.firstFrame, lastFrame: snapshot.lastFrame, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences }, (progress) => {
+                if (!isCurrentAccount()) return;
                 setResults((value) => updateResultByLogId(value, pendingLog.id, { progress }));
             }, { clientTaskId: pendingLog.task?.id, source: "video-workbench" });
             const nextLog = { ...pendingLog, task: created.task, lastPolledAt: Date.now() };
-            await saveGenerationLog(nextLog);
+            if (!(await saveGenerationLog(nextLog, ownerId, taskToken))) return nextLog;
             setResults((value) => updateResultByLogId(value, pendingLog.id, { progress: created.task.progress, task: created.task, taskLogId: nextLog.id, lastPolledAt: nextLog.lastPolledAt }));
             return nextLog;
         } catch (error) {
             const durationMs = Date.now() - pendingLog.createdAt;
             const nextLog = { ...pendingLog, status: "失败" as const, durationMs, lastPolledAt: Date.now(), error: errorMessage(error), errorDetail: errorDetail(error) };
-            await saveGenerationLog(nextLog);
-            await persistVideoLog(nextLog);
+            if (!(await saveGenerationLog(nextLog, ownerId, taskToken))) return nextLog;
+            await persistVideoLog(nextLog, ownerId, taskToken);
+            if (!isCurrentAccount()) return nextLog;
             setResults((value) => updateResultByLogId(value, pendingLog.id, { status: "failed", taskLogId: nextLog.id, error: nextLog.error, errorDetail: nextLog.errorDetail, durationMs }));
             return nextLog;
         }
@@ -701,31 +747,37 @@ export default function VideoPage() {
         }
     };
 
-    const syncVideo = async (video: GeneratedVideo, index = 0) => {
-        if (isCloudVideo(video)) return video;
+    const syncVideo = async (video: GeneratedVideo, index = 0, ownerId = accountOwnerId, taskToken = token) => {
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount() || isCloudVideo(video)) return video;
         setSyncingVideoIds((ids) => Array.from(new Set([...ids, video.id])));
         const hideLoading = message.loading("正在同步视频到云端存储...", 0);
         try {
-            const uploaded = await uploadRemoteMediaToServer(video.url, `video-${index + 1}.mp4`);
+            const uploaded = await uploadRemoteMediaToServer(video.url, `video-${index + 1}.mp4`, taskToken, ownerId);
+            if (!isCurrentAccount()) return null;
             message.success("视频已同步到云端存储");
             return { ...video, url: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || video.width, height: uploaded.height || video.height, bytes: uploaded.bytes || video.bytes, mimeType: uploaded.mimeType || video.mimeType };
         } catch (error) {
+            if (!isCurrentAccount()) return null;
             message.error(error instanceof Error ? error.message : "视频同步失败");
             return null;
         } finally {
             hideLoading();
-            setSyncingVideoIds((ids) => ids.filter((id) => id !== video.id));
+            if (isCurrentAccount()) setSyncingVideoIds((ids) => ids.filter((id) => id !== video.id));
         }
     };
 
-    const autoSyncGeneratedVideo = async (video: GeneratedVideo, channelMode: AiConfig["channelMode"], index = 0) => {
-        if (video.storageKey) return video;
+    const autoSyncGeneratedVideo = async (video: GeneratedVideo, channelMode: AiConfig["channelMode"], index = 0, ownerId = accountOwnerId, taskToken = token) => {
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount() || video.storageKey) return video;
         const storageConfig = await loadStorageConfig().catch(() => null);
-        if (!storageConfig || !shouldAutoSyncGeneratedMedia(storageConfig, channelMode)) return video;
+        if (!isCurrentAccount() || !storageConfig || !shouldAutoSyncGeneratedMedia(storageConfig, channelMode)) return video;
         try {
-            const uploaded = await uploadRemoteMediaToServer(video.url, `video-${index + 1}.mp4`);
+            const uploaded = await uploadRemoteMediaToServer(video.url, `video-${index + 1}.mp4`, taskToken, ownerId);
+            if (!isCurrentAccount()) return video;
             return { ...video, url: uploaded.url, storageKey: uploaded.storageKey, width: uploaded.width || video.width, height: uploaded.height || video.height, bytes: uploaded.bytes || video.bytes, mimeType: uploaded.mimeType || video.mimeType };
         } catch (error) {
+            if (!isCurrentAccount()) return video;
             // 自动同步失败不能覆盖已生成结果，否则云存储故障会被误判为生视频失败。
             message.warning(`视频已生成，但自动同步失败：${errorMessage(error)}`);
             return video;
@@ -739,14 +791,17 @@ export default function VideoPage() {
     };
 
     const syncLogVideo = async (log: GenerationLog, video: GeneratedVideo, index: number) => {
-        const synced = await syncVideo(video, index);
-        if (!synced) return;
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const synced = await syncVideo(video, index, ownerId, taskToken);
+        if (!synced || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const nextLog = { ...log, video: synced };
-        await logStore.setItem(log.id, serializeLog(nextLog));
+        await logStore.setItem(videoLogStorageKey(nextLog.id, ownerId), serializeLog(nextLog));
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const nextLogs = logs.map((item) => (item.id === log.id ? nextLog : item));
         setLogs(nextLogs);
-        await persistVideoLog(nextLog);
-        if (previewLog?.id === log.id) setPreviewLog(nextLog);
+        await persistVideoLog(nextLog, ownerId, taskToken);
+        if (getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken && previewLog?.id === log.id) setPreviewLog(nextLog);
     };
 
     const saveResultToAssets = (video: GeneratedVideo) => {
@@ -854,15 +909,19 @@ export default function VideoPage() {
     };
 
     const deleteSelectedLogs = () => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         const selectedLogs = logs.filter((log) => selectedLogIds.includes(log.id));
         const deleteKeys = new Set(selectedLogs.flatMap(videoLogDeleteKeys));
         const deletedLogs = logs.filter((log) => selectedLogIds.includes(log.id) || videoLogDeleteKeys(log).some((key) => deleteKeys.has(key)));
         const nextLogs = logs.filter((log) => !deletedLogs.some((deleted) => deleted.id === log.id));
         const keys = disposableLogStorageKeys(deletedLogs, nextLogs, [firstFrame, lastFrame, ...references].filter((item): item is ReferenceImage => Boolean(item)), [...videoReferences, ...audioReferences], results);
+        if (!isCurrentAccount()) return;
         setLogs(nextLogs);
         logsRef.current = nextLogs;
         setResults((value) => value.filter((item) => !selectedLogIds.includes(item.id) && !selectedLogIds.includes(item.taskLogId || "") && !videoResultIdentityKeys(item).some((key) => deleteKeys.has(key))));
-        void Promise.all([deleteBackendVideoTasks(deletedLogs), deleteAccountVideoLogs(deletedLogs), deleteStoredMedia(keys.media), deleteStoredImages(keys.images), ...deletedLogs.map((log) => logStore.removeItem(log.id))]).catch(() => undefined);
+        void Promise.all([deleteBackendVideoTasks(deletedLogs, ownerId, taskToken), deleteAccountVideoLogs(deletedLogs, ownerId, taskToken), deleteStoredMedia(keys.media, { ownerId, token: taskToken }), deleteStoredImages(keys.images, { ownerId, token: taskToken }), ...deletedLogs.map((log) => logStore.removeItem(videoLogStorageKey(log.id, ownerId)))]).catch(() => undefined);
         if (previewLog && deletedLogs.some((log) => log.id === previewLog.id)) {
             setPreviewLog(null);
             setResults([]);
@@ -871,37 +930,40 @@ export default function VideoPage() {
         setDeleteConfirmOpen(false);
     };
 
-    const deleteBackendVideoTasks = async (items: GenerationLog[]) => {
+    const deleteBackendVideoTasks = async (items: GenerationLog[], ownerId = accountOwnerId, taskToken = token) => {
         const config = effectiveConfigRef.current;
-        if (!token || !usesBackendVideoTasks(config)) return;
+        if (!taskToken || !usesBackendVideoTasks(config) || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         await Promise.all(items.filter((item) => item.task && !isLocalClientVideoTask(item.task)).map((item) => deleteVideoGenerationTask(config, item.task).catch(() => undefined)));
     };
 
-    const deleteAccountVideoLogs = async (items: GenerationLog[]) => {
-        if (!token) return;
+    const deleteAccountVideoLogs = async (items: GenerationLog[], ownerId = accountOwnerId, taskToken = token) => {
+        if (!taskToken || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return;
         const ids = Array.from(new Set(items.flatMap(videoLogDeleteKeys)));
         if (!ids.length) return;
-        await deleteVideoGenerationLogs(token, ids).catch(() => undefined);
+        await deleteVideoGenerationLogs(taskToken, ids).catch(() => undefined);
     };
 
-    const refreshLogs = async () => {
-        const nextLogs = await readStoredLogs();
+    const refreshLogs = async (ownerId = getAccountOwnerId(), currentToken = useUserStore.getState().token) => {
+        const nextLogs = await readStoredLogs(ownerId);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== currentToken) return logsRef.current;
         setLogs(nextLogs);
         return nextLogs;
     };
 
-    const syncBackendVideoTasks = async (baseLogs?: GenerationLog[]) => {
+    const syncBackendVideoTasks = async (baseLogs?: GenerationLog[], ownerId = getAccountOwnerId()) => {
         const config = effectiveConfigRef.current;
-        if (!token || !usesBackendVideoTasks(config)) return baseLogs || logsRef.current;
+        if (!token || !usesBackendVideoTasks(config) || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return baseLogs || logsRef.current;
         try {
             const tasks = await listVideoGenerationTasks(config);
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return baseLogs || logsRef.current;
             const recoverableTasks = tasks.filter(isRecoverableBackendVideoTask);
             if (!recoverableTasks.length) return baseLogs || logsRef.current;
-            const currentLogs = baseLogs || (await readStoredLogs());
+            const currentLogs = baseLogs || (await readStoredLogs(ownerId));
             const mergedLogs = mergeBackendVideoTasks(currentLogs, recoverableTasks, config);
             const taskKeys = new Set(recoverableTasks.flatMap(videoTaskIdentityKeys));
             const recoveredLogs = mergedLogs.filter((log) => videoLogIdentityKeys(log).some((key) => taskKeys.has(key)));
-            await persistStoredVideoLogs(recoveredLogs);
+            if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return baseLogs || logsRef.current;
+            await persistStoredVideoLogs(recoveredLogs, ownerId);
             setLogs(mergedLogs);
             setResults((value) => mergePendingLogResults(value, mergedLogs.filter((log) => log.status === "生成中" && log.task && !log.video)));
             return mergedLogs;
@@ -910,12 +972,17 @@ export default function VideoPage() {
         }
     };
 
-    const loadAccountVideoHistory = async (currentToken: string) => {
+    const loadAccountVideoHistory = async (currentToken: string, ownerId = getAccountOwnerId()) => {
         try {
-            const localLogs = await readStoredLogs();
+            const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === currentToken;
+            const localLogs = await readStoredLogs(ownerId);
+            if (!isCurrentAccount()) return undefined;
             const remoteLogs = await fetchVideoGenerationLogs<GenerationLog>(currentToken);
+            if (!isCurrentAccount()) return undefined;
             const mergedLogs = await mergeVideoLogs(remoteLogs, localLogs);
-            await replaceStoredVideoHistory(mergedLogs);
+            if (!isCurrentAccount()) return undefined;
+            await replaceStoredVideoHistory(mergedLogs, ownerId);
+            if (!isCurrentAccount()) return undefined;
             setLogs(mergedLogs);
             return mergedLogs;
         } catch {
@@ -924,59 +991,69 @@ export default function VideoPage() {
         }
     };
 
-    const persistVideoLog = async (log: GenerationLog) => {
-        if (!token || !shouldSyncVideoLog(log)) return;
-        await saveVideoGenerationLogs(token, [serializeLog(log)]).catch(() => undefined);
+    const persistVideoLog = async (log: GenerationLog, ownerId = accountOwnerId, taskToken = token) => {
+        if (!taskToken || !shouldSyncVideoLog(log) || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return false;
+        await saveVideoGenerationLogs(taskToken, [serializeLog(log)]).catch(() => undefined);
+        return getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
     };
 
-    const saveGenerationLog = async (log: GenerationLog) => {
-        await logStore.setItem(log.id, serializeLog(log));
+    const saveGenerationLog = async (log: GenerationLog, ownerId = accountOwnerId, taskToken = token) => {
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return false;
+        await logStore.setItem(videoLogStorageKey(log.id, ownerId), serializeLog(log));
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return false;
         setLogs((value) => sortVideoLogs([log, ...value.filter((item) => item.id !== log.id)]));
+        return true;
     };
 
-    const finalizeGenerationLog = async (log: GenerationLog) => {
-        await saveGenerationLog(log);
-        const nextLogs = await readStoredLogs();
+    const finalizeGenerationLog = async (log: GenerationLog, ownerId = accountOwnerId, taskToken = token) => {
+        if (!(await saveGenerationLog(log, ownerId, taskToken))) return false;
+        const nextLogs = await readStoredLogs(ownerId);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== taskToken) return false;
         setLogs(nextLogs);
-        await persistVideoLog(log);
+        return persistVideoLog(log, ownerId, taskToken);
     };
 
     const pollPendingLogOnce = async (log: GenerationLog, resumeConfig: AiConfig) => {
+        const ownerId = accountOwnerId;
+        const taskToken = token;
+        const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
+        if (!isCurrentAccount()) return;
         pollingLogIdsRef.current.add(log.id);
         const startedAt = log.createdAt || Date.now();
         try {
             const task = await pollVideoGenerationTaskStatus(resumeConfig, log.task!);
+            if (!isCurrentAccount()) return;
             const durationMs = Date.now() - startedAt;
             const baseLog = { ...log, task, durationMs, lastPolledAt: Date.now() };
             if (isFailedVideoTask(task)) {
                 const nextLog = { ...baseLog, status: "失败" as const, error: task.error?.message || "视频生成失败", errorDetail: errorDetail(new VideoRequestError(task.error?.message || "视频生成失败", task)) };
-                await finalizeGenerationLog(nextLog);
+                if (!(await finalizeGenerationLog(nextLog, ownerId, taskToken))) return;
                 setResults((value) => updateResultByLogId(value, log.id, { status: "failed", task, error: nextLog.error, errorDetail: nextLog.errorDetail, durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                 return;
             }
             if (isCompletedVideoTask(task)) {
                 if (!task.video_url && !task.url) {
                     const nextLog = { ...baseLog, status: "失败" as const, error: "视频生成完成但没有返回视频地址", errorDetail: errorDetail(new VideoRequestError("视频生成完成但没有返回视频地址", task)) };
-                    await finalizeGenerationLog(nextLog);
+                    if (!(await finalizeGenerationLog(nextLog, ownerId, taskToken))) return;
                     setResults((value) => updateResultByLogId(value, log.id, { status: "failed", task, error: nextLog.error, errorDetail: nextLog.errorDetail, durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                     return;
                 }
-                const video = await autoSyncGeneratedVideo(videoFromTaskResponse(task, durationMs), log.config.channelMode);
+                const video = await autoSyncGeneratedVideo(videoFromTaskResponse(task, durationMs), log.config.channelMode, 0, ownerId, taskToken);
                 const nextLog = { ...baseLog, status: "成功" as const, video, error: undefined, errorDetail: undefined };
-                await finalizeGenerationLog(nextLog);
+                if (!(await finalizeGenerationLog(nextLog, ownerId, taskToken))) return;
                 setResults((value) => value.filter((item) => item.taskLogId !== log.id && item.id !== log.id));
                 return;
             }
-            await saveGenerationLog(baseLog);
+            if (!(await saveGenerationLog(baseLog, ownerId, taskToken))) return;
             setResults((value) => updateResultByLogId(value, log.id, { task, progress: task.progress, durationMs, lastPolledAt: baseLog.lastPolledAt }));
         } catch (error) {
             const nextLog = { ...log, durationMs: Date.now() - startedAt, lastPolledAt: Date.now(), error: errorMessage(error), errorDetail: errorDetail(error) };
             if (isTransientVideoPollError(error)) {
-                await saveGenerationLog({ ...nextLog, status: "生成中" });
+                if (!(await saveGenerationLog({ ...nextLog, status: "生成中" }, ownerId, taskToken))) return;
                 setResults((value) => updateResultByLogId(value, log.id, { error: nextLog.error, errorDetail: nextLog.errorDetail, durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
                 return;
             }
-            await finalizeGenerationLog({ ...nextLog, status: "失败" });
+            if (!(await finalizeGenerationLog({ ...nextLog, status: "失败" }, ownerId, taskToken))) return;
             setResults((value) => updateResultByLogId(value, log.id, { status: "failed", error: nextLog.error, errorDetail: nextLog.errorDetail, durationMs: nextLog.durationMs, lastPolledAt: nextLog.lastPolledAt }));
         } finally {
             pollingLogIdsRef.current.delete(log.id);
@@ -2084,22 +2161,23 @@ function formatLogTime(value: number) {
     return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }
 
-async function replaceStoredVideoHistory(logs: GenerationLog[]) {
+async function replaceStoredVideoHistory(logs: GenerationLog[], ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined") return;
-    await persistStoredVideoLogs(logs);
-    const keepIds = new Set(logs.map((log) => log.id));
+    await persistStoredVideoLogs(logs, ownerId);
+    const ownedPrefix = getAccountStorageKey(VIDEO_LOG_STORE_KEY, ownerId) + ":";
+    const keepKeys = new Set(logs.map((log) => videoLogStorageKey(log.id, ownerId)));
     const storedKeys = await logStore.keys();
-    await Promise.all(storedKeys.filter((key) => !keepIds.has(key)).map((key) => logStore.removeItem(key)));
+    await Promise.all(storedKeys.filter((key) => key.startsWith(ownedPrefix) && !keepKeys.has(key)).map((key) => logStore.removeItem(key)));
 }
 
-async function persistStoredVideoLogs(logs: GenerationLog[]) {
+async function persistStoredVideoLogs(logs: GenerationLog[], ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined" || !logs.length) return;
     await Promise.all(
         logs.map(async (log) => {
             const serialized = serializeLog(log);
-            const current = await logStore.getItem<GenerationLog>(log.id);
+            const current = await logStore.getItem<GenerationLog>(videoLogStorageKey(log.id, ownerId));
             if (current && JSON.stringify(current) === JSON.stringify(serialized)) return;
-            await logStore.setItem(log.id, serialized);
+            await logStore.setItem(videoLogStorageKey(log.id, ownerId), serialized);
         }),
     );
 }
@@ -2515,12 +2593,13 @@ function errorDetail(error: unknown) {
     }
 }
 
-async function readStoredLogs() {
+async function readStoredLogs(ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined") return [];
     try {
         const logs: GenerationLog[] = [];
-        await logStore.iterate<GenerationLog, void>((value) => {
-            logs.push(value);
+        const ownedPrefix = getAccountStorageKey(VIDEO_LOG_STORE_KEY, ownerId) + ":";
+        await logStore.iterate<GenerationLog, void>((value, key) => {
+            if (key.startsWith(ownedPrefix)) logs.push(value);
         });
         return (await normalizeLogsSafely(logs)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     } catch {

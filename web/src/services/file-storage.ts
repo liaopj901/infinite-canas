@@ -3,8 +3,9 @@
 import localforage from "localforage";
 import { nanoid } from "nanoid";
 
+import { getAccountOwnerId } from "@/lib/account-scope";
 import { apiGet } from "@/services/api/request";
-import { canUseGlobalStorage, getProxyUrl, loadUserStorageProvider, toProviderPayload, type StorageConfig } from "@/services/image-storage";
+import { canUseGlobalStorage, getProxyUrl, loadUserStorageProvider, toProviderPayload, type StorageConfig, type StorageRequestContext } from "@/services/image-storage";
 import { useUserStore } from "@/stores/use-user-store";
 
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
@@ -50,16 +51,16 @@ export async function downloadRemoteMedia(url: string) {
     return blob;
 }
 
-export async function uploadRemoteMediaToServer(url: string, filename: string): Promise<UploadedFile> {
+export async function uploadRemoteMediaToServer(url: string, filename: string, requestToken = useUserStore.getState().token, requestOwnerId = getAccountOwnerId()): Promise<UploadedFile> {
     const blob = await downloadRemoteMedia(url);
-    return uploadMediaBlobToServer(blob, filename);
+    return uploadMediaBlobToServer(blob, filename, requestToken, requestOwnerId);
 }
 
-async function uploadMediaBlobToServer(blob: Blob, filename: string): Promise<UploadedFile> {
+async function uploadMediaBlobToServer(blob: Blob, filename: string, requestToken = useUserStore.getState().token, requestOwnerId = getAccountOwnerId()): Promise<UploadedFile> {
     const config = await loadStorageConfig().catch(() => null);
-    const userProvider = config?.allowUserProvider ? loadUserStorageProvider() : null;
+    const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
     if (!config || (!canUseGlobalStorage(config) && !userProvider)) throw new Error("服务端对象存储未启用");
-    const token = useUserStore.getState().token;
+    const token = requestToken;
     if (!token) throw new Error("请先登录后再同步媒体");
     const formData = new FormData();
     formData.append("file", blob, filename);
@@ -95,11 +96,20 @@ export async function resolveMediaUrl(storageKey?: string, fallback = "") {
         return url;
     }
     if (storageKey.startsWith("server:")) {
+        const ownerId = getAccountOwnerId();
+        const token = useUserStore.getState().token;
         const id = storageKey.slice("server:".length);
-        if (fallback && !fallback.startsWith("blob:")) return fallback;
-        const info = await apiGet<{ publicUrl?: string }>(`/api/files/${encodeURIComponent(id)}`).catch(() => null);
+        if (fallback && !fallback.startsWith("blob:") && !fallback.includes("/api/files/")) return fallback;
+        const info = await apiGet<{ publicUrl?: string }>(`/api/files/${encodeURIComponent(id)}`, undefined, token).catch(() => null);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
         if (!info) return fallback;
-        const url = info?.publicUrl || `/api/files/${encodeURIComponent(id)}/content`;
+        if (info.publicUrl) return info.publicUrl;
+        if (!token) return fallback;
+        const response = await fetch(`/api/files/${encodeURIComponent(id)}/content`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+        if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
+        const privateBlob = await response.blob();
+        const url = URL.createObjectURL(privateBlob);
+        objectUrls.set(storageKey, url);
         return url;
     }
     return fallback;
@@ -116,12 +126,11 @@ export async function setMediaBlob(storageKey: string, blob: Blob) {
     return url;
 }
 
-async function deleteServerMedia(storageKey: string) {
+async function deleteServerMedia(storageKey: string, ownerId = getAccountOwnerId(), token = useUserStore.getState().token) {
     const id = storageKey.slice("server:".length);
     if (!id) return;
-    const token = useUserStore.getState().token;
     if (!token) return;
-    const provider = loadUserStorageProvider();
+    const provider = loadUserStorageProvider(ownerId);
     const response = await fetch(`/api/v1/files/${encodeURIComponent(id)}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -131,7 +140,9 @@ async function deleteServerMedia(storageKey: string) {
     if (!response.ok || payload?.code !== 0) throw new Error(payload?.msg || "删除服务端视频失败");
 }
 
-export async function deleteStoredMedia(keys: Iterable<string>) {
+export async function deleteStoredMedia(keys: Iterable<string>, request: StorageRequestContext = {}) {
+    const ownerId = request.ownerId ?? getAccountOwnerId();
+    const token = request.token !== undefined ? request.token : useUserStore.getState().token;
     const { useAssetStore } = await import("@/stores/use-asset-store");
     const assetKeys = new Set(
         useAssetStore.getState().assets
@@ -142,7 +153,7 @@ export async function deleteStoredMedia(keys: Iterable<string>) {
         Array.from(new Set(keys)).map(async (key) => {
             if (assetKeys.has(key)) return;
             if (key.startsWith("server:")) {
-                await deleteServerMedia(key);
+                await deleteServerMedia(key, ownerId, token);
                 return;
             }
             const url = objectUrls.get(key);

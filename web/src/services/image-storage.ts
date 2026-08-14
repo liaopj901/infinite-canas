@@ -3,6 +3,7 @@
 import localforage from "localforage";
 
 import { nanoid } from "nanoid";
+import { getAccountOwnerId, getAccountStorageKey } from "@/lib/account-scope";
 import { readImageMeta } from "@/lib/image-utils";
 import { apiGet } from "@/services/api/request";
 import type { AiConfig } from "@/stores/use-config-store";
@@ -46,6 +47,11 @@ type UploadImageOptions = {
     localOnly?: boolean;
 };
 
+export type StorageRequestContext = {
+    ownerId?: string;
+    token?: string | null;
+};
+
 export type StorageConfig = {
     mode: string;
     allowUserProvider: boolean;
@@ -57,6 +63,10 @@ export type StorageConfig = {
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
 const objectUrls = new Map<string, string>();
 const serverUrls = new Map<string, string>();
+
+function serverUrlCacheKey(ownerId: string, id: string) {
+    return `${ownerId}:${id}`;
+}
 export const USER_STORAGE_PROVIDER_KEY = "infinite-canvas:user_storage_provider";
 export const USER_WEBDAV_STORAGE_PROVIDER_KEY = "infinite-canvas:user_webdav_storage_provider";
 let storageConfigPromise: Promise<StorageConfig> | null = null;
@@ -127,6 +137,8 @@ export function getProxyUrl(url: string): string {
 }
 
 export async function uploadImage(input: string | Blob, options: UploadImageOptions = {}): Promise<UploadedImage> {
+    const requestOwnerId = getAccountOwnerId();
+    const requestToken = useUserStore.getState().token;
     const url = typeof input === "string" ? getProxyUrl(input) : input;
     let blob: Blob;
     if (typeof url === "string") {
@@ -145,7 +157,7 @@ export async function uploadImage(input: string | Blob, options: UploadImageOpti
         blob = url;
     }
     if (!options.localOnly) {
-        const serverUpload = await maybeUploadImageToServer(blob);
+        const serverUpload = await maybeUploadImageToServer(blob, requestToken, requestOwnerId);
         if (serverUpload) return serverUpload;
     }
     const storageKey = `image:${nanoid()}`;
@@ -156,7 +168,7 @@ export async function uploadImage(input: string | Blob, options: UploadImageOpti
     return { url: urlObj, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type || meta.mimeType };
 }
 
-export async function uploadRemoteImageToServer(url: string, filename: string): Promise<UploadedImage> {
+export async function uploadRemoteImageToServer(url: string, filename: string, requestToken = useUserStore.getState().token, requestOwnerId = getAccountOwnerId()): Promise<UploadedImage> {
     const response = await fetch(getProxyUrl(url));
     if (!response.ok) {
         const payload = await response.json().catch(() => null) as { msg?: string } | null;
@@ -164,9 +176,9 @@ export async function uploadRemoteImageToServer(url: string, filename: string): 
     }
     const blob = await response.blob();
     const config = await loadStorageConfig();
-    const userProvider = config.allowUserProvider ? loadUserStorageProvider() : null;
+    const userProvider = config.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
     if (!canUseGlobalStorage(config) && !userProvider) throw new Error("服务端对象存储未启用");
-    const token = useUserStore.getState().token;
+    const token = requestToken;
     if (!token) throw new Error("服务端存储需要先登录");
     const formData = new FormData();
     formData.append("file", blob, filename || "image-" + nanoid() + "." + imageExtension(blob.type));
@@ -175,7 +187,7 @@ export async function uploadRemoteImageToServer(url: string, filename: string): 
     const payload = (await uploadResponse.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedImage } | null;
     if (!uploadResponse.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "服务端图片上传失败");
     const meta = await readImageMeta(payload.data.url);
-    if (payload.data.storageKey?.startsWith("server:")) serverUrls.set(payload.data.storageKey.slice("server:".length), payload.data.url);
+    if (payload.data.storageKey?.startsWith("server:")) serverUrls.set(serverUrlCacheKey(requestOwnerId, payload.data.storageKey.slice("server:".length)), payload.data.url);
     return { ...payload.data, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
 }
 
@@ -186,8 +198,10 @@ export function clearStorageConfigCache() {
 export async function resolveImageUrl(storageKey?: string, fallback = "") {
     if (!storageKey) return fallback;
     if (storageKey.startsWith("server:")) {
+        const ownerId = getAccountOwnerId();
+        const token = useUserStore.getState().token;
         const id = storageKey.slice("server:".length);
-        if (fallback && !fallback.startsWith("blob:")) return fallback;
+        if (fallback && !fallback.startsWith("blob:") && !fallback.includes("/api/files/")) return fallback;
         const cached = objectUrls.get(storageKey);
         if (cached) return cached;
         const blob = await store.getItem<Blob>(storageKey).catch(() => null);
@@ -196,12 +210,22 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
             objectUrls.set(storageKey, url);
             return url;
         }
-        const cachedUrl = serverUrls.get(id);
+        const cachedUrl = serverUrls.get(serverUrlCacheKey(ownerId, id));
         if (cachedUrl) return cachedUrl;
-        const info = await apiGet<{ publicUrl?: string }>(`/api/files/${encodeURIComponent(id)}`).catch(() => null);
+        const info = await apiGet<{ publicUrl?: string }>(`/api/files/${encodeURIComponent(id)}`, undefined, token).catch(() => null);
+        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
         if (!info) return fallback;
-        const url = info?.publicUrl || `/api/files/${encodeURIComponent(id)}/content`;
-        serverUrls.set(id, url);
+        if (info.publicUrl) {
+            serverUrls.set(serverUrlCacheKey(ownerId, id), info.publicUrl);
+            return info.publicUrl;
+        }
+        if (!token) return fallback;
+        const response = await fetch(`/api/files/${encodeURIComponent(id)}/content`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+        if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
+        const privateBlob = await response.blob();
+        const url = URL.createObjectURL(privateBlob);
+        objectUrls.set(storageKey, url);
+        serverUrls.set(serverUrlCacheKey(ownerId, id), url);
         return url;
     }
     const cached = objectUrls.get(storageKey);
@@ -213,13 +237,13 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
     return url;
 }
 
-async function maybeUploadImageToServer(blob: Blob): Promise<UploadedImage | null> {
+async function maybeUploadImageToServer(blob: Blob, requestToken: string | null, requestOwnerId: string): Promise<UploadedImage | null> {
     const config = await loadStorageConfig().catch(() => null);
-    const userProvider = config?.allowUserProvider ? loadUserStorageProvider() : null;
+    const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
     const canUseGlobalProvider = config ? canUseGlobalStorage(config) : false;
     const useServerStorage = canUseGlobalProvider || Boolean(userProvider);
     if (!config || !useServerStorage) return null;
-    const token = useUserStore.getState().token;
+    const token = requestToken;
     if (!token) {
         if (canUseGlobalProvider) throw new Error("服务端存储需要先登录");
         return null;
@@ -234,7 +258,7 @@ async function maybeUploadImageToServer(blob: Blob): Promise<UploadedImage | nul
         throw new Error(payload?.msg || "服务端图片上传失败");
     }
     const meta = await readImageMeta(payload.data.url);
-    if (payload.data.storageKey?.startsWith("server:")) serverUrls.set(payload.data.storageKey.slice("server:".length), payload.data.url);
+    if (payload.data.storageKey?.startsWith("server:")) serverUrls.set(serverUrlCacheKey(requestOwnerId, payload.data.storageKey.slice("server:".length)), payload.data.url);
     return { ...payload.data, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
 }
 
@@ -261,12 +285,11 @@ export async function setImageBlob(storageKey: string, blob: Blob) {
 }
 
 export async function imageToDataUrl(image: { url?: string; dataUrl?: string; storageKey?: string }) {
-    const serverObjectId = image.storageKey?.startsWith("server:") ? image.storageKey.slice("server:".length) : "";
+    const resolvedStorageUrl = await resolveImageUrl(image.storageKey, image.url || image.dataUrl || "");
     const urls = [
-        image.dataUrl && !image.dataUrl.startsWith("blob:") ? image.dataUrl : "",
-        image.url && !image.url.startsWith("blob:") ? image.url : "",
-        serverObjectId ? `/api/files/${encodeURIComponent(serverObjectId)}/content` : "",
-        !serverObjectId ? await resolveImageUrl(image.storageKey, image.url || image.dataUrl || "") : "",
+        image.dataUrl && !image.dataUrl.startsWith("blob:") && !image.dataUrl.includes("/api/files/") ? image.dataUrl : "",
+        image.url && !image.url.startsWith("blob:") && !image.url.includes("/api/files/") ? image.url : "",
+        resolvedStorageUrl,
     ].filter((url, index, list): url is string => Boolean(url) && list.indexOf(url) === index);
     if (!urls.length) return "";
     let lastError = "";
@@ -287,7 +310,9 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
     throw new Error(lastError || "读取参考图失败");
 }
 
-export async function deleteStoredImages(keys: Iterable<string>) {
+export async function deleteStoredImages(keys: Iterable<string>, request: StorageRequestContext = {}) {
+    const ownerId = request.ownerId ?? getAccountOwnerId();
+    const token = request.token !== undefined ? request.token : useUserStore.getState().token;
     const { useAssetStore } = await import("@/stores/use-asset-store");
     const assetKeys = new Set(
         useAssetStore.getState().assets
@@ -298,7 +323,7 @@ export async function deleteStoredImages(keys: Iterable<string>) {
         Array.from(new Set(keys)).map(async (key) => {
             if (assetKeys.has(key)) return;
             if (key.startsWith("server:")) {
-                await deleteServerImage(key);
+                await deleteServerImage(key, ownerId, token);
                 return;
             }
             const url = objectUrls.get(key);
@@ -356,29 +381,29 @@ export function defaultUserWebDAVStorageProvider(): UserWebDAVStorageProvider {
     };
 }
 
-export function loadUserS3StorageProvider() {
+export function loadUserS3StorageProvider(ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined") return null;
     try {
-        const parsed = JSON.parse(window.localStorage.getItem(USER_STORAGE_PROVIDER_KEY) || "null") as UserS3StorageProvider | null;
+        const parsed = JSON.parse(window.localStorage.getItem(getAccountStorageKey(USER_STORAGE_PROVIDER_KEY, ownerId)) || "null") as UserS3StorageProvider | null;
         return parsed ? { ...defaultUserStorageProvider(), ...parsed, type: "s3" as const } : null;
     } catch {
         return null;
     }
 }
 
-export function loadUserWebDAVStorageProvider() {
+export function loadUserWebDAVStorageProvider(ownerId = getAccountOwnerId()) {
     if (typeof window === "undefined") return null;
     try {
-        const parsed = JSON.parse(window.localStorage.getItem(USER_WEBDAV_STORAGE_PROVIDER_KEY) || "null") as UserWebDAVStorageProvider | null;
+        const parsed = JSON.parse(window.localStorage.getItem(getAccountStorageKey(USER_WEBDAV_STORAGE_PROVIDER_KEY, ownerId)) || "null") as UserWebDAVStorageProvider | null;
         return parsed ? { ...defaultUserWebDAVStorageProvider(), ...parsed, type: "webdav" as const } : null;
     } catch {
         return null;
     }
 }
 
-export function loadUserStorageProvider(): UserStorageProvider | null {
-    const s3 = loadUserS3StorageProvider();
-    const webdav = loadUserWebDAVStorageProvider();
+export function loadUserStorageProvider(ownerId = getAccountOwnerId()): UserStorageProvider | null {
+    const s3 = loadUserS3StorageProvider(ownerId);
+    const webdav = loadUserWebDAVStorageProvider(ownerId);
     if (s3?.enabled && webdav?.enabled) return null;
     if (s3?.enabled && validS3Provider(s3)) return s3;
     if (webdav?.enabled && validWebDAVProvider(webdav)) return webdav;
@@ -386,11 +411,11 @@ export function loadUserStorageProvider(): UserStorageProvider | null {
 }
 
 export function saveUserStorageProvider(provider: UserS3StorageProvider) {
-    window.localStorage.setItem(USER_STORAGE_PROVIDER_KEY, JSON.stringify({ ...defaultUserStorageProvider(), ...provider, type: "s3" }));
+    window.localStorage.setItem(getAccountStorageKey(USER_STORAGE_PROVIDER_KEY, ownerId), JSON.stringify({ ...defaultUserStorageProvider(), ...provider, type: "s3" }));
 }
 
 export function saveUserWebDAVStorageProvider(provider: UserWebDAVStorageProvider) {
-    window.localStorage.setItem(USER_WEBDAV_STORAGE_PROVIDER_KEY, JSON.stringify({ ...defaultUserWebDAVStorageProvider(), ...provider, type: "webdav" }));
+    window.localStorage.setItem(getAccountStorageKey(USER_WEBDAV_STORAGE_PROVIDER_KEY, ownerId), JSON.stringify({ ...defaultUserWebDAVStorageProvider(), ...provider, type: "webdav" }));
 }
 
 function validS3Provider(provider: UserS3StorageProvider) {
@@ -427,13 +452,12 @@ export function toProviderPayload(provider: UserStorageProvider) {
     };
 }
 
-async function deleteServerImage(storageKey: string) {
+async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId(), token = useUserStore.getState().token) {
     const id = storageKey.slice("server:".length);
     if (!id) return;
-    const token = useUserStore.getState().token;
-    serverUrls.delete(id);
+    serverUrls.delete(serverUrlCacheKey(ownerId, id));
     if (!token) return;
-    const provider = loadUserStorageProvider();
+    const provider = loadUserStorageProvider(ownerId);
     const response = await fetch(`/api/v1/files/${encodeURIComponent(id)}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },

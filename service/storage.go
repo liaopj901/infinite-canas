@@ -129,9 +129,27 @@ func PublicStorageConfig() (model.PublicStorageSetting, error) {
 	}, nil
 }
 
-// StorageObjectInfo 获取存储对象元数据。
-func StorageObjectInfo(id string) (model.StorageObject, error) {
-	return repository.GetStorageObject(id)
+// StorageObjectInfo 获取当前用户有权访问的存储对象元数据。
+func StorageObjectInfo(ctx context.Context, id string) (model.StorageObject, error) {
+	object, err := repository.GetStorageObject(id)
+	if err != nil {
+		return model.StorageObject{}, err
+	}
+	if err := requireStorageObjectOwner(ctx, object); err != nil {
+		return model.StorageObject{}, err
+	}
+	return object, nil
+}
+
+func requireStorageObjectOwner(ctx context.Context, object model.StorageObject) error {
+	user, ok := UserFromContext(ctx)
+	if !ok || user.ID == "" || user.Role == model.UserRoleGuest {
+		return errors.New("未登录或权限不足")
+	}
+	if object.CreatedBy != user.ID {
+		return errors.New("无权访问该对象")
+	}
+	return nil
 }
 
 // SaveCurrentUserStorageProvider 保存用户配置的存储提供商。
@@ -395,10 +413,13 @@ func RefreshStorageCapacityScheduler() {
 	}
 }
 
-// DownloadStorageObject 下载存储对象内容。
-func DownloadStorageObject(id string) (DownloadedStorageObject, error) {
+// DownloadStorageObject 下载当前用户有权访问的存储对象内容。
+func DownloadStorageObject(ctx context.Context, id string) (DownloadedStorageObject, error) {
 	object, err := repository.GetStorageObject(id)
 	if err != nil {
+		return DownloadedStorageObject{}, err
+	}
+	if err := requireStorageObjectOwner(ctx, object); err != nil {
 		return DownloadedStorageObject{}, err
 	}
 
