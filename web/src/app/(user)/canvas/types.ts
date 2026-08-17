@@ -60,6 +60,9 @@ export type CanvasNodeMetadata = {
     audioFormat?: string;
     audioSpeed?: string;
     audioInstructions?: string;
+    glmTtsVoice?: string;
+    glmTtsFormat?: string;
+    glmTtsSpeed?: string;
     mimoTtsVoice?: string;
     mimoTtsFormat?: string;
     mimoVoiceDesignPrompt?: string;
@@ -111,6 +114,14 @@ export type CanvasDirectorPanorama = {
 export type CanvasDirectorCapture = {
     dataUrl: string;
     fileName: string;
+};
+
+export type CanvasDirectorVideo = {
+    blob: Blob;
+    fileName: string;
+    width: number;
+    height: number;
+    durationSeconds: number;
 };
 
 export type CanvasNodeData = {
@@ -210,7 +221,7 @@ export type CanvasAgentToolCall = {
 
 export type CanvasAgentProtocolMessage =
     | { role: "user" | "system"; content: CanvasAgentContent }
-    | { role: "assistant"; content?: string; toolCalls?: CanvasAgentToolCall[] }
+    | { role: "assistant"; content?: string; reasoningContent?: string; toolCalls?: CanvasAgentToolCall[] }
     | { role: "tool"; content: string; toolCallId: string; name: string };
 
 export type CanvasAssistantMessageStatus = "thinking" | "running" | "waiting" | "success" | "error";
