@@ -846,21 +846,23 @@ export default function ImagePage() {
         await deleteImageGenerationLogs(taskToken, ids).catch(() => undefined);
     };
 
-    const deleteSelectedLogs = () => {
+    const deleteSelectedLogs = async () => {
         const ownerId = accountOwnerId;
         const taskToken = token;
         const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         const deletedLogs = logs.filter((log) => selectedLogIds.includes(log.id));
         const nextLogs = logs.filter((log) => !selectedLogIds.includes(log.id));
         const imageKeys = disposableLogStorageKeys(deletedLogs, nextLogs);
-        void Promise.all([deleteBackendImageTasks(deletedLogs, ownerId, taskToken), deleteAccountImageLogs(deletedLogs, ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), ...deletedLogs.map((log) => logStore.removeItem(imageLogStorageKey(log.id, ownerId)))]).then(async () => {
-            if (!isCurrentAccount()) return;
-            setLogs(nextLogs);
-            setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
-            await persistImageHistory(nextLogs, categories, ownerId, taskToken);
-            if (!isCurrentAccount()) return;
-            await refreshLogs(ownerId, taskToken);
-        });
+        await Promise.all([deleteBackendImageTasks(deletedLogs, ownerId, taskToken), deleteAccountImageLogs(deletedLogs, ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), ...deletedLogs.map((log) => logStore.removeItem(imageLogStorageKey(log.id, ownerId)))]);
+        if (!isCurrentAccount()) return;
+        // 删除已经落地后立即关闭弹窗并清空选择，避免刷新失败时用户重复提交同一批删除。
+        setDeleteConfirmOpen(false);
+        setSelectedLogIds([]);
+        setLogs(nextLogs);
+        setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
+        await persistImageHistory(nextLogs, categories, ownerId, taskToken);
+        if (!isCurrentAccount()) return;
+        await refreshLogs(ownerId, taskToken);
     };
 
     const deleteLog = (log: GenerationLog) => {

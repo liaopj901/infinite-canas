@@ -72,7 +72,8 @@ func GeneratedImageContent(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		FailError(w, err)
+		// 内容接口必须返回非 2xx，否则前端会把错误 JSON 当作图片 Blob，最终只表现为空白图片。
+		FailErrorWithStatus(w, http.StatusInternalServerError, err)
 		return
 	}
 	if content.RedirectURL != "" {

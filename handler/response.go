@@ -42,6 +42,15 @@ func FailError(w http.ResponseWriter, err error) {
 	Fail(w, "操作失败")
 }
 
+func FailErrorWithStatus(w http.ResponseWriter, status int, err error) {
+	log.Printf("request failed: %v", err)
+	if safe, ok := err.(interface{ SafeMessage() string }); ok {
+		FailWithStatus(w, status, safe.SafeMessage())
+		return
+	}
+	FailWithStatus(w, status, "操作失败")
+}
+
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)

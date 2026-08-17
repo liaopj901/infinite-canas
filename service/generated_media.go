@@ -19,6 +19,11 @@ import (
 	"gorm.io/gorm"
 )
 
+const (
+	generatedMediaDirectoryMode os.FileMode = 0o755
+	generatedMediaFileMode      os.FileMode = 0o644
+)
+
 var (
 	// ErrGeneratedMediaCleaned 用于让内容接口明确返回 410，而不是伪装成普通 404。
 	ErrGeneratedMediaCleaned  = errors.New("图片已被清理")
@@ -136,7 +141,11 @@ func ReadGeneratedMediaContent(ctx context.Context, id string) (GeneratedMediaCo
 		return GeneratedMediaContent{}, ErrGeneratedMediaCleaned
 	}
 	if err != nil {
-		return GeneratedMediaContent{}, err
+		return GeneratedMediaContent{}, generatedMediaStorageFailure("服务器无法读取生成图片，请检查 GENERATED_MEDIA_DIR 和文件权限", err)
+	}
+	// 顺手修复旧版本创建的 0600 文件，避免容器重启或多进程切换用户后再次无法读取。
+	if err := os.Chmod(path, generatedMediaFileMode); err != nil {
+		log.Printf("normalize generated media %s permission failed: %v", media.ID, err)
 	}
 	return GeneratedMediaContent{Media: media, Data: data}, nil
 }
@@ -224,16 +233,22 @@ func writeGeneratedMedia(userID string, filename string, contentType string, dat
 	if err != nil {
 		return model.GeneratedMedia{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(absolutePath), 0755); err != nil {
-		return model.GeneratedMedia{}, err
+	if err := ensureGeneratedMediaDirectory(filepath.Dir(absolutePath)); err != nil {
+		return model.GeneratedMedia{}, generatedMediaStorageFailure("生成图片无法写入服务器，请检查 GENERATED_MEDIA_DIR 和目录权限", err)
 	}
 	temporaryPath := absolutePath + ".tmp"
-	if err := os.WriteFile(temporaryPath, data, 0600); err != nil {
-		return model.GeneratedMedia{}, err
+	if err := os.WriteFile(temporaryPath, data, 0o600); err != nil {
+		_ = os.Remove(temporaryPath)
+		return model.GeneratedMedia{}, generatedMediaStorageFailure("生成图片无法写入服务器，请检查 GENERATED_MEDIA_DIR 和目录权限", err)
+	}
+	// 临时文件写完后再开放读取权限，避免其他进程读到未完成内容；显式 Chmod 不受 umask 影响。
+	if err := os.Chmod(temporaryPath, generatedMediaFileMode); err != nil {
+		_ = os.Remove(temporaryPath)
+		return model.GeneratedMedia{}, generatedMediaStorageFailure("生成图片权限设置失败，请检查 GENERATED_MEDIA_DIR 所在文件系统", err)
 	}
 	if err := os.Rename(temporaryPath, absolutePath); err != nil {
 		_ = os.Remove(temporaryPath)
-		return model.GeneratedMedia{}, err
+		return model.GeneratedMedia{}, generatedMediaStorageFailure("生成图片无法写入服务器，请检查 GENERATED_MEDIA_DIR 和目录权限", err)
 	}
 	fileName := filepath.Base(strings.TrimSpace(filename))
 	if fileName == "" || fileName == "." {
@@ -327,11 +342,7 @@ func generatedMediaAbsolutePath(relativePath string) (string, error) {
 	if relativePath == "" || filepath.IsAbs(relativePath) {
 		return "", fmt.Errorf("生成图片相对路径无效")
 	}
-	root := strings.TrimSpace(config.Cfg.GeneratedMediaDir)
-	if root == "" {
-		root = "data/generated-images"
-	}
-	absoluteRoot, err := filepath.Abs(root)
+	absoluteRoot, err := generatedMediaRoot()
 	if err != nil {
 		return "", err
 	}
@@ -344,4 +355,40 @@ func generatedMediaAbsolutePath(relativePath string) (string, error) {
 		return "", fmt.Errorf("生成图片路径越界")
 	}
 	return absolutePath, nil
+}
+
+func generatedMediaStorageFailure(message string, err error) error {
+	log.Printf("generated media storage failed: %v", err)
+	return safeMessageError{message: message}
+}
+
+func generatedMediaRoot() (string, error) {
+	root := strings.TrimSpace(config.Cfg.GeneratedMediaDir)
+	if root == "" {
+		root = "data/generated-images"
+	}
+	return filepath.Abs(root)
+}
+
+func ensureGeneratedMediaDirectory(directory string) error {
+	absoluteRoot, err := generatedMediaRoot()
+	if err != nil {
+		return err
+	}
+	relativeDirectory, err := filepath.Rel(absoluteRoot, directory)
+	if err != nil || relativeDirectory == ".." || strings.HasPrefix(relativeDirectory, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("生成图片目录越界")
+	}
+	if err := os.MkdirAll(directory, generatedMediaDirectoryMode); err != nil {
+		return fmt.Errorf("创建生成图片目录失败: %w", err)
+	}
+	// MkdirAll 的 mode 会被 umask 过滤，并且不会修复已有目录，因此逐层显式校正到可遍历权限。
+	for current := directory; ; current = filepath.Dir(current) {
+		if err := os.Chmod(current, generatedMediaDirectoryMode); err != nil {
+			return fmt.Errorf("设置生成图片目录权限失败: %w", err)
+		}
+		if current == absoluteRoot {
+			return nil
+		}
+	}
 }

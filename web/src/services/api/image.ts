@@ -3,7 +3,7 @@ import axios from "axios";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { isKIESeedreamLayerDecompositionModel } from "@/lib/kie-models";
 import { isMimoChannel, mimoModels } from "@/lib/mimo-tts";
-import { imageToDataUrl, resolveImageUrl } from "@/services/image-storage";
+import { imageToDataUrl, isProtectedImageUrl, resolveImageUrl } from "@/services/image-storage";
 import { buildApiUrl, channelIdForActiveModel, directAIProviderForConfig, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
@@ -1327,7 +1327,8 @@ function applyAgnesImageSize(
 }
 
 function publicHttpUrl(value?: string) {
-    if (!value || value.startsWith("blob:") || value.startsWith("data:")) return "";
+    // 站内私有媒体接口需要登录令牌，上游模型访问只会得到 401，必须降级为 data URL。
+    if (!value || value.startsWith("blob:") || value.startsWith("data:") || isProtectedImageUrl(value)) return "";
     try {
         const url = new URL(value, typeof window === "undefined" ? undefined : window.location.origin);
         if (!["http:", "https:"].includes(url.protocol)) return "";

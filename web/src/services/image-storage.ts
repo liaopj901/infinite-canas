@@ -69,6 +69,17 @@ const serverUrls = new Map<string, string>();
 function serverUrlCacheKey(ownerId: string, id: string) {
     return `${ownerId}:${id}`;
 }
+
+export function isProtectedImageUrl(value?: string) {
+    if (!value) return false;
+    try {
+        const appOrigin = typeof window === "undefined" ? "http://local.invalid" : window.location.origin;
+        const url = new URL(value, appOrigin);
+        return url.origin === appOrigin && /^\/api\/(?:files\/[^/]+\/content|v1\/generated-images\/[^/]+\/content)$/.test(url.pathname);
+    } catch {
+        return false;
+    }
+}
 export const USER_STORAGE_PROVIDER_KEY = "infinite-canvas:user_storage_provider";
 export const USER_WEBDAV_STORAGE_PROVIDER_KEY = "infinite-canvas:user_webdav_storage_provider";
 let storageConfigPromise: Promise<StorageConfig> | null = null;
@@ -188,9 +199,14 @@ export async function uploadRemoteImageToServer(url: string, filename: string, r
     const uploadResponse = await fetch("/api/v1/files", { method: "POST", headers: { Authorization: "Bearer " + token }, body: formData });
     const payload = (await uploadResponse.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedImage } | null;
     if (!uploadResponse.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "服务端图片上传失败");
-    const meta = await readImageMeta(payload.data.url);
-    if (payload.data.storageKey?.startsWith("server:")) serverUrls.set(serverUrlCacheKey(requestOwnerId, payload.data.storageKey.slice("server:".length)), payload.data.url);
-    return { ...payload.data, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
+    const storageKey = payload.data.storageKey;
+    const displayUrl = isProtectedImageUrl(payload.data.url) ? URL.createObjectURL(blob) : payload.data.url;
+    if (storageKey?.startsWith("server:")) {
+        if (isProtectedImageUrl(payload.data.url)) objectUrls.set(storageKey, displayUrl);
+        else serverUrls.set(serverUrlCacheKey(requestOwnerId, storageKey.slice("server:".length)), payload.data.url);
+    }
+    const meta = await readImageMeta(displayUrl);
+    return { ...payload.data, url: displayUrl, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
 }
 
 export async function saveGeneratedImage(
@@ -221,6 +237,7 @@ export async function saveGeneratedImage(
     if (!response.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "生成图片保存失败");
     if (getAccountOwnerId() !== requestOwnerId || useUserStore.getState().token !== requestToken) return payload.data;
     const url = await resolveImageUrl(payload.data.storageKey, payload.data.url);
+    if (!url) throw new Error("生成图片已保存，但服务器无法读取本地文件");
     return {
         ...payload.data,
         url,
@@ -290,7 +307,7 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
             return url;
         }
         const cachedUrl = serverUrls.get(serverUrlCacheKey(ownerId, id));
-        if (cachedUrl) return cachedUrl;
+        if (cachedUrl && !isProtectedImageUrl(cachedUrl)) return cachedUrl;
         const info = await apiGet<{ publicUrl?: string }>(`/api/files/${encodeURIComponent(id)}`, undefined, token).catch(() => null);
         if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
         if (!info) return fallback;
@@ -299,7 +316,9 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
             return info.publicUrl;
         }
         if (!token) return fallback;
-        const response = await fetch(`/api/files/${encodeURIComponent(id)}/content`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+        // 私有对象地址只能由浏览器携带站内令牌读取，不能直接作为公开参考图地址交给上游模型。
+        const contentUrl = cachedUrl && isProtectedImageUrl(cachedUrl) ? cachedUrl : `/api/files/${encodeURIComponent(id)}/content`;
+        const response = await fetch(contentUrl, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
         if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
         const privateBlob = await response.blob();
         const url = URL.createObjectURL(privateBlob);
@@ -336,9 +355,14 @@ async function maybeUploadImageToServer(blob: Blob, requestToken: string | null,
         if (!canUseGlobalProvider) return null;
         throw new Error(payload?.msg || "服务端图片上传失败");
     }
-    const meta = await readImageMeta(payload.data.url);
-    if (payload.data.storageKey?.startsWith("server:")) serverUrls.set(serverUrlCacheKey(requestOwnerId, payload.data.storageKey.slice("server:".length)), payload.data.url);
-    return { ...payload.data, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
+    const storageKey = payload.data.storageKey;
+    const displayUrl = isProtectedImageUrl(payload.data.url) ? URL.createObjectURL(blob) : payload.data.url;
+    if (storageKey?.startsWith("server:")) {
+        if (isProtectedImageUrl(payload.data.url)) objectUrls.set(storageKey, displayUrl);
+        else serverUrls.set(serverUrlCacheKey(requestOwnerId, storageKey.slice("server:".length)), payload.data.url);
+    }
+    const meta = await readImageMeta(displayUrl);
+    return { ...payload.data, url: displayUrl, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
 }
 
 export async function loadStorageConfig() {
@@ -564,6 +588,9 @@ async function deleteLocalGeneratedImage(storageKey: string, ownerId = getAccoun
 async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId(), token = useUserStore.getState().token) {
     const id = storageKey.slice("server:".length);
     if (!id) return;
+    const url = objectUrls.get(storageKey);
+    if (url) URL.revokeObjectURL(url);
+    objectUrls.delete(storageKey);
     serverUrls.delete(serverUrlCacheKey(ownerId, id));
     if (!token) return;
     const provider = loadUserStorageProvider(ownerId);
