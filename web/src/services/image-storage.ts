@@ -70,15 +70,22 @@ function serverUrlCacheKey(ownerId: string, id: string) {
     return `${ownerId}:${id}`;
 }
 
-export function isProtectedImageUrl(value?: string) {
-    if (!value) return false;
+function protectedImagePath(value?: string) {
+    if (!value) return "";
     try {
         const appOrigin = typeof window === "undefined" ? "http://local.invalid" : window.location.origin;
         const url = new URL(value, appOrigin);
-        return url.origin === appOrigin && /^\/api\/(?:files\/[^/]+\/content|v1\/generated-images\/[^/]+\/content)$/.test(url.pathname);
+        if (!/^\/api\/(?:files\/[^/]+\/content|v1\/generated-images\/[^/]+\/content)$/.test(url.pathname)) {
+            return "";
+        }
+        return `${url.pathname}${url.search}`;
     } catch {
-        return false;
+        return "";
     }
+}
+
+export function isProtectedImageUrl(value?: string) {
+    return Boolean(protectedImagePath(value));
 }
 export const USER_STORAGE_PROVIDER_KEY = "infinite-canvas:user_storage_provider";
 export const USER_WEBDAV_STORAGE_PROVIDER_KEY = "infinite-canvas:user_webdav_storage_provider";
@@ -153,60 +160,17 @@ export async function uploadImage(input: string | Blob, options: UploadImageOpti
     const requestOwnerId = getAccountOwnerId();
     const requestToken = useUserStore.getState().token;
     const url = typeof input === "string" ? getProxyUrl(input) : input;
-    let blob: Blob;
-    if (typeof url === "string") {
-        const response = await fetch(url);
-        if (!response.ok) {
-            const payload = await response.json().catch(() => null) as { msg?: string } | null;
-            throw new Error(payload?.msg || `代理图片拉取失败：${response.status}`);
-        }
-        const contentType = response.headers.get("content-type") || "";
-        if (contentType.includes("application/json")) {
-            const payload = await response.json().catch(() => null) as { msg?: string } | null;
-            throw new Error(payload?.msg || "代理图片下载失败");
-        }
-        blob = await response.blob();
-    } else {
-        blob = url;
+    const blob = await loadImageBlob(url);
+    if (!options.localOnly && requestToken) {
+        return uploadImageBlobToGeneratedMedia(blob, `image-${nanoid()}.${imageExtension(blob.type)}`, requestToken, requestOwnerId);
     }
-    if (!options.localOnly) {
-        const serverUpload = await maybeUploadImageToServer(blob, requestToken, requestOwnerId);
-        if (serverUpload) return serverUpload;
-    }
-    const storageKey = `image:${nanoid()}`;
-    await store.setItem(storageKey, blob);
-    const urlObj = URL.createObjectURL(blob);
-    objectUrls.set(storageKey, urlObj);
-    const meta = await readImageMeta(urlObj);
-    return { url: urlObj, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type || meta.mimeType };
+    return saveImageToBrowser(blob);
 }
 
 export async function uploadRemoteImageToServer(url: string, filename: string, requestToken = useUserStore.getState().token, requestOwnerId = getAccountOwnerId()): Promise<UploadedImage> {
-    const response = await fetch(getProxyUrl(url));
-    if (!response.ok) {
-        const payload = await response.json().catch(() => null) as { msg?: string } | null;
-        throw new Error(payload?.msg || "代理图片拉取失败：" + response.status);
-    }
-    const blob = await response.blob();
-    const config = await loadStorageConfig();
-    const userProvider = config.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
-    if (!canUseGlobalStorage(config) && !userProvider) throw new Error("服务端对象存储未启用");
-    const token = requestToken;
-    if (!token) throw new Error("服务端存储需要先登录");
-    const formData = new FormData();
-    formData.append("file", blob, filename || "image-" + nanoid() + "." + imageExtension(blob.type));
-    if (userProvider) formData.append("provider", JSON.stringify(toProviderPayload(userProvider)));
-    const uploadResponse = await fetch("/api/v1/files", { method: "POST", headers: { Authorization: "Bearer " + token }, body: formData });
-    const payload = (await uploadResponse.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedImage } | null;
-    if (!uploadResponse.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "服务端图片上传失败");
-    const storageKey = payload.data.storageKey;
-    const displayUrl = isProtectedImageUrl(payload.data.url) ? URL.createObjectURL(blob) : payload.data.url;
-    if (storageKey?.startsWith("server:")) {
-        if (isProtectedImageUrl(payload.data.url)) objectUrls.set(storageKey, displayUrl);
-        else serverUrls.set(serverUrlCacheKey(requestOwnerId, storageKey.slice("server:".length)), payload.data.url);
-    }
-    const meta = await readImageMeta(displayUrl);
-    return { ...payload.data, url: displayUrl, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
+    if (!requestToken) throw new Error("服务端存储需要先登录");
+    const blob = await loadImageBlob(getProxyUrl(url));
+    return uploadImageBlobToGeneratedMedia(blob, filename || `image-${nanoid()}.${imageExtension(blob.type)}`, requestToken, requestOwnerId);
 }
 
 export async function saveGeneratedImage(
@@ -297,7 +261,7 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
         const ownerId = getAccountOwnerId();
         const token = useUserStore.getState().token;
         const id = storageKey.slice("server:".length);
-        if (fallback && !fallback.startsWith("blob:") && !fallback.includes("/api/files/")) return fallback;
+        if (fallback && !fallback.startsWith("blob:") && !isProtectedImageUrl(fallback)) return fallback;
         const cached = objectUrls.get(storageKey);
         if (cached) return cached;
         const blob = await store.getItem<Blob>(storageKey).catch(() => null);
@@ -310,14 +274,13 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
         if (cachedUrl && !isProtectedImageUrl(cachedUrl)) return cachedUrl;
         const info = await apiGet<{ publicUrl?: string }>(`/api/files/${encodeURIComponent(id)}`, undefined, token).catch(() => null);
         if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
-        if (!info) return fallback;
-        if (info.publicUrl) {
+        if (info?.publicUrl) {
             serverUrls.set(serverUrlCacheKey(ownerId, id), info.publicUrl);
             return info.publicUrl;
         }
         if (!token) return fallback;
         // 私有对象地址只能由浏览器携带站内令牌读取，不能直接作为公开参考图地址交给上游模型。
-        const contentUrl = cachedUrl && isProtectedImageUrl(cachedUrl) ? cachedUrl : `/api/files/${encodeURIComponent(id)}/content`;
+        const contentUrl = protectedImagePath(cachedUrl) || protectedImagePath(fallback) || `/api/files/${encodeURIComponent(id)}/content`;
         const response = await fetch(contentUrl, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
         if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
         const privateBlob = await response.blob();
@@ -335,34 +298,27 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
     return url;
 }
 
-async function maybeUploadImageToServer(blob: Blob, requestToken: string | null, requestOwnerId: string): Promise<UploadedImage | null> {
-    const config = await loadStorageConfig().catch(() => null);
-    const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
-    const canUseGlobalProvider = config ? canUseGlobalStorage(config) : false;
-    const useServerStorage = canUseGlobalProvider || Boolean(userProvider);
-    if (!config || !useServerStorage) return null;
-    const token = requestToken;
-    if (!token) {
-        if (canUseGlobalProvider) throw new Error("服务端存储需要先登录");
-        return null;
+async function uploadImageBlobToGeneratedMedia(blob: Blob, filename: string, requestToken: string, requestOwnerId: string) {
+    const previewUrl = URL.createObjectURL(blob);
+    try {
+        const meta = await readImageMeta(previewUrl);
+        const config = await loadStorageConfig().catch(() => null);
+        const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
+        const autoUpload = Boolean(config && (canUseGlobalStorage(config) || userProvider));
+        // 登录用户的图片先由服务器落盘，云端只是可选同步；这样云端故障不会阻断素材和参考图上传。
+        return await saveGeneratedImage(blob, filename, meta.width, meta.height, autoUpload, requestToken, requestOwnerId);
+    } finally {
+        URL.revokeObjectURL(previewUrl);
     }
-    const formData = new FormData();
-    formData.append("file", blob, `image-${nanoid()}.${imageExtension(blob.type)}`);
-    if (userProvider) formData.append("provider", JSON.stringify(toProviderPayload(userProvider)));
-    const response = await fetch("/api/v1/files", { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: formData });
-    const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedImage } | null;
-    if (!response.ok || payload?.code !== 0 || !payload.data) {
-        if (!canUseGlobalProvider) return null;
-        throw new Error(payload?.msg || "服务端图片上传失败");
-    }
-    const storageKey = payload.data.storageKey;
-    const displayUrl = isProtectedImageUrl(payload.data.url) ? URL.createObjectURL(blob) : payload.data.url;
-    if (storageKey?.startsWith("server:")) {
-        if (isProtectedImageUrl(payload.data.url)) objectUrls.set(storageKey, displayUrl);
-        else serverUrls.set(serverUrlCacheKey(requestOwnerId, storageKey.slice("server:".length)), payload.data.url);
-    }
-    const meta = await readImageMeta(displayUrl);
-    return { ...payload.data, url: displayUrl, width: payload.data.width || meta.width, height: payload.data.height || meta.height, mimeType: payload.data.mimeType || blob.type || "image/png", bytes: payload.data.bytes || blob.size };
+}
+
+async function saveImageToBrowser(blob: Blob): Promise<UploadedImage> {
+    const storageKey = `image:${nanoid()}`;
+    await store.setItem(storageKey, blob);
+    const url = URL.createObjectURL(blob);
+    objectUrls.set(storageKey, url);
+    const meta = await readImageMeta(url);
+    return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type || meta.mimeType };
 }
 
 export async function loadStorageConfig() {
@@ -565,6 +521,10 @@ async function loadImageBlob(input: string | Blob) {
     if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as { msg?: string } | null;
         throw new Error(payload?.msg || `代理图片拉取失败：${response.status}`);
+    }
+    if ((response.headers.get("content-type") || "").includes("application/json")) {
+        const payload = (await response.json().catch(() => null)) as { msg?: string } | null;
+        throw new Error(payload?.msg || "代理图片下载失败");
     }
     return response.blob();
 }

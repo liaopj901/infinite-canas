@@ -1,15 +1,15 @@
 package handler
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/tigerowo/infinite-canvas/config"
 	"github.com/google/uuid"
+	"github.com/tigerowo/infinite-canvas/config"
+	"github.com/tigerowo/infinite-canvas/service"
 )
 
 const (
@@ -33,8 +33,8 @@ type referenceMediaUploadResult struct {
 func UploadReferenceMedia(w http.ResponseWriter, r *http.Request) {
 	publicBaseURL := strings.TrimRight(strings.TrimSpace(config.Cfg.PublicBaseURL), "/")
 	if publicBaseURL == "" {
-		Fail(w, "未配置 PUBLIC_BASE_URL，无法把本地参考素材提供给火山方舟访问")
-		return
+		// 站内上传先保证可访问；若上游模型需要回调读取，部署时仍必须配置公网 PUBLIC_BASE_URL。
+		publicBaseURL = strings.TrimRight(strings.TrimSpace(service.RequestOrigin(r)), "/")
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, referenceMediaMaxBytes+1)
 	if err := r.ParseMultipartForm(referenceMediaMaxBytes); err != nil {
@@ -86,7 +86,7 @@ func UploadReferenceMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	OK(w, referenceMediaUploadResult{
 		ID:       id,
-		URL:      fmt.Sprintf("%s/api/media/references/%s", publicBaseURL, id),
+		URL:      publicBaseURL + "/api/media/references/" + id,
 		MimeType: mimeType,
 		Bytes:    bytes,
 	})

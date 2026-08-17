@@ -244,17 +244,25 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `progress` | number | 生成进度 |
 | `prompt` | text | 提示词 |
 | `generation_type` | string | `generation` 或 `edit` |
-| `image_url` | text | 完成后图片 URL或第一张图片 URL |
-| `image_urls` | JSON | 完成后全部图片 URL，第一项与 `image_url` 一致 |
-| `storage_key` | string | 存储对象 key |
+| `response_body` | text | 精简生成结果 JSON，只保存本机或云端图片 URL，不保存图片字节、Base64 或 data URL |
+| `image_url` | text | 完成后图片 URL 或第一张图片 URL；服务器本地文件保存完整站内内容接口 URL，云端上传成功后覆盖为公开云端 URL；私有云端没有公开地址时保存完整站内 `/api/files/:id/content` URL |
+| `image_urls` | JSON | 完成后全部图片 URL，第一项与 `image_url` 一致；本地和私有对象均保存完整可定位地址，不包含图片字节 |
+| `storage_key` | string | 第一张图片的存储对象 key；`local:` 表示服务器本地文件，上传成功后更新为 `server:` |
+| `width` | number | 第一张本机图片的像素宽度，远程 URL 未读取时为 `0` |
+| `height` | number | 第一张本机图片的像素高度，远程 URL 未读取时为 `0` |
+| `mime_type` | string | 第一张本机图片的媒体类型，远程 URL 未读取时为空 |
+| `bytes` | number | 第一张本机图片的字节数值，不包含图片内容 |
 | `error` | text | 失败摘要 |
 | `error_detail` | text | 失败详情 |
 | `created_at` | string | 创建时间 |
 | `updated_at` | string | 更新时间 |
 | `started_at` | string | 开始时间 |
 | `completed_at` | string | 完成时间 |
+| `deleted_at` | string | 软删除时间，空字符串表示任务有效 |
 
-索引：`idx_canvas_image_tasks_user_source_node (user_id, source, source_id, node_id)`
+索引：`idx_canvas_image_tasks_user_source_node (user_id, source, source_id, node_id)`、`idx_canvas_image_tasks_user_deleted_created (user_id, deleted_at, created_at)`
+
+删除图片任务只写入 `deleted_at`，正常单条、列表和批量查询均排除软删除记录。软删除时同步清空请求、响应、错误详情和图片结果字段，避免旧任务中的大数据继续占用数据库空间。
 
 ### canvas_audio_tasks
 

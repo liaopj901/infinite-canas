@@ -4,10 +4,10 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tigerowo/infinite-canvas/handler"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/service"
-	"github.com/gin-gonic/gin"
 )
 
 func AdminAuth(c *gin.Context) {
@@ -17,7 +17,7 @@ func AdminAuth(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	c.Request = c.Request.WithContext(service.WithUser(c.Request.Context(), user))
+	setRequestContext(c, &user)
 	c.Next()
 }
 
@@ -28,15 +28,25 @@ func UserAuth(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	c.Request = c.Request.WithContext(service.WithUser(c.Request.Context(), user))
+	setRequestContext(c, &user)
 	c.Next()
 }
 
 func OptionalAuth(c *gin.Context) {
 	if user, ok := authUser(c); ok {
-		c.Request = c.Request.WithContext(service.WithUser(c.Request.Context(), user))
+		setRequestContext(c, &user)
+	} else {
+		setRequestContext(c, nil)
 	}
 	c.Next()
+}
+
+func setRequestContext(c *gin.Context, user *model.AuthUser) {
+	ctx := service.WithRequestOrigin(c.Request.Context(), service.RequestOrigin(c.Request))
+	if user != nil {
+		ctx = service.WithUser(ctx, *user)
+	}
+	c.Request = c.Request.WithContext(ctx)
 }
 
 func NotFoundJSON(c *gin.Context) {

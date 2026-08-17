@@ -116,7 +116,7 @@ func proxyAIVideoTaskRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	payload, status, err := doAIRequest(request, channel)
+	payload, status, err := doVideoAIRequest(request, channel)
 	if err != nil {
 		if credits > 0 {
 			refundVideoCredits(user.ID, modelName, credits, upstreamPath)
@@ -258,7 +258,7 @@ func pollVideoTaskFromUpstream(task model.VideoTask) (service.VideoTaskPollUpdat
 		UserDisplayName: task.UserDisplayName,
 		RequestBody:     fmt.Sprintf(`{"taskId":%q}`, pollID),
 	}
-	payload, status, err := doAIRequest(request, channel)
+	payload, status, err := doVideoAIRequest(request, channel)
 	if err != nil {
 		saveAIProxyLog(logContext, 0, "", err.Error())
 		return service.VideoTaskPollUpdate{}, err
@@ -308,7 +308,8 @@ func normalizeVideoCreateBody(body []byte, contentType string, modelName string,
 	return body, contentType, nil
 }
 
-func doAIRequest(request *http.Request, channel model.ModelChannel) ([]byte, int, error) {
+// 视频接口需要同时读取响应体和状态码，不能复用流式 AI 请求函数。
+func doVideoAIRequest(request *http.Request, channel model.ModelChannel) ([]byte, int, error) {
 	response, err := service.HTTPClientForChannel(channel).Do(request)
 	if err != nil {
 		return nil, 0, err

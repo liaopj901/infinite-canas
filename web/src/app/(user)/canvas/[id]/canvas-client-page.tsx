@@ -13,7 +13,7 @@ import { createCanvasImageTask, pollCanvasImageTaskStatus, requestImageQuestion,
 import { createCanvasAudioTask, pollCanvasAudioTaskStatus, type CanvasAudioTask } from "@/services/api/audio";
 import { createVideoGenerationTask, pollVideoGenerationTaskStatus, VIDEO_POLL_INTERVAL_MS, type VideoResponse } from "@/services/api/video";
 import { defaultConfig, type AiConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import { collectImageStorageKeys, deleteStoredImages, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
+import { collectImageStorageKeys, deleteStoredImages, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadGeneratedImageToCloud, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
 import { resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
@@ -2002,8 +2002,9 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         uploadingImageNodeIdsRef.current.add(node.id);
         const hideLoading = automatic ? () => undefined : message.loading("正在上传图片至云存储...", 0);
         try {
-            const imageUrl = await resolveImageUrl(node.metadata.storageKey, node.metadata.content);
-            const uploaded = await uploadRemoteImageToServer(imageUrl, "canvas-image-" + node.id + ".png", taskToken, ownerId);
+            const uploaded = node.metadata.storageKey?.startsWith("local:")
+                ? await uploadGeneratedImageToCloud(node.metadata.storageKey, taskToken, ownerId)
+                : await uploadRemoteImageToServer(await resolveImageUrl(node.metadata.storageKey, node.metadata.content), "canvas-image-" + node.id + ".png", taskToken, ownerId);
             if (!isCurrentAccount()) return;
             setNodes((nodes) => nodes.map((item) => (item.id === node.id ? {
                 ...item,
@@ -2047,7 +2048,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                             shouldAutoSyncGeneratedMedia(storageConfig, node.metadata?.channelMode || "remote") &&
                             node.metadata?.status === NODE_STATUS_SUCCESS &&
                             Boolean(node.metadata.content) &&
-                            !node.metadata.storageKey &&
+                            !node.metadata.storageKey?.startsWith("server:") &&
                             Boolean(node.metadata.imageTaskId),
                     )
                     .forEach((node) => {
@@ -4795,7 +4796,7 @@ function applyCanvasImageTaskUpdate(nodes: CanvasNodeData[], nodeId: string, tas
                 content: url,
                 status: NODE_STATUS_SUCCESS,
                 progress: 100,
-                storageKey: "",
+                storageKey: task.storageKeys?.[index] || (index === 0 ? task.storageKey || "" : ""),
                 mimeType: "image/png",
                 bytes: 0,
                 imageTaskId: undefined,

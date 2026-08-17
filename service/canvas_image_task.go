@@ -1,11 +1,13 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/repository"
-	"github.com/google/uuid"
 )
 
 type CanvasImageTaskCreateInput struct {
@@ -81,16 +83,38 @@ func BatchUserCanvasImageTasks(userID string, ids []string) ([]map[string]any, e
 }
 
 func DeleteUserCanvasImageTask(userID string, id string) error {
-	return repository.DeleteUserCanvasImageTask(strings.TrimSpace(userID), strings.TrimSpace(id))
+	return repository.DeleteUserCanvasImageTask(strings.TrimSpace(userID), strings.TrimSpace(id), now())
 }
 
 func DeleteUserCanvasTasks(userID string, sourceID string, nodeIDs []string) error {
-	return repository.DeleteUserCanvasTasks(strings.TrimSpace(userID), strings.TrimSpace(sourceID), nodeIDs)
+	return repository.DeleteUserCanvasTasks(strings.TrimSpace(userID), strings.TrimSpace(sourceID), nodeIDs, now())
 }
 
 func SaveCanvasImageTask(task model.CanvasImageTask) (model.CanvasImageTask, error) {
 	task.UpdatedAt = now()
 	return repository.UpdateCanvasImageTask(task)
+}
+
+func syncCanvasImageTasksAfterGeneratedMediaUpload(ctx context.Context, userID string, generatedMediaID string, view GeneratedMediaView) error {
+	generatedMediaID = strings.TrimSpace(generatedMediaID)
+	cloudURL := strings.TrimSpace(view.URL)
+	cloudStorageKey := strings.TrimSpace(view.StorageKey)
+	if generatedMediaID == "" || cloudURL == "" || !strings.HasPrefix(cloudStorageKey, "server:") {
+		return errors.New("生成图片云端存储信息不完整")
+	}
+	localStorageKey := "local:" + generatedMediaID
+	localPath := "/api/v1/generated-images/" + generatedMediaID + "/content"
+	localURL := absoluteAppURL(ctx, localPath)
+	// image_url、image_urls 和 response_body 都是展示冗余字段，上传成功后必须一次性替换，不能永久引用已删除的本机文件。
+	return repository.UpdateUserCanvasImageTasksAfterGeneratedMediaUpload(
+		userID,
+		localStorageKey,
+		localURL,
+		localPath,
+		cloudStorageKey,
+		cloudURL,
+		now(),
+	)
 }
 
 func CanvasImageTaskResponse(task model.CanvasImageTask) map[string]any {
@@ -156,4 +180,3 @@ func normalizeCanvasImageTaskSources(sources []string) []string {
 	}
 	return result
 }
-

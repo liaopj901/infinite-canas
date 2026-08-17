@@ -84,7 +84,7 @@ func CreateCanvasImageTask(w http.ResponseWriter, r *http.Request) {
 		Fail(w, "AI 接口请求失败")
 		return
 	}
-	taskContext, taskRun := registerCanvasImageTaskRun(user.ID, task.ID)
+	taskContext, taskRun := registerCanvasImageTaskRun(r.Context(), user.ID, task.ID)
 	OK(w, service.CanvasImageTaskResponse(task))
 	go runCanvasImageTask(taskContext, taskRun, task, user, body, contentType, task.ChannelID, task.UserChannelID)
 }
@@ -281,35 +281,35 @@ func runCanvasImageTask(taskContext context.Context, taskRun *canvasImageTaskRun
 	}
 	if status >= http.StatusBadRequest {
 		message := readUpstreamAIErrorMessage(payload, status)
-		saveFailedCanvasImageTask(task, message, string(payload))
+		saveFailedCanvasImageTask(task, message, message)
 		return
 	}
 	if message := readWrappedTaskError(payload); message != "" {
-		saveFailedCanvasImageTask(task, message, string(payload))
+		saveFailedCanvasImageTask(task, message, message)
 		return
 	}
 	collectAll := isKIESeedreamLayerDecompositionModel(task.Model)
-	imageURLs, mimeType, bytes, err := imageURLsFromAIResponse(payload, responseContentType, collectAll)
-	if err != nil {
-		saveFailedCanvasImageTask(task, err.Error(), string(payload))
+	result, err := storeCanvasImageTaskResult(taskContext, user, payload, responseContentType, collectAll)
+	if taskContext.Err() != nil {
 		return
 	}
-	if taskContext.Err() != nil {
+	if err != nil {
+		saveFailedCanvasImageTask(task, err.Error(), err.Error())
 		return
 	}
 	task.Status = "completed"
 	task.Progress = 100
 	task.CompletedAt = taskTime()
-	task.ResponseBody = string(payload)
-	task.ImageURL = imageURLs[0]
+	task.ResponseBody = canvasImageTaskResponseBody(result.URLs)
+	task.ImageURL = result.URLs[0]
 	if collectAll {
-		task.ImageURLs = imageURLs
+		task.ImageURLs = result.URLs
 	}
-	task.StorageKey = ""
-	task.MimeType = mimeType
-	task.Bytes = bytes
-	task.Width = 0
-	task.Height = 0
+	task.StorageKey = result.StorageKey
+	task.MimeType = result.MimeType
+	task.Bytes = result.Bytes
+	task.Width = result.Width
+	task.Height = result.Height
 	task.Error = ""
 	task.ErrorDetail = ""
 	_, _ = service.SaveCanvasImageTask(task)
@@ -379,8 +379,9 @@ func executeCanvasAIRequest(requestContext context.Context, user model.AuthUser,
 	return payload, response.StatusCode, response.Header.Get("Content-Type"), nil
 }
 
-func registerCanvasImageTaskRun(userID string, taskID string) (context.Context, *canvasImageTaskRun) {
-	ctx, cancel := context.WithCancel(context.Background())
+func registerCanvasImageTaskRun(parent context.Context, userID string, taskID string) (context.Context, *canvasImageTaskRun) {
+	// 创建接口返回后任务仍需继续执行，但必须保留请求 Origin，才能把本机图片写成完整可访问地址。
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	run := &canvasImageTaskRun{cancel: cancel}
 	canvasImageTaskRuns.Store(canvasImageTaskRunKey(userID, taskID), run)
 	return ctx, run
@@ -594,47 +595,87 @@ func imageBytesFromAIResponse(payload []byte) ([]byte, string, error) {
 	return nil, "", errors.New("图片接口没有返回图片")
 }
 
-func imageURLsFromAIResponse(payload []byte, contentType string, collectAll bool) ([]string, string, int64, error) {
+// canvasImageTaskResult 只保存图片位置和元数据，禁止携带图片字节或 Base64。
+type canvasImageTaskResult struct {
+	// URLs 是完整的本机内容接口地址或上游/对象存储 URL。
+	URLs []string
+	// StorageKey 标识第一张落到本机生成图片目录的图片。
+	StorageKey string
+	// MimeType 是第一张本机图片的媒体类型，远程 URL 未下载时为空。
+	MimeType string
+	// Bytes 是第一张本机图片的字节数，只保存数值。
+	Bytes int64
+	// Width 是第一张本机图片的像素宽度。
+	Width int
+	// Height 是第一张本机图片的像素高度。
+	Height int
+}
+
+func storeCanvasImageTaskResult(ctx context.Context, user model.AuthUser, payload []byte, contentType string, collectAll bool) (canvasImageTaskResult, error) {
 	candidates, err := imageCandidatesFromAIResponse(payload, contentType)
 	if err != nil {
-		return nil, "", 0, err
+		return canvasImageTaskResult{}, err
 	}
-	urls := make([]string, 0, len(candidates))
+	result := canvasImageTaskResult{URLs: make([]string, 0, len(candidates))}
 	seen := map[string]bool{}
-	firstMimeType := ""
-	var firstBytes int64
 	for _, candidate := range candidates {
-		url := candidate
-		mimeType := ""
-		var bytes int64
-		if !strings.HasPrefix(candidate, "http://") && !strings.HasPrefix(candidate, "https://") {
-			data, detectedMimeType, err := imageCandidateBytes(candidate)
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		if ctx.Err() != nil {
+			return canvasImageTaskResult{}, ctx.Err()
+		}
+		if strings.HasPrefix(candidate, "http://") || strings.HasPrefix(candidate, "https://") {
+			result.URLs = append(result.URLs, candidate)
+		} else {
+			data, mimeType, err := imageCandidateBytes(candidate)
 			if err != nil || len(data) == 0 {
 				continue
 			}
-			mimeType = detectedMimeType
-			bytes = int64(len(data))
-			if !strings.HasPrefix(candidate, "data:image/") {
-				url = "data:" + mimeType + ";base64," + candidate
+			media, err := storeCanvasImageCandidate(ctx, user, data, mimeType)
+			if err != nil {
+				return canvasImageTaskResult{}, err
+			}
+			result.URLs = append(result.URLs, media.URL)
+			if len(result.URLs) == 1 {
+				result.StorageKey = media.StorageKey
+				result.MimeType = media.MimeType
+				result.Bytes = media.Bytes
+				result.Width = media.Width
+				result.Height = media.Height
 			}
 		}
-		if seen[url] {
-			continue
-		}
-		seen[url] = true
-		urls = append(urls, url)
-		if len(urls) == 1 {
-			firstMimeType = mimeType
-			firstBytes = bytes
-		}
 		if !collectAll {
-			return urls, firstMimeType, firstBytes, nil
+			return result, nil
 		}
 	}
-	if len(urls) == 0 {
-		return nil, "", 0, errors.New("图片接口没有返回图片")
+	if len(result.URLs) == 0 {
+		return canvasImageTaskResult{}, errors.New("图片接口没有返回图片")
 	}
-	return urls, firstMimeType, firstBytes, nil
+	return result, nil
+}
+
+func storeCanvasImageCandidate(ctx context.Context, user model.AuthUser, data []byte, mimeType string) (service.GeneratedMediaView, error) {
+	mimeType = strings.TrimSpace(strings.Split(mimeType, ";")[0])
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		mimeType = strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0])
+	}
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return service.GeneratedMediaView{}, errors.New("图片接口返回了无效图片类型")
+	}
+	width, height := imageSize(data)
+	// 图片字节只写入生成图片目录；任务表始终引用内容接口 URL，绝不保存 data URL。
+	return service.CreateGeneratedMedia(service.WithUser(ctx, user), "canvas-image", mimeType, data, width, height, false, nil)
+}
+
+func canvasImageTaskResponseBody(urls []string) string {
+	data := make([]map[string]string, 0, len(urls))
+	for _, url := range urls {
+		data = append(data, map[string]string{"url": url})
+	}
+	encoded, _ := json.Marshal(map[string]any{"data": data})
+	return string(encoded)
 }
 
 type serverSentJSONEvent struct {

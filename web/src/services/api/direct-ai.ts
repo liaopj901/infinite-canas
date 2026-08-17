@@ -12,13 +12,11 @@ type SerializedDirectBody = { body: unknown; references: DirectReference[] };
 
 const DIRECT_REFERENCE_HOST = "direct-reference.invalid";
 const DIRECT_IMAGE_POLL_INTERVAL_MS = 2000;
-const DIRECT_IMAGE_MAX_RETRIES = 3;
-const DIRECT_IMAGE_RETRY_DELAY_MS = 700;
 
 export async function requestDirectImages(config: AiConfig, provider: DirectAIProvider, endpoint: "/images/generations" | "/images/edits", body: DirectRequestBody, timeoutSeconds: number, signal?: AbortSignal): Promise<DirectImageResponse> {
     const startedAt = Date.now();
     const { plan, requestBody, apiKey } = await prepareDirectRequest(config, provider, endpoint, body, signal);
-    const created = await requestDirectJSON(plan.url, apiKey, plan.contentType, requestBody, remainingTimeoutMs(startedAt, timeoutSeconds), true, signal);
+    const created = await requestDirectJSON(plan.url, apiKey, plan.contentType, requestBody, remainingTimeoutMs(startedAt, timeoutSeconds), signal);
     const directUrls = readDirectImageURLs(provider, created);
     if (directUrls.length) return directImageResponse(directUrls);
     const taskId = readDirectTaskId(provider, created);
@@ -27,7 +25,7 @@ export async function requestDirectImages(config: AiConfig, provider: DirectAIPr
     for (;;) {
         const waitMs = Math.min(DIRECT_IMAGE_POLL_INTERVAL_MS, remainingTimeoutMs(startedAt, timeoutSeconds));
         await delay(waitMs, signal);
-        const payload = await requestDirectJSON(directPollURL(config, provider, taskId), apiKey, "", undefined, remainingTimeoutMs(startedAt, timeoutSeconds), true, signal);
+        const payload = await requestDirectJSON(directPollURL(config, provider, taskId), apiKey, "", undefined, remainingTimeoutMs(startedAt, timeoutSeconds), signal);
         const result = readDirectImagePoll(provider, payload);
         if (result.error) throw new Error(result.error);
         if (result.urls.length) return directImageResponse(result.urls);
@@ -280,57 +278,38 @@ function replaceDirectMarkers(value: unknown, uploaded: Map<string, string>): un
     return value;
 }
 
-async function requestDirectJSON(url: string, apiKey: string, contentType: string, body?: unknown, timeoutMs?: number, retryImage = false, signal?: AbortSignal) {
-    const startedAt = Date.now();
-    for (let attempt = 0; ; attempt += 1) {
-        throwIfAborted(signal);
-        const remaining = timeoutMs ? timeoutMs - (Date.now() - startedAt) : undefined;
-        if (remaining !== undefined && remaining <= 0) throw new Error("请求超时");
-        const controller = new AbortController();
-        const abort = () => controller.abort(signal?.reason);
-        signal?.addEventListener("abort", abort, { once: true });
-        const timeout = remaining ? window.setTimeout(() => controller.abort(), remaining) : 0;
-        try {
-            const response = await fetch(url, {
-                method: body === undefined ? "GET" : "POST",
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    ...(body === undefined ? {} : { "Content-Type": contentType || "application/json" }),
-                },
-                ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-                signal: controller.signal,
-            });
-            const payload = await readDirectResponse(response);
-            const knownError = readDirectError(payload);
-            if (!response.ok) {
-                const httpError = readDirectHTTPError(payload);
-                if (!shouldRetryDirectImage(response.status, httpError) || !retryImage) {
-                    throw new DirectAIRequestError(httpError || `上游请求失败：${response.status}`);
-                }
-                if (attempt >= DIRECT_IMAGE_MAX_RETRIES) {
-                    throw new DirectAIRequestError(`上游临时不可用：${response.status}，已重试 ${DIRECT_IMAGE_MAX_RETRIES} 次`);
-                }
-            } else {
-                if (knownError) throw new DirectAIRequestError(knownError);
-                const raw = readDirectRawError(payload);
-                if (raw) throw new DirectAIRequestError(raw);
-                return payload;
-            }
-        } catch (error) {
-            if (signal?.aborted) throw abortError(signal);
-            if (controller.signal.aborted) throw new Error("请求超时");
-            if (isAbortError(error)) throw error;
-            if (error instanceof DirectAIRequestError) throw error;
-            if (!retryImage) throw error;
-            if (attempt >= DIRECT_IMAGE_MAX_RETRIES) {
-                throw new Error(`上游网络异常，已重试 ${DIRECT_IMAGE_MAX_RETRIES} 次`);
-            }
-        } finally {
-            if (timeout) window.clearTimeout(timeout);
-            signal?.removeEventListener("abort", abort);
-        }
-        // 图片创建请求可能产生费用，按用户确认仅对无明确业务错误的临时故障重试。
-        await delay(DIRECT_IMAGE_RETRY_DELAY_MS * (attempt + 1), signal);
+async function requestDirectJSON(url: string, apiKey: string, contentType: string, body?: unknown, timeoutMs?: number, signal?: AbortSignal) {
+    throwIfAborted(signal);
+    if (timeoutMs !== undefined && timeoutMs <= 0) throw new Error("请求超时");
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    const timeout = timeoutMs ? window.setTimeout(() => controller.abort(), timeoutMs) : 0;
+    try {
+        // 直连请求统一单次发送，避免图片创建在网络抖动时重复扣费或创建任务；异步结果由外层轮询查询。
+        const response = await fetch(url, {
+            method: body === undefined ? "GET" : "POST",
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+                ...(body === undefined ? {} : { "Content-Type": contentType || "application/json" }),
+            },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            signal: controller.signal,
+        });
+        const payload = await readDirectResponse(response);
+        if (!response.ok) throw new DirectAIRequestError(readDirectHTTPError(payload) || `上游请求失败：${response.status}`);
+        const knownError = readDirectError(payload);
+        if (knownError) throw new DirectAIRequestError(knownError);
+        const raw = readDirectRawError(payload);
+        if (raw) throw new DirectAIRequestError(raw);
+        return payload;
+    } catch (error) {
+        if (signal?.aborted) throw abortError(signal);
+        if (controller.signal.aborted) throw new Error("请求超时");
+        throw error;
+    } finally {
+        if (timeout) window.clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
     }
 }
 
@@ -344,10 +323,6 @@ async function readDirectResponse(response: Response): Promise<unknown> {
     } catch {
         return { raw: text };
     }
-}
-
-function shouldRetryDirectImage(status: number, knownError: string) {
-    return !knownError && [500, 502, 503, 504].includes(status);
 }
 
 function directPollURL(config: AiConfig, provider: DirectAIProvider, taskId: string) {
@@ -501,10 +476,6 @@ function remainingTimeoutMs(startedAt: number, timeoutSeconds: number) {
     const remaining = timeoutSeconds * 1000 - (Date.now() - startedAt);
     if (remaining <= 0) throw new Error(`请求超时（${timeoutSeconds} 秒）`);
     return remaining;
-}
-
-function isAbortError(error: unknown) {
-    return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
 }
 
 function abortError(signal?: AbortSignal) {

@@ -79,17 +79,17 @@ func CreateGeneratedMedia(ctx context.Context, filename string, contentType stri
 		return GeneratedMediaView{}, err
 	}
 	if !autoUpload {
-		return generatedMediaView(media), nil
+		return generatedMediaView(ctx, media), nil
 	}
 	uploaded, err := uploadGeneratedMediaRecord(ctx, media, provider)
 	if err == nil {
-		return generatedMediaView(uploaded), nil
+		return generatedMediaView(ctx, uploaded), nil
 	}
 	// 云端故障不能抹掉已经成功生成并落盘的图片，本地记录仍然可用。
 	media.StorageMessage = "自动上传云端失败：" + err.Error()
 	media.UpdatedAt = now()
 	_, _ = repository.SaveGeneratedMedia(media)
-	return generatedMediaView(media), nil
+	return generatedMediaView(ctx, media), nil
 }
 
 // UploadGeneratedMediaToCloud 将本地生成图片上传云端，成功后删除本地副本。
@@ -99,16 +99,20 @@ func UploadGeneratedMediaToCloud(ctx context.Context, id string, provider *Stora
 		return GeneratedMediaView{}, err
 	}
 	if media.StorageStatus == model.GeneratedMediaStatusCleaned {
-		return generatedMediaView(media), ErrGeneratedMediaCleaned
+		return generatedMediaView(ctx, media), ErrGeneratedMediaCleaned
 	}
 	if media.StorageStatus == model.GeneratedMediaStatusCloud {
-		return generatedMediaView(media), nil
+		view := generatedMediaView(ctx, media)
+		if err := syncCanvasImageTasksAfterGeneratedMediaUpload(ctx, media.UserID, media.ID, view); err != nil {
+			log.Printf("repair canvas image task after generated media upload %s failed: %v", media.ID, err)
+		}
+		return view, nil
 	}
 	uploaded, err := uploadGeneratedMediaRecord(ctx, media, provider)
 	if err != nil {
 		return GeneratedMediaView{}, err
 	}
-	return generatedMediaView(uploaded), nil
+	return generatedMediaView(ctx, uploaded), nil
 }
 
 // ReadGeneratedMediaContent 读取本地文件；云端记录则复用对象存储下载逻辑。
@@ -292,6 +296,11 @@ func uploadGeneratedMediaRecord(ctx context.Context, media model.GeneratedMedia,
 	if _, err := repository.SaveGeneratedMedia(media); err != nil {
 		return model.GeneratedMedia{}, err
 	}
+	view := generatedMediaView(ctx, media)
+	if err := syncCanvasImageTasksAfterGeneratedMediaUpload(ctx, media.UserID, media.ID, view); err != nil {
+		// 云端对象和 generated_media 已经成功，任务冗余字段同步失败不能把一次成功上传伪装成失败。
+		log.Printf("sync canvas image task after generated media upload %s failed: %v", media.ID, err)
+	}
 	// 数据库已经切换为云端后再删本地文件，删除失败只造成冗余，不会让图片不可访问。
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Printf("remove uploaded generated media %s failed: %v", media.ID, err)
@@ -307,14 +316,18 @@ func currentUserGeneratedMedia(ctx context.Context, id string) (model.GeneratedM
 	return repository.GetGeneratedMedia(user.ID, strings.TrimSpace(id))
 }
 
-func generatedMediaView(media model.GeneratedMedia) GeneratedMediaView {
+func generatedMediaView(ctx context.Context, media model.GeneratedMedia) GeneratedMediaView {
 	view := GeneratedMediaView{
 		ID: media.ID, StorageStatus: media.StorageStatus, StorageMessage: media.StorageMessage,
 		Width: media.Width, Height: media.Height, Bytes: media.Bytes, MimeType: media.MimeType,
 	}
 	switch media.StorageStatus {
 	case model.GeneratedMediaStatusCloud:
-		view.URL = media.CloudURL
+		view.URL = absoluteAppURL(ctx, media.CloudURL)
+		if view.URL == "" && media.StorageObjectID != "" {
+			// 私有对象存储没有公开 URL 时，仍返回完整站内内容地址，避免前端拿到空图。
+			view.URL = absoluteAppURL(ctx, "/api/files/"+media.StorageObjectID+"/content")
+		}
 		view.StorageKey = "server:" + media.StorageObjectID
 	case model.GeneratedMediaStatusCleaned:
 		view.StorageKey = "local:" + media.ID
@@ -322,7 +335,7 @@ func generatedMediaView(media model.GeneratedMedia) GeneratedMediaView {
 			view.StorageMessage = ErrGeneratedMediaCleaned.Error()
 		}
 	default:
-		view.URL = "/api/v1/generated-images/" + media.ID + "/content"
+		view.URL = absoluteAppURL(ctx, "/api/v1/generated-images/"+media.ID+"/content")
 		view.StorageKey = "local:" + media.ID
 	}
 	return view

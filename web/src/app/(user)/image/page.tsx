@@ -726,20 +726,23 @@ export default function ImagePage() {
 
     const autoSyncGeneratedImage = async (image: GeneratedImage, index: number, channelMode: AiConfig["channelMode"], ownerId = accountOwnerId, taskToken = token) => {
         const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
-        if (!isCurrentAccount() || image.storageKey || !taskToken) return image;
+        if (!isCurrentAccount() || image.storageStatus === "cleaned" || (image.storageKey && !image.storageKey.startsWith("local:")) || !taskToken) return image;
         const storageConfig = await loadStorageConfig().catch(() => null);
         if (!isCurrentAccount()) return image;
         const autoUpload = Boolean(storageConfig) && shouldAutoSyncGeneratedMedia(storageConfig, channelMode);
+        if (image.storageKey?.startsWith("local:") && !autoUpload) return image;
         try {
-            const saved = await saveGeneratedImage(
-                image.dataUrl,
-                "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl),
-                image.width,
-                image.height,
-                autoUpload,
-                taskToken,
-                ownerId,
-            );
+            const saved = image.storageKey?.startsWith("local:")
+                ? await uploadGeneratedImageToCloud(image.storageKey, taskToken, ownerId)
+                : await saveGeneratedImage(
+                      image.dataUrl,
+                      "image-" + (index + 1) + "." + imageExtension(image.mimeType || image.dataUrl),
+                      image.width,
+                      image.height,
+                      autoUpload,
+                      taskToken,
+                      ownerId,
+                  );
             if (!isCurrentAccount()) return image;
             if (saved.storageMessage) message.warning(saved.storageMessage);
             return {
@@ -2734,7 +2737,7 @@ function imageLogsFromTask(log: GenerationLog, task: CanvasImageTask): Generatio
                 parent_task_id: parentTaskId,
                 url,
                 image_url: url,
-                storageKey: undefined,
+                storageKey: task.storageKeys?.[index] || (index === 0 ? task.storageKey : undefined),
                 bytes: 0,
             },
         );

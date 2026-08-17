@@ -78,7 +78,7 @@ func CurrentUserImageGenerationLogs(ctx context.Context) ([]json.RawMessage, err
 	if err != nil {
 		return nil, err
 	}
-	return imageGenerationPayloads(user.ID, logs)
+	return imageGenerationPayloads(ctx, user.ID, logs)
 }
 
 func SaveCurrentUserImageGenerationLogs(ctx context.Context, raws []json.RawMessage) error {
@@ -125,7 +125,7 @@ func videoGenerationPayloads(logs []model.VideoGenerationLog) []json.RawMessage 
 	return result
 }
 
-func imageGenerationPayloads(userID string, logs []model.ImageGenerationLog) ([]json.RawMessage, error) {
+func imageGenerationPayloads(ctx context.Context, userID string, logs []model.ImageGenerationLog) ([]json.RawMessage, error) {
 	records := make([]map[string]any, 0, len(logs))
 	localIDs := make([]string, 0)
 	for _, log := range logs {
@@ -146,7 +146,7 @@ func imageGenerationPayloads(userID string, logs []model.ImageGenerationLog) ([]
 	}
 	result := make([]json.RawMessage, 0, len(records))
 	for _, record := range records {
-		reconcileGenerationLogMedia(record, mediaByID)
+		reconcileGenerationLogMedia(ctx, record, mediaByID)
 		raw, err := json.Marshal(record)
 		if err != nil {
 			return nil, err
@@ -322,7 +322,7 @@ func generationLogLocalMediaIDs(record map[string]any) []string {
 	return ids
 }
 
-func reconcileGenerationLogMedia(record map[string]any, mediaByID map[string]model.GeneratedMedia) {
+func reconcileGenerationLogMedia(ctx context.Context, record map[string]any, mediaByID map[string]model.GeneratedMedia) {
 	items, _ := record["images"].([]any)
 	for _, item := range items {
 		image := generationLogRecord(item)
@@ -338,7 +338,7 @@ func reconcileGenerationLogMedia(record map[string]any, mediaByID map[string]mod
 			image["storageMessage"] = ErrGeneratedMediaCleaned.Error()
 			continue
 		}
-		view := generatedMediaView(media)
+		view := generatedMediaView(ctx, media)
 		image["dataUrl"] = view.URL
 		image["storageKey"] = view.StorageKey
 		image["storageStatus"] = view.StorageStatus

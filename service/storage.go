@@ -19,10 +19,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tigerowo/infinite-canvas/model"
-	"github.com/tigerowo/infinite-canvas/repository"
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
+	"github.com/tigerowo/infinite-canvas/model"
+	"github.com/tigerowo/infinite-canvas/repository"
 	"gorm.io/gorm"
 )
 
@@ -244,7 +244,7 @@ func UploadStorageObjectWithProvider(ctx context.Context, filename string, conte
 	if _, err := repository.SaveStorageObject(object); err != nil {
 		return UploadedStorageObject{}, err
 	}
-	url := "/api/files/" + objectID + "/content"
+	url := absoluteAppURL(ctx, "/api/files/"+objectID+"/content")
 	if publicURL != "" {
 		url = publicURL
 	}
