@@ -6,7 +6,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 import { nanoid } from "nanoid";
 import { getAccountOwnerId, getAccountStorageKey, GUEST_ACCOUNT_OWNER } from "@/lib/account-scope";
 import { localForageStorage } from "@/lib/localforage-storage";
-import { resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { isProtectedImageUrl, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { resolveMediaUrl } from "@/services/file-storage";
 import { fetchUserAssetData, syncUserAssetData } from "@/services/api/user-config";
 import { useUserStore } from "@/stores/use-user-store";
@@ -62,23 +62,7 @@ const assetStorage: PersistStorage<AssetStore> = {
         const parsed = JSON.parse(value) as StorageValue<AssetStore>;
         const persistedState = parsed.state as PersistedAssetState;
         if (persistedState.ownerId !== ownerId) return null;
-        const normalizedAssets = await Promise.all(
-            parsed.state.assets.map(async (asset) => {
-                if (asset.kind === "video" && asset.data.storageKey) return { ...asset, data: { ...asset.data, url: await resolveMediaUrl(asset.data.storageKey, asset.data.url) } };
-                if (asset.kind === "audio" && asset.data.storageKey) return { ...asset, data: { ...asset.data, url: await resolveMediaUrl(asset.data.storageKey, asset.data.url) } };
-                if (asset.kind !== "image") return asset;
-                if (asset.data.storageKey)
-                    return {
-                        ...asset,
-                        coverUrl: asset.coverUrl.startsWith("blob:") ? await resolveImageUrl(asset.data.storageKey, asset.coverUrl) : asset.coverUrl,
-                        data: { ...asset.data, dataUrl: await resolveImageUrl(asset.data.storageKey, asset.data.dataUrl) },
-                    };
-                if (!asset.data.dataUrl.startsWith("data:image/")) return asset;
-                // 恢复历史素材只补齐本地 storageKey，不能在读取本地缓存时隐式创建云端对象。
-                const image = await uploadImage(asset.data.dataUrl, { localOnly: true });
-                return { ...asset, coverUrl: asset.coverUrl.startsWith("data:image/") ? image.url : asset.coverUrl, data: { ...asset.data, dataUrl: image.url, storageKey: image.storageKey, bytes: image.bytes, mimeType: image.mimeType } };
-            }),
-        );
+        const normalizedAssets = await resolveAssetUrls(parsed.state.assets);
         parsed.state.assets = normalizedAssets;
         const nextState = { ...(parsed.state as PersistedAssetState), assets: normalizedAssets };
         const nextParsed = { ...parsed, state: nextState };
@@ -208,21 +192,19 @@ export const useAssetStore = create<AssetStore>()(
                     const remote = await fetchUserAssetData<AssetSnapshot>(token);
                     if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return;
                     const remoteAssets = Array.isArray(remote?.assets) ? remote.assets : [];
-                    if (syncEnabled) {
-                        set({ assets: remoteAssets });
-                    } else {
-                        const localHasAssets = get().assets.length > 0;
-                        if (!localHasAssets && remoteAssets.length) {
-                            set({ assets: remoteAssets });
-                        }
-                    }
+                    const shouldUseRemote = syncEnabled || (!get().assets.length && remoteAssets.length > 0);
+                    if (!shouldUseRemote) return;
+                    // 云端 JSON 里的 blob URL 只属于创建它的页面，必须按 storageKey 重新生成当前页面可用的地址。
+                    const resolvedAssets = await resolveAssetUrls(remoteAssets);
+                    if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return;
+                    set({ assets: resolvedAssets });
                 } finally {
                     isHydratingAccountAssets = false;
                 }
             },
             syncAccountAssets: async (token) => {
                 if (!token || !accountAssetSyncEnabled || getAccountOwnerId() !== activeAssetOwnerId || useUserStore.getState().token !== token) return;
-                await syncUserAssetData(token, { assets: get().assets });
+                await syncUserAssetData(token, { assets: assetsForSync(get().assets) });
             },
             stopAccountAssetSync: () => {
                 activeAssetSyncToken = "";
@@ -242,6 +224,52 @@ export const useAssetStore = create<AssetStore>()(
         },
     ),
 );
+
+async function resolveAssetUrls(assets: Asset[]) {
+    return Promise.all(assets.map(resolveAssetUrl));
+}
+
+async function resolveAssetUrl(asset: Asset): Promise<Asset> {
+    if (asset.kind === "video" || asset.kind === "audio") {
+        if (!asset.data.storageKey) return asset;
+        const url = await resolveMediaUrl(asset.data.storageKey, asset.data.url);
+        const coverUrl = asset.coverUrl === asset.data.url || asset.coverUrl.startsWith("blob:") ? url : asset.coverUrl;
+        return { ...asset, coverUrl, data: { ...asset.data, url } } as Asset;
+    }
+    if (asset.kind !== "image") return asset;
+    if (asset.data.storageKey) {
+        const dataUrl = await resolveImageUrl(asset.data.storageKey, asset.data.dataUrl);
+        const replaceCover = asset.coverUrl === asset.data.dataUrl || asset.coverUrl.startsWith("blob:") || isProtectedImageUrl(asset.coverUrl);
+        return { ...asset, coverUrl: replaceCover ? dataUrl : asset.coverUrl, data: { ...asset.data, dataUrl } };
+    }
+    if (!asset.data.dataUrl.startsWith("data:image/")) return asset;
+    // 恢复历史素材只补齐浏览器本地 storageKey，不能在读取缓存时隐式创建服务器文件。
+    const image = await uploadImage(asset.data.dataUrl, { localOnly: true });
+    return { ...asset, coverUrl: asset.coverUrl.startsWith("data:image/") ? image.url : asset.coverUrl, data: { ...asset.data, dataUrl: image.url, storageKey: image.storageKey, bytes: image.bytes, mimeType: image.mimeType } };
+}
+
+function assetsForSync(assets: Asset[]) {
+    return assets.map((asset) => {
+        if (asset.kind === "image" && asset.data.storageKey) {
+            const dataUrl = stableStorageUrl(asset.data.storageKey, asset.data.dataUrl);
+            const coverUrl = asset.coverUrl === asset.data.dataUrl || asset.coverUrl.startsWith("blob:") ? dataUrl : asset.coverUrl;
+            return { ...asset, coverUrl, data: { ...asset.data, dataUrl } };
+        }
+        if ((asset.kind === "video" || asset.kind === "audio") && asset.data.storageKey) {
+            const url = stableStorageUrl(asset.data.storageKey, asset.data.url);
+            const coverUrl = asset.coverUrl === asset.data.url || asset.coverUrl.startsWith("blob:") ? url : asset.coverUrl;
+            return { ...asset, coverUrl, data: { ...asset.data, url } };
+        }
+        return asset;
+    });
+}
+
+function stableStorageUrl(storageKey: string, currentUrl: string) {
+    if (!currentUrl.startsWith("blob:")) return currentUrl;
+    if (storageKey.startsWith("local:")) return `/api/v1/generated-images/${encodeURIComponent(storageKey.slice("local:".length))}/content`;
+    if (storageKey.startsWith("server:")) return `/api/files/${encodeURIComponent(storageKey.slice("server:".length))}/content`;
+    return currentUrl;
+}
 
 function scheduleAssetSync(get: () => AssetStore) {
     if (isHydratingAccountAssets || !activeAssetSyncToken || !accountAssetSyncEnabled || typeof window === "undefined") return;
