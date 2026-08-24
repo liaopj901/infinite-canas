@@ -895,10 +895,30 @@ export default function ImagePage() {
         });
     };
 
+    const persistLoggedOutLogImages = async (log: GenerationLog): Promise<GenerationLog> => {
+        const images = log.images || [];
+        if (!images.some((image) => !image.storageKey && image.dataUrl?.startsWith("data:image/"))) return log;
+        const persistedImages = await Promise.all(
+            images.map(async (image) => {
+                if (image.storageKey || !image.dataUrl?.startsWith("data:image/")) return image;
+                try {
+                    const stored = await uploadImage(image.dataUrl, { localOnly: true });
+                    return { ...image, dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width || image.width, height: stored.height || image.height, bytes: stored.bytes || image.bytes, mimeType: stored.mimeType || image.mimeType };
+                } catch {
+                    return image;
+                }
+            }),
+        );
+        return { ...log, images: persistedImages };
+    };
+
     const saveLog = async (log: GenerationLog, ownerId = accountOwnerId, taskToken = token) => {
         const isCurrentAccount = () => getAccountOwnerId() === ownerId && useUserStore.getState().token === taskToken;
         const isCancelled = () => imageLogIdentityKeys(log).some((id) => cancelledGenerationIdsRef.current.has(id));
         if (!isCurrentAccount() || isCancelled()) return false;
+        const persistedLog = taskToken ? log : await persistLoggedOutLogImages(log);
+        if (!isCurrentAccount() || isCancelled()) return false;
+
         const prevChain = saveLogChainRef.current;
         const nextChain = (async () => {
             try {
@@ -909,14 +929,14 @@ export default function ImagePage() {
             if (!isCurrentAccount() || isCancelled()) return false;
             const storedLogs = await readStoredLogs(ownerId);
             if (!isCurrentAccount() || isCancelled()) return false;
-            const keys = new Set(imageLogIdentityKeys(log));
-            const duplicateLogs = storedLogs.filter((item) => item.id !== log.id && imageLogIdentityKeys(item).some((key) => keys.has(key)));
-            const nextLogs = dedupeGenerationLogs([log, ...storedLogs.filter((item) => item.id !== log.id)]);
+            const keys = new Set(imageLogIdentityKeys(persistedLog));
+            const duplicateLogs = storedLogs.filter((item) => item.id !== persistedLog.id && imageLogIdentityKeys(item).some((key) => keys.has(key)));
+            const nextLogs = dedupeGenerationLogs([persistedLog, ...storedLogs.filter((item) => item.id !== persistedLog.id)]);
             await Promise.all(duplicateLogs.map((item) => logStore.removeItem(imageLogStorageKey(item.id, ownerId))));
             if (isCancelled()) return false;
-            await logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(log));
+            await logStore.setItem(imageLogStorageKey(persistedLog.id, ownerId), serializeLog(persistedLog));
             if (isCancelled()) {
-                await logStore.removeItem(imageLogStorageKey(log.id, ownerId));
+                await logStore.removeItem(imageLogStorageKey(persistedLog.id, ownerId));
                 return false;
             }
             if (!isCurrentAccount()) return false;
@@ -1620,10 +1640,11 @@ function WorkbenchPanel({
                                         size="small"
                                         className="canvas-config-mode !rounded-md !p-0.5 w-full"
                                         value={config.apiMode}
-                                        onChange={(value) => updateConfig("apiMode", value as "images" | "responses")}
+                                        onChange={(value) => updateConfig("apiMode", value as "images" | "responses" | "chat")}
                                         options={[
                                             { value: "images", label: "images" },
                                             { value: "responses", label: "responses" },
+                                            { value: "chat", label: "chat" },
                                         ]}
                                     />
                                 </div>
@@ -1794,7 +1815,7 @@ function settingsSummary(config: AiConfig, model: string) {
         imageSizeLabel(config.size || "auto"),
         imageQualityLabel(config.quality || "auto"),
         `${config.count || "1"} 张`,
-        config.streamImages ? `流式 ${config.streamPartialImages || "1"}` : "非流式",
+        config.apiMode !== "chat" && config.streamImages ? `流式 ${config.streamPartialImages || "1"}` : "非流式",
     ].join(" · ");
 }
 
@@ -2083,10 +2104,11 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
                             size="small"
                             className="canvas-config-mode !rounded-md !p-0.5"
                             value={config.apiMode}
-                            onChange={(value) => updateConfig("apiMode", value as "images" | "responses")}
+                            onChange={(value) => updateConfig("apiMode", value as "images" | "responses" | "chat")}
                             options={[
                                 { value: "images", label: "images" },
                                 { value: "responses", label: "responses" },
+                                { value: "chat", label: "chat" },
                             ]}
                         />
                     </div>
@@ -2238,10 +2260,10 @@ function TaskInfo({ result, error, onCopyPrompt }: { result: GenerationResult; e
                 ) : null}
                 <Tag className="m-0">{formatLogTime(result.createdAt)}</Tag>
                 <Tag className="m-0">{result.model}</Tag>
-                <Tag className="m-0">{result.config.apiMode === "responses" ? "Responses" : "Images"}</Tag>
+                <Tag className="m-0">{result.config.apiMode === "chat" ? "Chat" : result.config.apiMode === "responses" ? "Responses" : "Images"}</Tag>
                 <Tag className="m-0">{result.config.size || "auto"}</Tag>
                 <Tag className="m-0">{result.config.quality || "auto"}</Tag>
-                {result.config.streamImages ? <Tag className="m-0">流式 {result.config.streamPartialImages || "1"}</Tag> : null}
+                {result.config.apiMode !== "chat" && result.config.streamImages ? <Tag className="m-0">流式 {result.config.streamPartialImages || "1"}</Tag> : null}
                 {result.durationMs ? <Tag className="m-0">{formatDuration(result.durationMs)}</Tag> : null}
             </div>
             {error ? <div className="rounded-md bg-red-100 px-2 py-1.5 text-red-600 dark:bg-red-950/40 dark:text-red-300">{error}</div> : null}
@@ -2390,10 +2412,10 @@ function HistoryLogCard({
                     ) : null}
                     <Tag className="m-0 text-[10px]">{formatLogTime(log.createdAt)}</Tag>
                     <Tag className="m-0 text-[10px]">{log.model}</Tag>
-                    <Tag className="m-0 text-[10px]">{log.config.apiMode === "responses" ? "Responses" : "Images"}</Tag>
+                    <Tag className="m-0 text-[10px]">{log.config.apiMode === "chat" ? "Chat" : log.config.apiMode === "responses" ? "Responses" : "Images"}</Tag>
                     <Tag className="m-0 text-[10px]">{log.config.size || "auto"}</Tag>
                     <Tag className="m-0 text-[10px]">{log.config.quality || "auto"}</Tag>
-                    {log.config.streamImages ? <Tag className="m-0 text-[10px]">流式 {log.config.streamPartialImages || "1"}</Tag> : null}
+                    {log.config.apiMode !== "chat" && log.config.streamImages ? <Tag className="m-0 text-[10px]">流式 {log.config.streamPartialImages || "1"}</Tag> : null}
                     <Tag className="m-0 text-[10px]">{formatDuration(log.durationMs)}</Tag>
                 </div>
                 {log.errors[0] ? (

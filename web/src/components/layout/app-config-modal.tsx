@@ -3,14 +3,19 @@
 import { App, Button, Form, Input, Modal, Segmented, Select, Switch } from "antd";
 import { useEffect, useState } from "react";
 
+import { GrokTtsVoiceSelect } from "@/components/grok-tts-voice-select";
 import { ModelPicker } from "@/components/model-picker";
 import { fetchImageModels } from "@/services/api/image";
 import { fetchUserConfig, measureUserStorageProvider, syncUserModelConfig, syncUserStorageProvider } from "@/services/api/user-config";
 import { clearStorageConfigCache as clearFileStorageCache } from "@/services/file-storage";
 import { clearStorageConfigCache as clearImageStorageCache, defaultUserStorageProvider, defaultUserWebDAVStorageProvider, loadStorageConfig, loadUserS3StorageProvider, loadUserWebDAVStorageProvider, saveUserStorageProvider, saveUserWebDAVStorageProvider, type UserStorageProvider } from "@/services/image-storage";
 import { audioFormatOptions, audioVoiceOptions, glmTtsFormatOptions, glmTtsVoiceOptions, isGlmTtsModel, normalizeAudioSpeedValue, normalizeGlmTtsFormat, normalizeGlmTtsSpeed, normalizeGlmTtsVoice } from "@/lib/audio-generation";
+import { grokTtsFormatOptions, grokTtsLanguageOptions, isGrok2APITtsConfig, normalizeGrokTtsFormat, normalizeGrokTtsLanguage, normalizeGrokTtsSpeed } from "@/lib/grok-tts";
+import { isGeminiConfig, isGeminiTtsModel } from "@/lib/gemini";
+import { geminiTtsVoiceOptions, normalizeGeminiTtsVoice } from "@/lib/gemini-tts";
 import { isMimoPresetTtsModel, isMimoTtsModel, isMimoVoiceCloneModel, isMimoVoiceDesignModel, mimoTtsFormatOptions, mimoTtsVoiceOptions } from "@/lib/mimo-tts";
-import { filterModelsByCapability, normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig, type LocalModelChannel, type ModelCapability } from "@/stores/use-config-store";
+import { modelChannelApiKeyUrls, modelChannelDefaultBaseUrls } from "@/lib/model-channel";
+import { filterChannelModelsByCapability, normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig, type LocalModelChannel, type ModelCapability } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 
 type ModelGroup = {
@@ -58,8 +63,10 @@ export function AppConfigModal() {
     const effectiveMode = canUseRemoteChannel ? (allowCustomChannel ? config.channelMode : "remote") : "local";
     const localModelConfig: AiConfig = effectiveMode === "local" && config.channelMode !== "local" ? { ...config, channelMode: "local" } : config;
     const modelConfig = effectiveMode === "remote" ? effectiveConfig : localModelConfig;
-    const canUseUserStorageProvider = isLoggedIn && allowUserStorageProvider;
+    const canUseUserStorageProvider = allowUserStorageProvider;
     const glmTts = isGlmTtsModel(config.audioModel);
+    const grokTts = isGrok2APITtsConfig({ ...modelConfig, model: config.audioModel, audioModel: config.audioModel }, config.audioModel);
+    const geminiTts = isGeminiTtsModel(config.audioModel) && isGeminiConfig({ ...modelConfig, model: config.audioModel, audioModel: config.audioModel }, config.audioModel);
 
     useEffect(() => {
         setUserStorage(loadUserS3StorageProvider() || defaultUserStorageProvider());
@@ -176,10 +183,10 @@ export function AppConfigModal() {
     const updateLocalChannels = (channels: LocalModelChannel[]) => {
         const normalized = channels.length ? channels : normalizeLocalChannels({ baseUrl: config.baseUrl, apiKey: config.apiKey, models: config.models });
         const models = uniqueModels(normalized.flatMap((channel) => channel.models));
-        const nextImageModels = filterModelsByCapability(models, "image");
-        const nextVideoModels = filterModelsByCapability(models, "video");
-        const nextTextModels = filterModelsByCapability(models, "text");
-        const nextAudioModels = filterModelsByCapability(models, "audio");
+        const nextImageModels = filterChannelModelsByCapability(normalized, "image");
+        const nextVideoModels = filterChannelModelsByCapability(normalized, "video");
+        const nextTextModels = filterChannelModelsByCapability(normalized, "text");
+        const nextAudioModels = filterChannelModelsByCapability(normalized, "audio");
         const imageModel = nextImageModels.includes(config.imageModel) ? config.imageModel : nextImageModels[0] || "";
         const videoModel = nextVideoModels.includes(config.videoModel) ? config.videoModel : nextVideoModels[0] || "";
         const textModel = nextTextModels.includes(config.textModel) ? config.textModel : nextTextModels[0] || "";
@@ -207,7 +214,7 @@ export function AppConfigModal() {
     };
 
     const addLocalChannel = () => {
-        updateLocalChannels([...normalizeLocalChannels(config), { id: "local-" + Date.now(), protocol: "openai", name: "新渠道", baseUrl: "", apiKey: "", models: [] }]);
+        updateLocalChannels([...normalizeLocalChannels(config), { id: "local-" + Date.now(), protocol: "openai", name: "新渠道", baseUrl: modelChannelDefaultBaseUrls.openai, apiKey: "", models: [] }]);
     };
 
     const removeLocalChannel = (id: string) => {
@@ -318,20 +325,31 @@ export function AppConfigModal() {
                                                 value={channel.protocol}
                                                 options={[
                                                     { label: "OpenAI", value: "openai" },
+                                                    { label: "Gemini", value: "gemini" },
+                                                    { label: "Grok2API", value: "grok2api" },
+                                                    { label: "MiniMax & METASO", value: "metaso" },
+                                                    { label: "APIMart", value: "apimart" },
                                                     { label: "KIE", value: "kie" },
                                                     { label: "MiMo", value: "mimo" },
                                                 ]}
-                                                onChange={(protocol) => patchLocalChannel(channel.id, { protocol: protocol as LocalModelChannel["protocol"] })}
+                                                onChange={(protocol: LocalModelChannel["protocol"]) => patchLocalChannel(channel.id, { protocol, baseUrl: modelChannelDefaultBaseUrls[protocol] })}
                                             />
                                             <Input value={channel.baseUrl} placeholder="Base URL" onChange={(event) => patchLocalChannel(channel.id, { baseUrl: event.target.value })} />
                                             <Input.Password value={channel.apiKey} placeholder="API Key" onChange={(event) => patchLocalChannel(channel.id, { apiKey: event.target.value })} />
-                                            <div className="flex gap-2">
+                                            <div className="relative flex flex-wrap gap-2 md:flex-nowrap">
                                                 <Button size="small" loading={loadingModels} onClick={() => void refreshLocalChannelModels(channel)}>
                                                     拉取
                                                 </Button>
                                                 <Button size="small" danger disabled={index === 0 && normalizeLocalChannels(config).length === 1} onClick={() => removeLocalChannel(channel.id)}>
                                                     删除
                                                 </Button>
+                                                {modelChannelApiKeyUrls[channel.protocol] ? (
+                                                    <div className="w-full md:absolute md:left-0 md:top-8">
+                                                        <Button block type="primary" size="small" href={modelChannelApiKeyUrls[channel.protocol]} target="_blank">
+                                                            获取 API Key
+                                                        </Button>
+                                                    </div>
+                                                ) : null}
                                             </div>
                                         </div>
                                         <div className="text-xs text-stone-500">已保存 {channel.models.length} 个模型</div>
@@ -374,7 +392,11 @@ export function AppConfigModal() {
                                 onBlur={(event) => updateConfig("canvasImageCount", normalizeImageCount(event.target.value))}
                             />
                         </Form.Item>
-                        {isMimoPresetTtsModel(config.audioModel) ? (
+                        {geminiTts ? (
+                            <Form.Item label="默认 Gemini 音色" className="mb-4">
+                                <Select showSearch optionFilterProp="label" value={normalizeGeminiTtsVoice(config.geminiTtsVoice)} options={geminiTtsVoiceOptions} onChange={(value) => updateConfig("geminiTtsVoice", value)} />
+                            </Form.Item>
+                        ) : isMimoPresetTtsModel(config.audioModel) ? (
                             <Form.Item label="默认 MiMo 音色" className="mb-4">
                                 <Select value={config.mimoTtsVoice} options={[...mimoTtsVoiceOptions]} onChange={(value) => updateConfig("mimoTtsVoice", value)} />
                             </Form.Item>
@@ -384,22 +406,29 @@ export function AppConfigModal() {
                             </Form.Item>
                         ) : isMimoTtsModel(config.audioModel) ? null : (
                             <Form.Item label="默认音频声音" className="mb-4">
-                                <Select value={glmTts ? normalizeGlmTtsVoice(config.glmTtsVoice) : config.audioVoice} options={glmTts ? glmTtsVoiceOptions : audioVoiceOptions} onChange={(value) => updateConfig(glmTts ? "glmTtsVoice" : "audioVoice", value)} />
+                                {grokTts ? <GrokTtsVoiceSelect config={modelConfig} model={config.audioModel} value={config.grokTtsVoice} enabled={isConfigOpen} onChange={(value) => updateConfig("grokTtsVoice", value)} /> : <Select value={glmTts ? normalizeGlmTtsVoice(config.glmTtsVoice) : config.audioVoice} options={glmTts ? glmTtsVoiceOptions : audioVoiceOptions} onChange={(value) => updateConfig(glmTts ? "glmTtsVoice" : "audioVoice", value)} />}
                             </Form.Item>
                         )}
-                        <Form.Item label="默认音频格式" className="mb-4">
-                            <Select value={isMimoTtsModel(config.audioModel) ? config.mimoTtsFormat : glmTts ? normalizeGlmTtsFormat(config.glmTtsFormat) : config.audioFormat} options={isMimoTtsModel(config.audioModel) ? [...mimoTtsFormatOptions] : glmTts ? glmTtsFormatOptions : audioFormatOptions} onChange={(value) => isMimoTtsModel(config.audioModel) ? updateConfig("mimoTtsFormat", value) : updateConfig(glmTts ? "glmTtsFormat" : "audioFormat", value)} />
-                        </Form.Item>
-                        {!isMimoTtsModel(config.audioModel) ? (
+                        {grokTts ? (
+                            <Form.Item label="默认音频语言" className="mb-4">
+                                <Select value={normalizeGrokTtsLanguage(config.grokTtsLanguage)} options={grokTtsLanguageOptions} showSearch optionFilterProp="label" onChange={(value) => updateConfig("grokTtsLanguage", value)} />
+                            </Form.Item>
+                        ) : null}
+                        {!geminiTts ? (
+                            <Form.Item label="默认音频格式" className="mb-4">
+                                <Select value={isMimoTtsModel(config.audioModel) ? config.mimoTtsFormat : glmTts ? normalizeGlmTtsFormat(config.glmTtsFormat) : grokTts ? normalizeGrokTtsFormat(config.grokTtsFormat) : config.audioFormat} options={isMimoTtsModel(config.audioModel) ? [...mimoTtsFormatOptions] : glmTts ? glmTtsFormatOptions : grokTts ? grokTtsFormatOptions : audioFormatOptions} onChange={(value) => isMimoTtsModel(config.audioModel) ? updateConfig("mimoTtsFormat", value) : updateConfig(glmTts ? "glmTtsFormat" : grokTts ? "grokTtsFormat" : "audioFormat", value)} />
+                            </Form.Item>
+                        ) : null}
+                        {!geminiTts && !isMimoTtsModel(config.audioModel) ? (
                             <Form.Item label="默认音频语速" className="mb-4">
                                 <Input
                                     type="number"
-                                    min={glmTts ? 0.5 : 0.25}
-                                    max={glmTts ? 2 : 4}
+                                    min={glmTts ? 0.5 : grokTts ? 0.7 : 0.25}
+                                    max={glmTts ? 2 : grokTts ? 1.5 : 4}
                                     step={0.05}
-                                    value={glmTts ? config.glmTtsSpeed : config.audioSpeed}
-                                    onChange={(event) => updateConfig(glmTts ? "glmTtsSpeed" : "audioSpeed", event.target.value)}
-                                    onBlur={(event) => updateConfig(glmTts ? "glmTtsSpeed" : "audioSpeed", glmTts ? normalizeGlmTtsSpeed(event.target.value) : normalizeAudioSpeedValue(event.target.value))}
+                                    value={glmTts ? config.glmTtsSpeed : grokTts ? config.grokTtsSpeed : config.audioSpeed}
+                                    onChange={(event) => updateConfig(glmTts ? "glmTtsSpeed" : grokTts ? "grokTtsSpeed" : "audioSpeed", event.target.value)}
+                                    onBlur={(event) => updateConfig(glmTts ? "glmTtsSpeed" : grokTts ? "grokTtsSpeed" : "audioSpeed", glmTts ? normalizeGlmTtsSpeed(event.target.value) : grokTts ? normalizeGrokTtsSpeed(event.target.value) : normalizeAudioSpeedValue(event.target.value))}
                                 />
                             </Form.Item>
                         ) : null}
@@ -472,7 +501,7 @@ export function AppConfigModal() {
                             </section>
                         </>
                     ) : null}
-                    {(!isMimoTtsModel(config.audioModel) || isMimoPresetTtsModel(config.audioModel) || isMimoVoiceCloneModel(config.audioModel)) && !glmTts ? (
+                    {(!isMimoTtsModel(config.audioModel) || isMimoPresetTtsModel(config.audioModel) || isMimoVoiceCloneModel(config.audioModel)) && !glmTts && !grokTts ? (
                         <Form.Item label="默认音频指令" className="mb-4">
                             <Input.TextArea rows={2} value={config.audioInstructions} placeholder="例如：自然、温暖、适合旁白。" onChange={(event) => updateConfig("audioInstructions", event.target.value)} />
                         </Form.Item>

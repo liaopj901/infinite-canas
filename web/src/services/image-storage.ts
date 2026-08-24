@@ -5,6 +5,7 @@ import localforage from "localforage";
 import { nanoid } from "nanoid";
 import { getAccountOwnerId, getAccountStorageKey } from "@/lib/account-scope";
 import { readImageMeta } from "@/lib/image-utils";
+import { deleteAnonymousStorageFile, uploadAnonymousStorageFile } from "@/services/anonymous-storage";
 import { apiGet } from "@/services/api/request";
 import type { AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
@@ -159,17 +160,43 @@ export function getProxyUrl(url: string): string {
 export async function uploadImage(input: string | Blob, options: UploadImageOptions = {}): Promise<UploadedImage> {
     const requestOwnerId = getAccountOwnerId();
     const requestToken = useUserStore.getState().token;
-    const url = typeof input === "string" ? getProxyUrl(input) : input;
-    const blob = await loadImageBlob(url);
-    if (!options.localOnly && requestToken) {
+    const blob = await loadImageBlob(typeof input === "string" ? getProxyUrl(input) : input);
+
+    if (options.localOnly) return saveImageToBrowser(blob);
+    if (requestToken) {
         return uploadImageBlobToGeneratedMedia(blob, `image-${nanoid()}.${imageExtension(blob.type)}`, requestToken, requestOwnerId);
     }
-    return saveImageToBrowser(blob);
+
+    const uploaded = await maybeUploadImageToServer(blob, requestOwnerId);
+    return uploaded || saveImageToBrowser(blob);
 }
 
-export async function uploadRemoteImageToServer(url: string, filename: string, requestToken = useUserStore.getState().token, requestOwnerId = getAccountOwnerId()): Promise<UploadedImage> {
-    if (!requestToken) throw new Error("服务端存储需要先登录");
+export async function uploadRemoteImageToServer(
+    url: string,
+    filename: string,
+    requestToken = useUserStore.getState().token,
+    requestOwnerId = getAccountOwnerId(),
+): Promise<UploadedImage> {
     const blob = await loadImageBlob(getProxyUrl(url));
+    const config = await loadStorageConfig().catch(() => null);
+    const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
+    if (!config || (!canUseGlobalStorage(config) && !userProvider)) throw new Error("服务端对象存储未启用");
+
+    if (
+        userProvider?.type === "webdav" &&
+        getAccountOwnerId() === requestOwnerId &&
+        useUserStore.getState().token === requestToken
+    ) {
+        const directUpload = await uploadWebDAVImageDirect(blob, filename || `image-${nanoid()}.${imageExtension(blob.type)}`, userProvider, requestOwnerId);
+        if (directUpload) return directUpload;
+    }
+
+    if (!requestToken) {
+        if (!userProvider) throw new Error("服务端存储需要先登录");
+        const uploaded = await uploadAnonymousStorageFile<UploadedImage>(blob, filename || `image-${nanoid()}.${imageExtension(blob.type)}`, toProviderPayload(userProvider));
+        return cacheAnonymousImage(uploaded, blob, requestOwnerId);
+    }
+
     return uploadImageBlobToGeneratedMedia(blob, filename || `image-${nanoid()}.${imageExtension(blob.type)}`, requestToken, requestOwnerId);
 }
 
@@ -243,6 +270,7 @@ export function clearStorageConfigCache() {
 
 export async function resolveImageUrl(storageKey?: string, fallback = "") {
     if (!storageKey) return fallback;
+
     if (storageKey.startsWith("local:")) {
         const ownerId = getAccountOwnerId();
         const token = useUserStore.getState().token;
@@ -252,47 +280,64 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
         if (!token || !id) return "";
         const response = await fetch(`/api/v1/generated-images/${encodeURIComponent(id)}/content`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
         if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return "";
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-        objectUrls.set(storageKey, url);
-        return url;
+        return setImageBlob(storageKey, await response.blob());
     }
-    if (storageKey.startsWith("server:")) {
-        const ownerId = getAccountOwnerId();
-        const token = useUserStore.getState().token;
-        const id = storageKey.slice("server:".length);
-        if (fallback && !fallback.startsWith("blob:") && !isProtectedImageUrl(fallback)) return fallback;
-        const cached = objectUrls.get(storageKey);
-        if (cached) return cached;
-        const blob = await store.getItem<Blob>(storageKey).catch(() => null);
-        if (blob) {
-            const url = URL.createObjectURL(blob);
-            objectUrls.set(storageKey, url);
-            return url;
-        }
-        const cachedUrl = serverUrls.get(serverUrlCacheKey(ownerId, id));
-        if (cachedUrl && !isProtectedImageUrl(cachedUrl)) return cachedUrl;
-        const info = await apiGet<{ publicUrl?: string }>(`/api/files/${encodeURIComponent(id)}`, undefined, token).catch(() => null);
-        if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
-        if (info?.publicUrl) {
-            serverUrls.set(serverUrlCacheKey(ownerId, id), info.publicUrl);
-            return info.publicUrl;
-        }
-        if (!token) return fallback;
-        // 私有对象地址只能由浏览器携带站内令牌读取，不能直接作为公开参考图地址交给上游模型。
-        const contentUrl = protectedImagePath(cachedUrl) || protectedImagePath(fallback) || `/api/files/${encodeURIComponent(id)}/content`;
-        const response = await fetch(contentUrl, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
-        if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
-        const privateBlob = await response.blob();
-        const url = URL.createObjectURL(privateBlob);
-        objectUrls.set(storageKey, url);
-        serverUrls.set(serverUrlCacheKey(ownerId, id), url);
-        return url;
+
+    if (storageKey.startsWith("server:webdav:")) {
+        const localUrl = await resolveLocalImageUrl(storageKey).catch(() => "");
+        if (localUrl) return localUrl;
+        const provider = loadUserStorageProvider();
+        if (provider?.type !== "webdav") return fallback;
+        const direct = await import("@/services/webdav-direct-storage");
+        return setImageBlob(storageKey, await direct.readDirectWebDAV(provider, direct.directWebDAVObjectKey(storageKey)));
     }
+
+    if (!storageKey.startsWith("server:")) return await resolveLocalImageUrl(storageKey) || fallback;
+    const ownerId = getAccountOwnerId();
+    const token = useUserStore.getState().token;
+    const id = storageKey.slice("server:".length);
+    if (fallback && !fallback.startsWith("blob:") && !isProtectedImageUrl(fallback) && !fallback.includes("direct=1") && !fallback.startsWith("/webdav-media/")) return fallback;
+
+    const localUrl = await resolveLocalImageUrl(storageKey).catch(() => "");
+    if (localUrl) return localUrl;
+
+    const cacheKey = serverUrlCacheKey(ownerId, id);
+    const cachedUrl = serverUrls.get(cacheKey);
+    if (cachedUrl && !isProtectedImageUrl(cachedUrl)) return cachedUrl;
+
+    const info = await apiGet<{ publicUrl?: string; direct?: boolean; objectKey?: string; mimeType?: string }>(`/api/files/${encodeURIComponent(id)}`, undefined, token).catch(() => null);
+    if (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token || !info) return fallback;
+
+    const provider = loadUserStorageProvider(ownerId);
+    if (info.direct && info.objectKey && provider?.type === "webdav") {
+        const direct = await import("@/services/webdav-direct-storage");
+        try {
+            return setImageBlob(storageKey, await direct.readDirectWebDAV(provider, info.objectKey, info.mimeType));
+        } catch (error) {
+            if (!token || !direct.isWebDAVDirectUnavailable(error)) throw error;
+        }
+    }
+
+    if (info.publicUrl) {
+        serverUrls.set(cacheKey, info.publicUrl);
+        return info.publicUrl;
+    }
+    if (!token) return fallback;
+
+    // 私有对象只允许当前浏览器携带令牌读取，不能把裸接口地址交给模型或外部页面。
+    const contentUrl = protectedImagePath(cachedUrl) || protectedImagePath(fallback) || `/api/files/${encodeURIComponent(id)}/content`;
+    const response = await fetch(contentUrl, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+    if (!response?.ok || getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token) return fallback;
+    const url = await setImageBlob(storageKey, await response.blob());
+    serverUrls.set(cacheKey, url);
+    return url;
+}
+
+async function resolveLocalImageUrl(storageKey: string) {
     const cached = objectUrls.get(storageKey);
     if (cached) return cached;
     const blob = await store.getItem<Blob>(storageKey);
-    if (!blob) return fallback;
+    if (!blob) return "";
     const url = URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
     return url;
@@ -305,11 +350,54 @@ async function uploadImageBlobToGeneratedMedia(blob: Blob, filename: string, req
         const config = await loadStorageConfig().catch(() => null);
         const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
         const autoUpload = Boolean(config && (canUseGlobalStorage(config) || userProvider));
-        // 登录用户的图片先由服务器落盘，云端只是可选同步；这样云端故障不会阻断素材和参考图上传。
+        // 登录用户先保存在生成媒体目录；对象存储同步失败不应让素材和参考图丢失。
         return await saveGeneratedImage(blob, filename, meta.width, meta.height, autoUpload, requestToken, requestOwnerId);
     } finally {
         URL.revokeObjectURL(previewUrl);
     }
+}
+
+async function maybeUploadImageToServer(blob: Blob, requestOwnerId: string): Promise<UploadedImage | null> {
+    const config = await loadStorageConfig().catch(() => null);
+    const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
+    const canUseGlobalProvider = config ? canUseGlobalStorage(config) : false;
+    if (!config || (!canUseGlobalProvider && !userProvider)) return null;
+
+    const token = useUserStore.getState().token;
+    if (token) return null;
+    if (!userProvider) {
+        if (canUseGlobalProvider) throw new Error("服务端存储需要先登录");
+        return null;
+    }
+
+    if (userProvider.type === "webdav" && getAccountOwnerId() === requestOwnerId) {
+        const directUpload = await uploadWebDAVImageDirect(blob, `image-${nanoid()}.${imageExtension(blob.type)}`, userProvider, requestOwnerId);
+        if (directUpload) return directUpload;
+    }
+
+    try {
+        const uploaded = await uploadAnonymousStorageFile<UploadedImage>(blob, `image-${nanoid()}.${imageExtension(blob.type)}`, toProviderPayload(userProvider));
+        return cacheAnonymousImage(uploaded, blob, requestOwnerId);
+    } catch {
+        return null;
+    }
+}
+
+async function uploadWebDAVImageDirect(blob: Blob, filename: string, provider: UserWebDAVStorageProvider, ownerId = getAccountOwnerId()): Promise<UploadedImage | null> {
+    const direct = await import("@/services/webdav-direct-storage");
+    const uploaded = await direct.persistDirectWebDAV(provider, blob, filename);
+    return uploaded ? cacheAnonymousImage({ ...uploaded, width: 0, height: 0 }, blob, ownerId) : null;
+}
+
+async function cacheAnonymousImage(uploaded: UploadedImage, blob: Blob, ownerId = getAccountOwnerId()) {
+    await store.setItem(uploaded.storageKey, blob);
+    const url = URL.createObjectURL(blob);
+    objectUrls.set(uploaded.storageKey, url);
+    if (uploaded.storageKey.startsWith("server:") && uploaded.url && !isProtectedImageUrl(uploaded.url)) {
+        serverUrls.set(serverUrlCacheKey(ownerId, uploaded.storageKey.slice("server:".length)), uploaded.url);
+    }
+    const meta = await readImageMeta(url);
+    return { ...uploaded, url, width: uploaded.width || meta.width, height: uploaded.height || meta.height, mimeType: uploaded.mimeType || blob.type || meta.mimeType, bytes: uploaded.bytes || blob.size };
 }
 
 async function saveImageToBrowser(blob: Blob): Promise<UploadedImage> {
@@ -344,19 +432,24 @@ export async function setImageBlob(storageKey: string, blob: Blob) {
 }
 
 export async function imageToDataUrl(image: { url?: string; dataUrl?: string; storageKey?: string }) {
-    const resolvedStorageUrl = await resolveImageUrl(image.storageKey, image.url || image.dataUrl || "");
+    const storageKey = image.storageKey;
+    const serverObjectId = storageKey?.startsWith("server:") && !storageKey.startsWith("server:webdav:") ? storageKey.slice("server:".length) : "";
+    const resolvedStorageUrl = storageKey ? await resolveImageUrl(storageKey, image.url || image.dataUrl || "") : "";
+    const token = useUserStore.getState().token;
     const urls = [
-        image.dataUrl && !image.dataUrl.startsWith("blob:") && !image.dataUrl.includes("/api/files/") ? image.dataUrl : "",
-        image.url && !image.url.startsWith("blob:") && !image.url.includes("/api/files/") ? image.url : "",
+        image.dataUrl && !image.dataUrl.startsWith("blob:") && !isProtectedImageUrl(image.dataUrl) ? image.dataUrl : "",
+        image.url && !image.url.startsWith("blob:") && !isProtectedImageUrl(image.url) ? image.url : "",
         resolvedStorageUrl,
+        serverObjectId && token ? `/api/files/${encodeURIComponent(serverObjectId)}/content` : "",
     ].filter((url, index, list): url is string => Boolean(url) && list.indexOf(url) === index);
     if (!urls.length) return "";
+
     let lastError = "";
     for (const url of urls) {
         if (url.startsWith("data:")) return url;
         try {
-            const proxyUrl = getProxyUrl(url);
-            const response = await fetch(proxyUrl);
+            const protectedPath = protectedImagePath(url);
+            const response = await fetch(protectedPath || getProxyUrl(url), protectedPath && token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
             if (!response.ok) {
                 lastError = `读取参考图失败：${response.status}`;
                 continue;
@@ -474,11 +567,11 @@ export function loadUserStorageProvider(ownerId = getAccountOwnerId()): UserStor
 }
 
 export function saveUserStorageProvider(provider: UserS3StorageProvider) {
-    window.localStorage.setItem(getAccountStorageKey(USER_STORAGE_PROVIDER_KEY, ownerId), JSON.stringify({ ...defaultUserStorageProvider(), ...provider, type: "s3" }));
+    window.localStorage.setItem(getAccountStorageKey(USER_STORAGE_PROVIDER_KEY, getAccountOwnerId()), JSON.stringify({ ...defaultUserStorageProvider(), ...provider, type: "s3" }));
 }
 
 export function saveUserWebDAVStorageProvider(provider: UserWebDAVStorageProvider) {
-    window.localStorage.setItem(getAccountStorageKey(USER_WEBDAV_STORAGE_PROVIDER_KEY, ownerId), JSON.stringify({ ...defaultUserWebDAVStorageProvider(), ...provider, type: "webdav" }));
+    window.localStorage.setItem(getAccountStorageKey(USER_WEBDAV_STORAGE_PROVIDER_KEY, getAccountOwnerId()), JSON.stringify({ ...defaultUserWebDAVStorageProvider(), ...provider, type: "webdav" }));
 }
 
 function validS3Provider(provider: UserS3StorageProvider) {
@@ -545,15 +638,44 @@ async function deleteLocalGeneratedImage(storageKey: string, ownerId = getAccoun
     if (!response.ok || payload?.code !== 0) throw new Error(payload?.msg || "删除本地生成图片失败");
 }
 
-async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId(), token = useUserStore.getState().token) {
-    const id = storageKey.slice("server:".length);
-    if (!id) return;
+function clearCachedImage(storageKey: string, ownerId: string, id: string) {
     const url = objectUrls.get(storageKey);
     if (url) URL.revokeObjectURL(url);
     objectUrls.delete(storageKey);
     serverUrls.delete(serverUrlCacheKey(ownerId, id));
-    if (!token) return;
+}
+
+async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId(), token = useUserStore.getState().token) {
+    const id = storageKey.slice("server:".length);
+    if (!id) return;
     const provider = loadUserStorageProvider(ownerId);
+    clearCachedImage(storageKey, ownerId, id);
+
+    if (storageKey.startsWith("server:webdav:")) {
+        if (provider?.type !== "webdav") return;
+        if (getAccountOwnerId() === ownerId && useUserStore.getState().token === token) {
+            const direct = await import("@/services/webdav-direct-storage");
+            if (await direct.deletePersistedDirectWebDAV(provider, storageKey)) {
+                await store.removeItem(storageKey);
+                return;
+            }
+        }
+        return;
+    } else if (provider?.type === "webdav" && getAccountOwnerId() === ownerId && useUserStore.getState().token === token) {
+        const direct = await import("@/services/webdav-direct-storage");
+        if (await direct.deletePersistedDirectWebDAV(provider, storageKey)) {
+            await store.removeItem(storageKey);
+            return;
+        }
+    }
+
+    if (!token) {
+        if (!provider) return;
+        await deleteAnonymousStorageFile(id, toProviderPayload(provider));
+        await store.removeItem(storageKey);
+        return;
+    }
+
     const response = await fetch(`/api/v1/files/${encodeURIComponent(id)}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -561,6 +683,7 @@ async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId
     });
     const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string } | null;
     if (!response.ok || payload?.code !== 0) throw new Error(payload?.msg || "删除服务端图片失败");
+    await store.removeItem(storageKey);
 }
 
 function blobToDataUrl(blob: Blob) {

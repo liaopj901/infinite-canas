@@ -1,6 +1,6 @@
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { seedanceReferenceLabel } from "@/lib/seedance-video";
-import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "../types";
+import { CanvasNodeType, type CanvasAssistantReference, type CanvasConnection, type CanvasNodeData } from "../types";
 import { isCanvasImageNodeType } from "./canvas-panorama";
 
 export type CanvasResourceKind = "image" | "video" | "audio" | "text";
@@ -15,6 +15,15 @@ export type CanvasResourceReference = {
     text?: string;
     active: boolean;
 };
+
+export function assistantReferenceContentFromNode(node: CanvasNodeData): Partial<CanvasAssistantReference> | null {
+    const content = node.metadata?.content;
+    if (!content) return null;
+    if (isCanvasImageNodeType(node.type)) return { dataUrl: content, url: undefined, storageKey: node.metadata.storageKey, mimeType: node.metadata.mimeType };
+    if (node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) return { dataUrl: undefined, url: content, storageKey: node.metadata.storageKey, mimeType: node.metadata.mimeType };
+    if (node.type === CanvasNodeType.Text) return { text: content };
+    return null;
+}
 
 export function buildCanvasResourceReferences(nodes: CanvasNodeData[], connections: CanvasConnection[], contextNodeId?: string | null) {
     const contextNodes = contextNodeId ? getMentionResourceNodes(contextNodeId, nodes, connections) : [];

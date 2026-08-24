@@ -1,12 +1,15 @@
 import axios from "axios";
 
-import { dataUrlToFile } from "@/lib/image-utils";
+import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
+import { isMiniMaxH3Config, normalizeMiniMaxH3Duration, normalizeMiniMaxH3Ratio, normalizeMiniMaxH3Resolution } from "@/lib/minimax-video";
+import { dataUrlToGeminiInlineData, geminiActionUrl, geminiDirectHeaders, geminiErrorMessage, geminiOperationUrl, isGeminiConfig, isGeminiVideoModel } from "@/lib/gemini";
+import { isGeminiVeo31Model, normalizeGeminiVideoDuration, normalizeGeminiVideoRatio, normalizeGeminiVideoResolution } from "@/lib/gemini-video";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio } from "@/lib/seedance-video";
 import { isKIEGrokVideoModel, isKIEKlingV3Config, kieKlingOmniVariant } from "@/components/video-settings-panel";
-import { isCogVideoX3Model, modelKey, normalizeCogVideoX3Duration, supportsVideoAudioGeneration } from "@/lib/video-model-capabilities";
+import { isAgnesVideoV25Model, isCogVideoX3Model, modelKey, normalizeCogVideoX3Duration, supportsVideoAudioGeneration } from "@/lib/video-model-capabilities";
 import { resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
 import { imageToDataUrl, resolveImageUrl } from "@/services/image-storage";
-import { buildApiUrl, channelIdForActiveModel, directAIProviderForConfig, localChannelForActiveModel, type AiConfig, type VideoElementReference } from "@/stores/use-config-store";
+import { buildApiUrl, channelIdForActiveModel, channelProtocolForConfig, directAIProviderForConfig, localChannelForActiveModel, type AiConfig, type VideoElementReference } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -42,6 +45,13 @@ function aiApiUrl(config: AiConfig, path: string) {
 }
 
 function aiVideoPollUrl(config: AiConfig, model: string, id: string) {
+    if (!usesAccountProxy(config) && isGeminiConfig(config, model)) {
+        const channel = localChannelForActiveModel(config);
+        return geminiOperationUrl(channel?.baseUrl || config.baseUrl, id);
+    }
+    if (!usesAccountProxy(config) && isMiniMaxH3Config(config, model)) {
+        return miniMaxApiUrl(config, `/v2/query/video_generation/${encodeURIComponent(id)}`);
+    }
     if (!usesAccountProxy(config) && isCogVideoX3Model(model)) {
         return aiApiUrl(config, `/async-result/${encodeURIComponent(id)}`);
     }
@@ -56,6 +66,11 @@ function aiVideoPollUrl(config: AiConfig, model: string, id: string) {
     return `${baseUrl}/agnesapi?video_id=${encodeURIComponent(id)}&model_name=${encodeURIComponent(model)}`;
 }
 
+function miniMaxApiUrl(config: AiConfig, path: string) {
+    const channel = localChannelForActiveModel(config);
+    return `${(channel?.baseUrl || config.baseUrl).trim().replace(/\/+$/, "")}${path}`;
+}
+
 function agnesBaseUrl(baseUrl: string) {
     const normalized = baseUrl.trim().replace(/\/+$/, "");
     return normalized.toLowerCase().endsWith("/v1") ? normalized.slice(0, -3).replace(/\/+$/, "") : normalized;
@@ -66,6 +81,7 @@ function aiHeaders(config: AiConfig) {
     if (config.channelMode === "remote" && !token) throw new Error("请先登录后再使用云端渠道");
     if (config.channelMode === "remote") return { Authorization: `Bearer ${token}`, ...(channelIdForActiveModel(config) ? { "X-Model-Channel-ID": channelIdForActiveModel(config) } : {}) };
     if (token) return { Authorization: `Bearer ${token}`, ...(channelIdForActiveModel(config) ? { "X-User-Model-Channel-ID": channelIdForActiveModel(config) } : {}) };
+    if (isGeminiConfig(config)) return geminiDirectHeaders(config);
     return { Authorization: `Bearer ${localChannelForActiveModel(config)?.apiKey || config.apiKey}` };
 }
 
@@ -99,9 +115,16 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
         const accountProxy = usesAccountProxy(config);
         const headers = { ...aiHeaders(config), ...(accountProxy && createOptions.clientTaskId ? { "X-Client-Video-Task-ID": createOptions.clientTaskId } : {}), ...(accountProxy && createOptions.source ? { "X-Video-Task-Source": createOptions.source } : {}), ...(accountProxy && createOptions.sourceId ? { "X-Video-Task-Source-ID": createOptions.sourceId } : {}) };
         const directProvider = !accountProxy ? directAIProviderForConfig(config) : null;
+        const channel = localChannelForActiveModel(config);
+        const createUrl = !accountProxy && isGeminiConfig(config, model)
+            ? geminiActionUrl(channel?.baseUrl || config.baseUrl, model, "predictLongRunning")
+            : !accountProxy && isMiniMaxH3Config(config, model)
+                ? miniMaxApiUrl(config, "/v2/video_generation")
+                : aiApiUrl(config, !accountProxy && (isGrok2APIVideoConfig(config, model) || isCogVideoX3Model(model)) ? "/videos/generations" : "/videos");
+        const requestBody = !accountProxy && isGeminiConfig(config, model) ? withoutVideoModel(body) : body;
         const created = directProvider
             ? await (await import("@/services/api/direct-ai")).createDirectVideoTask(config, directProvider, body)
-            : unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, !accountProxy && (isGrok2APIVideoConfig(config, model) || isCogVideoX3Model(model)) ? "/videos/generations" : "/videos"), body, { headers })).data);
+            : unwrapVideoResponseForConfig(config, model, (await axios.post<ApiVideoResponse>(createUrl, requestBody, { headers })).data);
         if (!created.id && !created.video_id) throw new Error("视频接口没有返回任务 ID");
         if (typeof created.progress === "number") onProgress?.(created.progress, created);
         return { task: created, pollId: videoPollId(model, created), startedAt, requestBody: body };
@@ -124,12 +147,12 @@ export async function pollCreatedVideoGenerationTask(config: AiConfig, task: Vid
     const directPoll = directProvider ? (await import("@/services/api/direct-ai")).pollDirectVideoTask : null;
     const pollOnce = directProvider && directPoll
         ? () => directPoll(config, directProvider, pollId)
-        : async () => unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data);
+        : async () => unwrapVideoResponseForConfig(config, model, (await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data);
     let completed: VideoResponse | null = null;
     try {
         if (initialDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, initialDelayMs));
         for (; ;) {
-            const video = await pollOnce();
+            const video = await cacheProtectedGeminiVideo(config, model, await pollOnce());
             onPoll?.(video);
             if (isFailedVideoStatus(video.status)) throw new VideoRequestError(video.error?.message || "视频生成失败", video);
             if (typeof video.progress === "number") onProgress?.(video.progress, video);
@@ -159,8 +182,8 @@ export async function pollVideoGenerationTaskStatus(config: AiConfig, task: Vide
     const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
     const result = directProvider
         ? await (await import("@/services/api/direct-ai")).pollDirectVideoTask(config, directProvider, pollId)
-        : unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data);
-    return cacheProtectedGrokVideo(config, model, result);
+        : unwrapVideoResponseForConfig(config, model, (await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data);
+    return cacheProtectedGeminiVideo(config, model, await cacheProtectedGrokVideo(config, model, result));
 }
 
 export async function listVideoGenerationTasks(config: AiConfig) {
@@ -179,9 +202,8 @@ export async function deleteVideoGenerationTask(config: AiConfig, task?: VideoRe
 }
 
 function isGrok2APIVideoConfig(config: AiConfig, model: string) {
-    if (model.trim().toLowerCase() !== "grok-imagine-video") return false;
-    const channel = videoChannelText(config, model);
-    return !channel.includes("kie") && !channel.includes("apimart");
+    const normalizedModel = model.trim().toLowerCase();
+    return (normalizedModel === "grok-imagine-video" || normalizedModel === "grok-imagine-video-1.5") && videoChannelProtocol(config, model) === "grok2api";
 }
 
 async function cacheProtectedGrokVideo(config: AiConfig, model: string, task: VideoResponse) {
@@ -204,18 +226,45 @@ async function createGrok2APIVideoRequestBody(config: AiConfig, model: string, p
     const aspectRatio = normalizeSeedanceRatio(config.size);
     if (aspectRatio !== "adaptive") body.aspect_ratio = aspectRatio;
 
-    const references = [input.firstFrame, ...input.references, input.lastFrame].filter((reference): reference is ReferenceImage => Boolean(reference));
-    const urls = await Promise.all(references.map((reference) => imageToDataUrl(reference)));
-    if (urls.length) body.image = { url: urls[0] };
-    if (urls.length > 1) body.reference_images = urls.slice(1).map((url) => ({ url }));
+    const urls = await Promise.all(input.references.map((reference) => imageToDataUrl(reference)));
+    if (urls.length === 1) body.image = { url: urls[0] };
+    else if (urls.length > 1) body.reference_images = urls.map((url) => ({ url }));
 
+    return body;
+}
+
+async function createAgnesVideoV25RequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
+    const hasFrames = Boolean(input.firstFrame || input.lastFrame);
+    const hasReferences = Boolean(input.references.length || input.videoReferences.length || input.audioReferences.length);
+    if (hasFrames && hasReferences) throw new VideoRequestError("Agnes Video 2.5 的首尾帧不能和普通参考素材同时使用");
+
+    const ratio = normalizeSeedanceRatio(config.size);
+    const body: Record<string, unknown> = {
+        model,
+        prompt,
+        mode: hasFrames ? "keyframe" : hasReferences ? "reference" : "text",
+        seconds: String(Math.min(12, Math.max(4, Math.floor(Number(config.videoSeconds) || 5)))),
+        size: "720P",
+        aspect_ratio: ratio === "adaptive" ? "16:9" : ratio,
+    };
+    if (input.firstFrame) body.first_frame = await agnesVideoV25ReferenceUrl(input.firstFrame);
+    if (input.lastFrame) body.last_frame = await agnesVideoV25ReferenceUrl(input.lastFrame);
+    if (input.references.length) body.images = await Promise.all(input.references.map(agnesVideoV25ReferenceUrl));
+    if (input.audioReferences.length) body.audios = await Promise.all(input.audioReferences.map(agnesVideoV25ReferenceUrl));
+    if (input.videoReferences.length) {
+        const urls = await Promise.all(input.videoReferences.map(agnesVideoV25ReferenceUrl));
+        body.videos = urls.map((url) => ({ url }));
+    }
     return body;
 }
 
 async function createVideoRequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
     const size = normalizeVideoSize(config.size);
+    if (isGeminiVideoModel(model) && isGeminiConfig(config, model)) return createGeminiVeoRequestBody(config, model, prompt, input);
     if (isGrok2APIVideoConfig(config, model)) return createGrok2APIVideoRequestBody(config, model, prompt, input);
+    if (isMiniMaxH3Config(config, model)) return createMiniMaxH3VideoRequestBody(config, model, prompt, input);
     if (isCogVideoX3Model(model)) return createCogVideoX3RequestBody(config, model, prompt, input);
+    if (isAgnesVideoV25Model(model)) return createAgnesVideoV25RequestBody(config, model, prompt, input);
     if (isAgnesVideoModel(model)) {
         const references = input.references;
         const inputReferences = await Promise.all(references.slice(0, 7).map(imageToAgnesReference));
@@ -292,6 +341,48 @@ async function createVideoRequestBody(config: AiConfig, model: string, prompt: s
     return body;
 }
 
+async function createMiniMaxH3VideoRequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
+    const hasFrames = Boolean(input.firstFrame || input.lastFrame);
+    const hasReferences = Boolean(input.references.length || input.videoReferences.length || input.audioReferences.length);
+    if (hasFrames && hasReferences) throw new VideoRequestError("MiniMax-H3 首尾帧不能与参考图片、视频或音频同时使用");
+    if (input.audioReferences.length && !input.references.length && !input.videoReferences.length) {
+        throw new VideoRequestError("MiniMax-H3 参考音频需要同时提供参考图片或参考视频");
+    }
+
+    const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+    if (hasFrames) {
+        const frames = [
+            { reference: input.firstFrame, role: "first_frame" },
+            { reference: input.lastFrame, role: "last_frame" },
+        ].filter((item): item is { reference: ReferenceImage; role: string } => Boolean(item.reference));
+        const urls = await Promise.all(frames.map((item) => miniMaxReferenceValue(imageReferenceToFormValue(item.reference))));
+        frames.forEach((item, index) => content.push({ type: "image_url", image_url: { url: urls[index] }, role: item.role }));
+    } else if (hasReferences) {
+        const [images, videos, audios] = await Promise.all([
+            Promise.all(input.references.map((reference) => miniMaxReferenceValue(imageReferenceToFormValue(reference)))),
+            Promise.all(input.videoReferences.map((reference) => miniMaxReferenceValue(mediaReferenceToFormValue(reference)))),
+            Promise.all(input.audioReferences.map((reference) => miniMaxReferenceValue(mediaReferenceToFormValue(reference)))),
+        ]);
+        images.forEach((url) => content.push({ type: "image_url", image_url: { url }, role: "reference_image" }));
+        videos.forEach((url) => content.push({ type: "video_url", video_url: { url }, role: "reference_video" }));
+        audios.forEach((url) => content.push({ type: "audio_url", audio_url: { url }, role: "reference_audio" }));
+    }
+
+    const selectedRatio = normalizeMiniMaxH3Ratio(config.size);
+    return {
+        model,
+        content,
+        resolution: normalizeMiniMaxH3Resolution(config.vquality),
+        duration: normalizeMiniMaxH3Duration(config.videoSeconds),
+        ratio: hasFrames ? "adaptive" : !hasReferences && selectedRatio === "adaptive" ? "16:9" : selectedRatio,
+    };
+}
+
+async function miniMaxReferenceValue(value: Promise<string | File>) {
+    const reference = await value;
+    return typeof reference === "string" ? reference : readFileAsDataUrl(reference);
+}
+
 async function createCogVideoX3RequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
     if (input.videoReferences.length || input.audioReferences.length) throw new VideoRequestError("CogVideoX-3 不支持参考视频或参考音频");
     const frames = [input.firstFrame, input.lastFrame].filter((frame): frame is ReferenceImage => Boolean(frame));
@@ -337,20 +428,15 @@ function isKIEKlingMotionControlVideoConfig(config: AiConfig, model: string) {
 }
 
 function isAPIMartKlingVideoConfig(config: AiConfig, model: string, key: string) {
-    return modelKey(model) === key && videoChannelText(config, model).includes("apimart");
+    return modelKey(model) === key && videoChannelProtocol(config, model) === "apimart";
 }
 
 function isKIEKlingVideoConfig(config: AiConfig, model: string, key: string) {
-    return modelKey(model) === key && videoChannelText(config, model).includes("kie");
+    return modelKey(model) === key && videoChannelProtocol(config, model) === "kie";
 }
 
-function videoChannelText(config: AiConfig, model: string) {
-    const scopedConfig = { ...config, model, videoModel: model };
-    const channelId = channelIdForActiveModel(scopedConfig);
-    const channels = config.channelMode === "remote" ? config.publicChannels : [localChannelForActiveModel(scopedConfig)];
-    const channel = channels.find((item) => (item?.id || "") === channelId) || channels[0];
-    const record = channel as { id?: string; name?: string; baseUrl?: string; remark?: string } | undefined;
-    return [record?.id, record?.name, record?.baseUrl, record?.remark].filter(Boolean).join(" ").toLowerCase();
+function videoChannelProtocol(config: AiConfig, model: string) {
+    return channelProtocolForConfig({ ...config, model, videoModel: model });
 }
 
 function normalizeCharacterOrientation(value: string | undefined) {
@@ -490,6 +576,15 @@ async function imageToAgnesReference(image: ReferenceImage) {
     return imageToDataUrl(image);
 }
 
+async function agnesVideoV25ReferenceUrl(reference: ReferenceImage | ReferenceVideo | ReferenceAudio) {
+    const resolvedUrl = "dataUrl" in reference
+        ? await resolveImageUrl(reference.storageKey, reference.url || "")
+        : await resolveMediaUrl(reference.storageKey, reference.url);
+    const url = publicHttpUrl(reference.url) || ("dataUrl" in reference ? publicHttpUrl(reference.dataUrl) : "") || publicHttpUrl(resolvedUrl);
+    if (!url) throw new VideoRequestError("Agnes Video 2.5 的参考素材必须具有公网访问地址");
+    return url;
+}
+
 function publicHttpUrl(value?: string) {
     if (!value || value.startsWith("blob:") || value.startsWith("data:")) return "";
     try {
@@ -579,6 +674,107 @@ function unwrapVideoResponse(payload: ApiVideoResponse): VideoResponse {
     return normalizeVideoResponse(payload);
 }
 
+function unwrapVideoResponseForConfig(config: AiConfig, model: string, payload: ApiVideoResponse) {
+    if (isGeminiVideoModel(model) && isGeminiConfig(config, model)) return normalizeGeminiVideoResponse(payload);
+    if (isMiniMaxH3Config(config, model)) {
+        const root = payload as unknown as Record<string, unknown>;
+        const task = root.task && typeof root.task === "object" ? root.task as Record<string, unknown> : null;
+        if (task) {
+            const content = task.content && typeof task.content === "object" ? task.content as Record<string, unknown> : {};
+            return normalizeVideoResponse({
+                ...task,
+                task_id: firstString(task.id),
+                video_url: firstString(content.url, task.video_url),
+                seconds: task.duration == null ? undefined : String(task.duration),
+                size: firstString(task.resolution, task.size),
+            });
+        }
+    }
+    return unwrapVideoResponse(payload);
+}
+
+async function createGeminiVeoRequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
+    if (input.videoReferences.length) throw new VideoRequestError("Gemini Veo 不支持普通参考视频，请移除后重试");
+    if (input.audioReferences.length) throw new VideoRequestError("Gemini Veo 不支持参考音频，请移除后重试");
+    if (input.lastFrame && !input.firstFrame) throw new VideoRequestError("请先添加首帧图片");
+    const hasFrames = Boolean(input.firstFrame || input.lastFrame);
+    if (hasFrames && input.references.length) throw new VideoRequestError("首尾帧模式不能与普通参考图同时使用");
+    if ((input.lastFrame || input.references.length) && !isGeminiVeo31Model(model)) throw new VideoRequestError("当前 Veo 模型不支持尾帧或普通参考图");
+    if (input.references.length > 3) throw new VideoRequestError("Veo 3.1 参考图最多 3 张");
+
+    const instance: Record<string, unknown> = { prompt };
+    if (input.firstFrame) instance.image = dataUrlToGeminiInlineData(await imageToDataUrl(input.firstFrame));
+    if (input.lastFrame) instance.lastFrame = dataUrlToGeminiInlineData(await imageToDataUrl(input.lastFrame));
+    if (input.references.length) {
+        const images = await Promise.all(input.references.map(imageToDataUrl));
+        instance.referenceImages = images.map((image) => ({ image: dataUrlToGeminiInlineData(image), referenceType: "asset" }));
+    }
+    const resolution = normalizeGeminiVideoResolution(config.vquality);
+    const forceEightSeconds = resolution !== "720p" || hasFrames || input.references.length > 0;
+    const aspectRatio = normalizeGeminiVideoRatio(config.size);
+    return {
+        model,
+        instances: [instance],
+        parameters: {
+            ...(aspectRatio ? { aspectRatio } : {}),
+            durationSeconds: normalizeGeminiVideoDuration(config.videoSeconds, forceEightSeconds),
+            resolution,
+        },
+    };
+}
+
+function normalizeGeminiVideoResponse(payload: ApiVideoResponse): VideoResponse {
+    const root = payload as unknown as Record<string, unknown>;
+    if (typeof root.code === "number") return unwrapVideoResponse(payload);
+    const name = firstString(root.name);
+    const error = root.error && typeof root.error === "object" ? root.error as Record<string, unknown> : {};
+    const videoUrl = geminiVideoUri(root);
+    const done = root.done === true;
+    return normalizeVideoResponse({
+        ...root,
+        id: name,
+        task_id: name,
+        status: Object.keys(error).length ? "failed" : done && videoUrl ? "completed" : done ? "failed" : "processing",
+        progress: done ? 100 : 0,
+        video_url: videoUrl,
+        error: Object.keys(error).length ? { message: geminiErrorMessage(root, "视频生成失败") } : done && !videoUrl ? { message: "Gemini Veo 任务完成但没有返回视频地址" } : undefined,
+    });
+}
+
+function geminiVideoUri(value: unknown, depth = 0): string {
+    if (depth > 8 || value == null) return "";
+    if (typeof value === "string") return /^https?:\/\//.test(value) ? value : "";
+    if (Array.isArray(value)) return value.map((item) => geminiVideoUri(item, depth + 1)).find(Boolean) || "";
+    if (typeof value !== "object") return "";
+    const record = value as Record<string, unknown>;
+    const direct = firstString(record.uri, record.videoUri, record.video_url, record.url);
+    if (/^https?:\/\//.test(direct)) return direct;
+    for (const item of Object.values(record)) {
+        const found = geminiVideoUri(item, depth + 1);
+        if (found) return found;
+    }
+    return "";
+}
+
+async function cacheProtectedGeminiVideo(config: AiConfig, model: string, task: VideoResponse) {
+    const url = task.video_url || task.url || "";
+    if (!isGeminiConfig(config, model) || !isCompletedVideoStatus(task.status) || task.storageKey || !url) return task;
+    const localTaskId = task.id || task.task_id || "";
+    const response = await fetch(
+        usesAccountProxy(config) ? `${aiApiUrl(config, `/videos/${encodeURIComponent(localTaskId)}/content`)}?model=${encodeURIComponent(model)}` : url,
+        { headers: usesAccountProxy(config) ? aiHeaders(config) : geminiDirectHeaders(config) },
+    );
+    if (!response.ok) throw new VideoRequestError(`视频内容下载失败：${response.status}`, task);
+    const media = await uploadMediaFile(await response.blob(), "generated-video");
+    return { ...task, url: media.url, video_url: media.url, storageKey: media.storageKey };
+}
+
+function withoutVideoModel(body: FormData | Record<string, unknown>) {
+    if (body instanceof FormData) return body;
+    const { model: _model, ...nativeBody } = body;
+    return nativeBody;
+}
+
 function isVideoEnvelope(payload: ApiVideoResponse): payload is ApiVideoEnvelope {
     return "code" in payload && typeof payload.code === "number";
 }
@@ -662,8 +858,8 @@ function redactLogMedia(value: unknown) {
     const record = value as Record<string, unknown>;
     for (const key of Object.keys(record)) {
         const item = record[key];
-        if (typeof item === "string" && (item.startsWith("data:image/") || item.includes("data:image/") || item.length > 2048 && looksLikeBase64(item))) {
-            record[key] = `[redacted image/string len=${item.length}]`;
+        if (typeof item === "string" && (item.startsWith("data:image/") || item.startsWith("data:video/") || item.startsWith("data:audio/") || item.includes("data:image/") || item.includes("data:video/") || item.includes("data:audio/") || item.length > 2048 && looksLikeBase64(item))) {
+            record[key] = `[redacted media/string len=${item.length}]`;
             continue;
         }
         redactLogMedia(item);

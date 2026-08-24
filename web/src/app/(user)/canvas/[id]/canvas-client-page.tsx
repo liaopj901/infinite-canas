@@ -12,7 +12,7 @@ import { getCanvasProjectTitle } from "@/constant/brand";
 import { createCanvasImageTask, pollCanvasImageTaskStatus, requestImageQuestion, type CanvasImageTask } from "@/services/api/image";
 import { createCanvasAudioTask, pollCanvasAudioTaskStatus, type CanvasAudioTask } from "@/services/api/audio";
 import { createVideoGenerationTask, pollVideoGenerationTaskStatus, VIDEO_POLL_INTERVAL_MS, type VideoResponse } from "@/services/api/video";
-import { defaultConfig, type AiConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
+import { channelProtocolForConfig, defaultConfig, type AiConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { collectImageStorageKeys, deleteStoredImages, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadGeneratedImageToCloud, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
 import { resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
@@ -33,6 +33,8 @@ import { App, Button, Dropdown, Modal } from "antd";
 import { isCogVideoX3Model, modelKey, supportsVideoAudioGeneration, supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
 import { isMimoVoiceCloneModel } from "@/lib/mimo-tts";
 import { isGlmTtsModel } from "@/lib/audio-generation";
+import { isGrok2APITtsConfig } from "@/lib/grok-tts";
+import { isGeminiConfig, isGeminiTtsModel } from "@/lib/gemini";
 import { isKIESeedreamLayerDecompositionModel } from "@/lib/kie-models";
 import { NODE_DEFAULT_SIZE, getNodeSpec } from "../constants";
 import { ActiveConnectionPath, ConnectionPath } from "../components/canvas-connections";
@@ -59,7 +61,7 @@ import { AssetPickerModal, type AssetPickerTab } from "../components/asset-picke
 import { CanvasZoomControls } from "../components/canvas-zoom-controls";
 import { CANVAS_ASSET_DRAG_TYPE, CanvasSidePanel } from "../components/canvas-side-panel";
 import { DEFAULT_CANVAS_AGENT_PANEL, DEFAULT_CANVAS_SIDE_PANEL, useCanvasStore } from "../stores/use-canvas-store";
-import { buildNodeMentionReferences } from "../utils/canvas-resource-references";
+import { assistantReferenceContentFromNode, buildNodeMentionReferences } from "../utils/canvas-resource-references";
 import { buildCanvasAgentContext } from "../agent/canvas-agent-context";
 import type { CanvasAgentAction, CanvasAgentToolResult } from "../agent/canvas-agent-tools";
 import {
@@ -493,7 +495,11 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
         const restore = async () => {
             const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes));
-            const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
+            const restoredSessions = syncAssistantReferences(
+                await hydrateAssistantImages(project.chatSessions || []),
+                restoredNodes,
+                true,
+            );
             if ((useUserStore.getState().user?.id || "guest") !== ownerId) return;
             setNodes(restoredNodes);
             setConnections(project.connections);
@@ -985,8 +991,20 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             const removedNodes = nodesRef.current.filter((node) => allIds.has(node.id));
             const remainingNodes = nodesRef.current.filter((node) => !allIds.has(node.id));
             const removedKeys = collectImageStorageKeys(removedNodes);
-            const usedKeys = collectImageStorageKeys({ nodes: remainingNodes, chatSessions, assets: useAssetStore.getState().assets });
+            const usedKeys = collectImageStorageKeys({ nodes: remainingNodes, assets: useAssetStore.getState().assets });
             const disposableKeys = [...removedKeys].filter((key) => !usedKeys.has(key));
+            setChatSessions((sessions) => sessions.map((session) => ({
+                ...session,
+                messages: session.messages.map((message) => ({
+                    ...message,
+                    references: message.references?.map((reference) => allIds.has(reference.id) ? {
+                        ...reference,
+                        dataUrl: undefined,
+                        url: undefined,
+                        storageKey: undefined,
+                    } : reference),
+                })),
+            })));
             if (disposableKeys.length) void deleteStoredImages(disposableKeys).catch((error) => message.error(error instanceof Error ? error.message : "图片文件删除失败"));
             const nextNodes = remainingNodes.map((node) => {
                 const nextNode = node.metadata?.groupId && allIds.has(node.metadata.groupId) ? { ...node, metadata: { ...node.metadata, groupId: undefined } } : node;
@@ -2018,6 +2036,15 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                     naturalHeight: uploaded.height || item.metadata?.naturalHeight,
                 },
             } : item)));
+            setChatSessions((sessions) => syncAssistantReferences(sessions, [{
+                ...node,
+                metadata: {
+                    ...node.metadata,
+                    content: uploaded.url,
+                    storageKey: uploaded.storageKey,
+                    mimeType: uploaded.mimeType,
+                },
+            }]));
             if (!automatic) message.success("图片已上传至云存储");
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "";
@@ -2894,7 +2921,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
                 if (mode === "video") {
                     const videoGenerationConfig = withCanvasVideoAdvancedConfig(generationConfig, generationContext);
-                    const frameReferencesEnabled = supportsVideoFrameReferences(videoGenerationConfig.model);
+                    const frameReferencesEnabled = supportsVideoFrameReferences(videoGenerationConfig.model, channelProtocolForConfig(videoGenerationConfig));
                     const firstFrame = frameReferencesEnabled ? generationContext.firstFrame : null;
                     const lastFrame = frameReferencesEnabled ? generationContext.lastFrame : null;
                     const videoReferenceImages = frameReferencesEnabled ? generationContext.referenceImages : [...generationContext.referenceImages, ...[generationContext.firstFrame, generationContext.lastFrame].filter((image): image is ReferenceImage => Boolean(image))];
@@ -3120,6 +3147,8 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
                 if (action.name === "get_generation_config") {
                     const videoModel = agentEffectiveConfig.videoModel || agentEffectiveConfig.model;
+                    const audioModel = agentEffectiveConfig.audioModel;
+                    const grokTts = isGrok2APITtsConfig({ ...agentEffectiveConfig, model: audioModel }, audioModel);
                     return {
                         ok: true,
                         models: {
@@ -3137,8 +3166,10 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         videoGenerateAudio: agentEffectiveConfig.videoGenerateAudio,
                         videoSupportsAudio: supportsVideoAudioGeneration(videoModel),
                         videoDuration: canvasAgentVideoDurationHint(videoModel),
-                        audioVoice: isGlmTtsModel(agentEffectiveConfig.audioModel) ? agentEffectiveConfig.glmTtsVoice : agentEffectiveConfig.audioVoice,
-                        audioFormat: isGlmTtsModel(agentEffectiveConfig.audioModel) ? agentEffectiveConfig.glmTtsFormat : agentEffectiveConfig.audioFormat,
+                        audioVoice: isGeminiTtsModel(audioModel) && isGeminiConfig({ ...agentEffectiveConfig, model: audioModel }, audioModel) ? agentEffectiveConfig.geminiTtsVoice : isGlmTtsModel(audioModel) ? agentEffectiveConfig.glmTtsVoice : grokTts ? agentEffectiveConfig.grokTtsVoice : agentEffectiveConfig.audioVoice,
+                        audioLanguage: grokTts ? agentEffectiveConfig.grokTtsLanguage : "",
+                        audioFormat: isGlmTtsModel(audioModel) ? agentEffectiveConfig.glmTtsFormat : grokTts ? agentEffectiveConfig.grokTtsFormat : agentEffectiveConfig.audioFormat,
+                        audioSpeed: isGlmTtsModel(audioModel) ? agentEffectiveConfig.glmTtsSpeed : grokTts ? agentEffectiveConfig.grokTtsSpeed : agentEffectiveConfig.audioSpeed,
                     };
                 }
 
@@ -3363,10 +3394,17 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         metadata.generateAudio = String(generateAudio);
                     }
                     if (mode === "audio") {
-                        if (isGlmTtsModel(generationConfig.model)) {
+                        if (isGeminiTtsModel(generationConfig.model) && isGeminiConfig(generationConfig, generationConfig.model)) {
+                            metadata.geminiTtsVoice = stringValue("voice") || generationConfig.geminiTtsVoice;
+                        } else if (isGlmTtsModel(generationConfig.model)) {
                             metadata.glmTtsVoice = stringValue("voice") || generationConfig.glmTtsVoice;
                             metadata.glmTtsFormat = generationConfig.glmTtsFormat;
                             metadata.glmTtsSpeed = generationConfig.glmTtsSpeed;
+                        } else if (isGrok2APITtsConfig(generationConfig, generationConfig.model)) {
+                            metadata.grokTtsVoice = stringValue("voice") || generationConfig.grokTtsVoice;
+                            metadata.grokTtsLanguage = generationConfig.grokTtsLanguage;
+                            metadata.grokTtsFormat = generationConfig.grokTtsFormat;
+                            metadata.grokTtsSpeed = generationConfig.grokTtsSpeed;
                         } else {
                             metadata.audioVoice = stringValue("voice") || generationConfig.audioVoice;
                             metadata.audioInstructions = stringValue("instructions") || generationConfig.audioInstructions;
@@ -3479,7 +3517,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                 }
                 if (node.type === CanvasNodeType.Video) {
                     const videoGenerationConfig = context ? withCanvasVideoAdvancedConfig(generationConfig, context) : generationConfig;
-                    const frameReferencesEnabled = supportsVideoFrameReferences(videoGenerationConfig.model);
+                    const frameReferencesEnabled = supportsVideoFrameReferences(videoGenerationConfig.model, channelProtocolForConfig(videoGenerationConfig));
                     const firstFrame = frameReferencesEnabled ? context?.firstFrame || null : null;
                     const lastFrame = frameReferencesEnabled ? context?.lastFrame || null : null;
                     const references = frameReferencesEnabled ? retryImages : [...retryImages, ...[context?.firstFrame, context?.lastFrame].filter((image): image is ReferenceImage => Boolean(image))];
@@ -4522,12 +4560,17 @@ function buildAudioGenerationMetadata(config: AiConfig, sourceMetadata?: CanvasN
         audioFormat: config.audioFormat,
         audioSpeed: config.audioSpeed,
         audioInstructions: config.audioInstructions,
+        grokTtsVoice: config.grokTtsVoice,
+        grokTtsLanguage: config.grokTtsLanguage,
+        grokTtsFormat: config.grokTtsFormat,
+        grokTtsSpeed: config.grokTtsSpeed,
         glmTtsVoice: config.glmTtsVoice,
         glmTtsFormat: config.glmTtsFormat,
         glmTtsSpeed: config.glmTtsSpeed,
         mimoTtsVoice: config.mimoTtsVoice,
         mimoTtsFormat: config.mimoTtsFormat,
         mimoVoiceDesignPrompt: config.mimoVoiceDesignPrompt,
+        geminiTtsVoice: config.geminiTtsVoice,
         mimoVoiceCloneAudioNodeId: sourceMetadata?.mimoVoiceCloneAudioNodeId,
     };
 }
@@ -4625,6 +4668,27 @@ async function hydrateAssistantImages(sessions: CanvasAssistantSession[]) {
             ),
         })),
     );
+}
+
+function syncAssistantReferences(sessions: CanvasAssistantSession[], nodes: CanvasNodeData[], restoreInterrupted = false) {
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    return sessions.map((session) => ({
+        ...session,
+        messages: session.messages.map((message) => {
+            const interrupted = restoreInterrupted && (message.status === "thinking" || message.status === "running");
+            return {
+                ...message,
+                text: interrupted && !message.text ? "上次 Agent 执行因页面关闭而中断；已提交的媒体任务会继续恢复，你可以让我从当前画布继续。" : message.text,
+                status: interrupted ? ("waiting" as const) : message.status,
+                activity: interrupted ? undefined : message.activity,
+                references: message.references?.map((reference) => {
+                    const node = nodeById.get(reference.id);
+                    const content = node && assistantReferenceContentFromNode(node);
+                    return content ? { ...reference, ...content } : reference;
+                }),
+            };
+        }),
+    }));
 }
 
 function getGenerationCount(count: string) {
@@ -4996,12 +5060,17 @@ function buildGenerationConfig(config: AiConfig, node: CanvasNodeData | undefine
         audioFormat: node?.metadata?.audioFormat || config.audioFormat || defaultConfig.audioFormat,
         audioSpeed: node?.metadata?.audioSpeed || config.audioSpeed || defaultConfig.audioSpeed,
         audioInstructions: node?.metadata?.audioInstructions || config.audioInstructions || defaultConfig.audioInstructions,
+        grokTtsVoice: node?.metadata?.grokTtsVoice || config.grokTtsVoice || defaultConfig.grokTtsVoice,
+        grokTtsLanguage: node?.metadata?.grokTtsLanguage || config.grokTtsLanguage || defaultConfig.grokTtsLanguage,
+        grokTtsFormat: node?.metadata?.grokTtsFormat || config.grokTtsFormat || defaultConfig.grokTtsFormat,
+        grokTtsSpeed: node?.metadata?.grokTtsSpeed || config.grokTtsSpeed || defaultConfig.grokTtsSpeed,
         glmTtsVoice: node?.metadata?.glmTtsVoice || config.glmTtsVoice || defaultConfig.glmTtsVoice,
         glmTtsFormat: node?.metadata?.glmTtsFormat || config.glmTtsFormat || defaultConfig.glmTtsFormat,
         glmTtsSpeed: node?.metadata?.glmTtsSpeed || config.glmTtsSpeed || defaultConfig.glmTtsSpeed,
         mimoTtsVoice: node?.metadata?.mimoTtsVoice || config.mimoTtsVoice || defaultConfig.mimoTtsVoice,
         mimoTtsFormat: node?.metadata?.mimoTtsFormat || config.mimoTtsFormat || defaultConfig.mimoTtsFormat,
         mimoVoiceDesignPrompt: node?.metadata?.mimoVoiceDesignPrompt || config.mimoVoiceDesignPrompt || defaultConfig.mimoVoiceDesignPrompt,
+        geminiTtsVoice: node?.metadata?.geminiTtsVoice || config.geminiTtsVoice || defaultConfig.geminiTtsVoice,
         count: String(node?.metadata?.count || (mode === "image" ? config.canvasImageCount || config.count : config.count) || defaultConfig.count),
     };
 }

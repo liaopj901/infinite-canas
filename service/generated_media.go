@@ -129,7 +129,7 @@ func ReadGeneratedMediaContent(ctx context.Context, id string) (GeneratedMediaCo
 		if err != nil {
 			return GeneratedMediaContent{}, err
 		}
-		return GeneratedMediaContent{Media: media, Data: download.Data, RedirectURL: download.RedirectURL}, nil
+		return GeneratedMediaContent{Media: media, Data: download.Data}, nil
 	}
 	if strings.TrimSpace(media.RelativePath) == "" {
 		markGeneratedMediaCleaned(media)

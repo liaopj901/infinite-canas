@@ -7,6 +7,7 @@ import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
 import { EditorView } from "@uiw/react-codemirror";
 
+import { modelChannelApiKeyUrls, modelChannelDefaultBaseUrls } from "@/lib/model-channel";
 import { fetchAdminSettings, fetchChannelModels, measureAdminStorageProvider, saveAdminSettings, testChannelModel, type AdminModelChannel, type AdminModelCost, type AdminSettings, type AdminStorageProvider } from "@/services/api/admin";
 import { clearStorageConfigCache as clearFileStorageConfigCache } from "@/services/file-storage";
 import { clearStorageConfigCache as clearImageStorageConfigCache } from "@/services/image-storage";
@@ -46,7 +47,7 @@ const emptySettings: AdminSettings = {
     },
     private: { channels: [], promptSync: { enabled: true, cron: "0 0 * * *" }, aiLog: { localDirectReportEnabled: false, cleanup: { enabled: false, retentionDays: 14, cron: "0 3 * * *" } }, auth: { linuxDo: { clientId: "", clientSecret: "" } }, storage: { mode: "local_indexeddb", allowUserProvider: false, allowUserGlobalProvider: true, autoSyncGeneratedMedia: false, autoSyncLocalGeneratedMedia: false, providers: [], roundRobinCursor: 0, capacityCheck: { enabled: false, cron: "0 */6 * * *" }, capacityLimitBytes: 9 * 1024 * 1024 * 1024 } },
 };
-const emptyChannel: AdminModelChannel = { id: "", protocol: "openai", name: "", baseUrl: "", apiKey: "", models: [], weight: 1, timeout: 600, enabled: true, remark: "" };
+const emptyChannel: AdminModelChannel = { id: "", protocol: "openai", name: "", baseUrl: modelChannelDefaultBaseUrls.openai, apiKey: "", models: [], weight: 1, timeout: 600, enabled: true, remark: "" };
 const emptyS3StorageProvider: AdminStorageProvider = { id: "", name: "", type: "s3", endpoint: "", region: "auto", bucket: "", accessKeyId: "", secretAccessKey: "", publicBaseUrl: "", pathPrefix: "canvas", username: "", password: "", weight: 1, enabled: true, ownerUserId: "", capacityBytes: 0, capacityCheckedAt: "", capacityExceeded: false };
 const emptyWebDAVStorageProvider: AdminStorageProvider = { ...emptyS3StorageProvider, name: "", type: "webdav", region: "" };
 
@@ -85,6 +86,8 @@ export default function AdminSettingsPage() {
     const [knownModels, setKnownModels] = useState<string[]>([]);
     const publicModels = Form.useWatch(["public", "modelChannel", "availableModels"], form) || [];
     const storageProviders = Form.useWatch(["private", "storage", "providers"], form) || [];
+    const channelProtocol = Form.useWatch("protocol", channelForm);
+    const channelApiKeyUrl = channelProtocol ? modelChannelApiKeyUrls[channelProtocol] : undefined;
     const channelModels = useMemo(() => collectChannelModels(channels), [channels]);
     const channelTableData = useMemo(() => channels.map((channel, index) => ({ ...channel, _index: index, _rowKey: `${index}-${channel.name}-${channel.baseUrl}` })), [channels]);
     const activeMode = editorMode[activeTab];
@@ -917,9 +920,16 @@ export default function AdminSettingsPage() {
                                     <Select
                                         options={[
                                             { label: "OpenAI", value: "openai" },
+                                            { label: "Gemini", value: "gemini" },
+                                            { label: "Grok2API", value: "grok2api" },
+                                            { label: "MiniMax & METASO", value: "metaso" },
+                                            { label: "APIMart", value: "apimart" },
                                             { label: "KIE", value: "kie" },
                                             { label: "MiMo", value: "mimo" },
                                         ]}
+                                        onChange={(protocol: AdminModelChannel["protocol"]) => {
+                                            channelForm.setFieldValue("baseUrl", modelChannelDefaultBaseUrls[protocol]);
+                                        }}
                                     />
                                 </Form.Item>
                             </Col>
@@ -939,7 +949,22 @@ export default function AdminSettingsPage() {
                                 </Form.Item>
                             </Col>
                             <Col span={24}>
-                                <Form.Item name="baseUrl" label="接口地址" rules={[{ required: true, message: "请输入接口地址" }]}>
+                                <Form.Item
+                                    name="baseUrl"
+                                    label={
+                                        <span className="relative inline-flex items-center">
+                                            接口地址
+                                            {channelApiKeyUrl ? (
+                                                <span className="absolute left-full top-1/2 ml-2 -translate-y-1/2 whitespace-nowrap">
+                                                    <Button type="primary" size="small" href={channelApiKeyUrl} target="_blank">
+                                                        获取 API Key
+                                                    </Button>
+                                                </span>
+                                            ) : null}
+                                        </span>
+                                    }
+                                    rules={[{ required: true, message: "请输入接口地址" }]}
+                                >
                                     <Input />
                                 </Form.Item>
                             </Col>

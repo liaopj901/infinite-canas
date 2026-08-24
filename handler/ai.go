@@ -74,11 +74,23 @@ func AIVideo(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func AIVideoContent(w http.ResponseWriter, r *http.Request, id string) {
+	if serveGeminiVideoTaskContent(w, r, id) {
+		return
+	}
 	proxyAIGetRequest(w, r, "/videos/"+id+"/content")
 }
 
 func AIAudioSpeech(w http.ResponseWriter, r *http.Request) {
 	proxyAIRequest(w, r, "/audio/speech")
+}
+
+func AITTSVoices(w http.ResponseWriter, r *http.Request) {
+	modelName := strings.TrimSpace(r.URL.Query().Get("model"))
+	if modelName == "" {
+		Fail(w, "缺少模型名称")
+		return
+	}
+	proxyAIGetRequest(w, r, "/tts/voices?model="+url.QueryEscape(modelName))
 }
 
 func proxyAIGetRequest(w http.ResponseWriter, r *http.Request, path string) {
@@ -104,7 +116,7 @@ func proxyAIGetRequest(w http.ResponseWriter, r *http.Request, path string) {
 		Fail(w, "AI 接口请求失败")
 		return
 	}
-	request.Header.Set("Authorization", "Bearer "+channel.APIKey)
+	service.SetModelChannelAuthHeader(request, channel)
 	copyAIResponse(w, request, channel, aiLogContext{StartedAt: startedAt, Endpoint: path, Method: http.MethodGet, Model: modelName, Channel: channel, UserID: user.ID, UserDisplayName: firstNonEmpty(user.DisplayName, user.Username), RequestBody: summarizeQueryParams(r.URL.Query())}, nil)
 }
 
@@ -138,6 +150,17 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 		credits *= readAIRequestCount(body, contentType)
 	}
 	upstreamPath := resolveAIProxyPath(channel, modelName, path)
+	if service.IsGeminiChannel(channel) {
+		if path == "/chat/completions" && !geminiStreamRequested(body) {
+			upstreamPath = service.GeminiModelActionPath(modelName, "generateContent")
+		}
+		body, err = service.StripGeminiModelField(body, contentType)
+		if err != nil {
+			log.Printf("AI proxy normalize Gemini request failed: model=%s err=%v", modelName, err)
+			Fail(w, "AI 接口请求失败")
+			return
+		}
+	}
 	if service.IsMiMoTTSModelName(modelName) && path == "/audio/speech" {
 		body, contentType, err = normalizeMiMoTTSBody(body, contentType, modelName)
 		if err != nil {
@@ -174,7 +197,7 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 		Fail(w, "AI 接口请求失败")
 		return
 	}
-	request.Header.Set("Authorization", "Bearer "+channel.APIKey)
+	service.SetModelChannelAuthHeader(request, channel)
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
@@ -201,6 +224,13 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 			}
 		}
 	})
+}
+
+func geminiStreamRequested(body []byte) bool {
+	var payload struct {
+		Stream *bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &payload) == nil && payload.Stream != nil && *payload.Stream
 }
 
 type aiLogContext struct {
@@ -322,6 +352,13 @@ func saveAIProxyLog(context aiLogContext, status int, responseBody string, error
 	if context.StartedAt.IsZero() {
 		context.StartedAt = time.Now()
 	}
+	if service.IsGeminiChannel(context.Channel) {
+		if context.Endpoint == "/images/generations" || context.Endpoint == "/images/edits" || context.Endpoint == "/audio/speech" {
+			responseBody = "[redacted Gemini media response]"
+		} else if strings.TrimSpace(responseBody) != "" {
+			responseBody = summarizeAIRequest([]byte(responseBody), "application/json")
+		}
+	}
 	service.SaveAICallLog(service.AICallLogInput{
 		UserID:          context.UserID,
 		UserDisplayName: context.UserDisplayName,
@@ -428,7 +465,7 @@ func redactLargeImages(value *any) {
 	switch typed := (*value).(type) {
 	case map[string]any:
 		for key, item := range typed {
-			if text, ok := item.(string); ok && (strings.HasPrefix(text, "data:image/") || strings.HasPrefix(text, "data:audio/") || len(text) > 2048 && looksLikeBase64(text)) {
+			if text, ok := item.(string); ok && (strings.HasPrefix(text, "data:image/") || strings.HasPrefix(text, "data:video/") || strings.HasPrefix(text, "data:audio/") || len(text) > 2048 && looksLikeBase64(text)) {
 				typed[key] = fmt.Sprintf("[redacted media/string len=%d]", len(text))
 				continue
 			}
@@ -545,8 +582,33 @@ func agnesVideoQueryID(modelName string, path string) (string, bool) {
 }
 
 func resolveAIProxyPath(channel model.ModelChannel, modelName string, path string) string {
+	if service.IsGeminiChannel(channel) {
+		switch path {
+		case "/chat/completions":
+			return service.GeminiModelActionPath(modelName, "streamGenerateContent") + "?alt=sse"
+		case "/images/generations", "/images/edits", "/audio/speech":
+			return service.GeminiModelActionPath(modelName, "generateContent")
+		case "/videos":
+			return service.GeminiModelActionPath(modelName, "predictLongRunning")
+		}
+		if strings.HasPrefix(path, "/videos/") && !strings.HasSuffix(path, "/content") {
+			return service.GeminiOperationPath(strings.TrimPrefix(path, "/videos/"))
+		}
+	}
 	if service.IsMiMoTTSModelName(modelName) && path == "/audio/speech" {
 		return "/chat/completions"
+	}
+	if isMiniMaxH3Channel(channel, modelName) {
+		if path == "/videos" {
+			return "/v2/video_generation"
+		}
+		if strings.HasPrefix(path, "/videos/") && !strings.HasSuffix(path, "/content") {
+			taskID := strings.TrimSpace(strings.TrimPrefix(path, "/videos/"))
+			if taskID != "" && !strings.Contains(taskID, "/") {
+				return "/v2/query/video_generation/" + url.PathEscape(taskID)
+			}
+		}
+		return path
 	}
 	if isCogVideoX3Model(modelName) {
 		if path == "/videos" {
@@ -594,7 +656,7 @@ func resolveAIProxyPath(channel model.ModelChannel, modelName string, path strin
 		}
 		return path
 	}
-	if strings.EqualFold(strings.TrimSpace(modelName), "grok-imagine-video") && path == "/videos" {
+	if strings.EqualFold(strings.TrimSpace(channel.Protocol), "grok2api") && (strings.EqualFold(strings.TrimSpace(modelName), "grok-imagine-video") || strings.EqualFold(strings.TrimSpace(modelName), "grok-imagine-video-1.5")) && path == "/videos" {
 		return "/videos/generations"
 	}
 	if isArkSeedanceVideo(channel.BaseURL, modelName) {

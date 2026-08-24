@@ -10,7 +10,7 @@ import { useUserStore } from "@/stores/use-user-store";
 
 export type LocalModelChannel = {
     id: string;
-    protocol: "openai" | "kie" | "mimo";
+    protocol: "openai" | "gemini" | "grok2api" | "metaso" | "apimart" | "kie" | "mimo";
     name: string;
     baseUrl: string;
     apiKey: string;
@@ -34,12 +34,17 @@ export type AiConfig = {
     audioFormat: string;
     audioSpeed: string;
     audioInstructions: string;
+    grokTtsVoice: string;
+    grokTtsLanguage: string;
+    grokTtsFormat: string;
+    grokTtsSpeed: string;
     glmTtsVoice: string;
     glmTtsFormat: string;
     glmTtsSpeed: string;
     mimoTtsVoice: string;
     mimoTtsFormat: string;
     mimoVoiceDesignPrompt: string;
+    geminiTtsVoice: string;
     videoSeconds: string;
     videoMode: string;
     videoNegativePrompt: string;
@@ -76,7 +81,7 @@ export type AiConfig = {
         workflowAgent: string;
     };
     localChannels: LocalModelChannel[];
-    publicChannels: Array<{ id?: string; name?: string; baseUrl?: string; models?: string[]; weight?: number; timeout?: number; enabled?: boolean; remark?: string }>;
+    publicChannels: Array<{ id?: string; protocol?: LocalModelChannel["protocol"]; name?: string; baseUrl?: string; models?: string[]; weight?: number; timeout?: number; enabled?: boolean; remark?: string }>;
     syncStorageConfig: boolean;
     syncWebDAVStorageConfig: boolean;
     activeChannelId: string;
@@ -102,12 +107,17 @@ export const defaultConfig: AiConfig = {
     audioFormat: "mp3",
     audioSpeed: "1",
     audioInstructions: "",
+    grokTtsVoice: "eve",
+    grokTtsLanguage: "auto",
+    grokTtsFormat: "mp3",
+    grokTtsSpeed: "1",
     glmTtsVoice: "tongtong",
     glmTtsFormat: "wav",
     glmTtsSpeed: "1",
     mimoTtsVoice: "冰糖",
     mimoTtsFormat: "wav",
     mimoVoiceDesignPrompt: "",
+    geminiTtsVoice: "Kore",
     videoSeconds: "6",
     videoMode: "std",
     videoNegativePrompt: "",
@@ -182,11 +192,11 @@ function resolveEffectiveConfig(config: AiConfig, modelChannel: AdminPublicSetti
         };
     }
     const models = modelChannel.availableModels;
-    const textModels = filterModelsByCapability(models, "text");
-    const imageModels = filterModelsByCapability(models, "image");
-    const videoModels = filterModelsByCapability(models, "video");
-    const audioModels = filterModelsByCapability(models, "audio");
-    const fallbackTextModel = validDefault(modelChannel.defaultTextModel, textModels) || preferredModel(textModels, isTextModelName);
+    const textModels = filterChannelModelsByCapability(modelChannel.channels, "text", models);
+    const imageModels = filterChannelModelsByCapability(modelChannel.channels, "image", models);
+    const videoModels = filterChannelModelsByCapability(modelChannel.channels, "video", models);
+    const audioModels = filterChannelModelsByCapability(modelChannel.channels, "audio", models);
+    const fallbackTextModel = validDefault(modelChannel.defaultTextModel, textModels) || preferredModel(textModels, isTextModelName) || textModels[0] || "";
     const fallbackModel = validDefault(modelChannel.defaultModel, textModels) || fallbackTextModel;
     const fallbackImageModel = validDefault(modelChannel.defaultImageModel, imageModels) || preferredModel(imageModels, isImageModelName);
     const fallbackVideoModel = validDefault(modelChannel.defaultVideoModel, videoModels) || preferredModel(videoModels, isVideoModelName);
@@ -305,20 +315,37 @@ function isTextModelName(model: string) {
     return !isImageModelName(model) && !isVideoModelName(model) && !isAudioModelName(model);
 }
 
-export function modelMatchesCapability(model: string, capability?: ModelCapability) {
+export function modelMatchesCapability(model: string, capability?: ModelCapability, protocol = "") {
     if (!capability) return true;
+    if (protocol === "gemini") {
+        const value = model.toLowerCase();
+        const video = /^models\/veo-|^veo-/.test(value);
+        const audio = value.includes("tts");
+        const image = !video && !audio && value.includes("image");
+        if (capability === "video") return video;
+        if (capability === "audio") return audio;
+        if (capability === "image") return image;
+        return !video && !audio && !image;
+    }
     if (capability === "image") return isImageModelName(model);
     if (capability === "video") return isVideoModelName(model);
     if (capability === "audio") return isAudioModelName(model);
     return isTextModelName(model);
 }
 
-export function filterModelsByCapability(models: string[], capability?: ModelCapability) {
-    return capability ? models.filter((model) => modelMatchesCapability(model, capability)) : models;
+export function filterModelsByCapability(models: string[], capability?: ModelCapability, protocol = "") {
+    return capability ? models.filter((model) => modelMatchesCapability(model, capability, protocol)) : models;
+}
+
+export function filterChannelModelsByCapability(channels: Array<{ protocol?: LocalModelChannel["protocol"]; models: string[] }>, capability: ModelCapability, allowedModels?: string[]) {
+    const allowed = allowedModels ? new Set(allowedModels) : null;
+    return normalizeModelList(channels.flatMap((channel) => filterModelsByCapability(channel.models, capability, channel.protocol || ""))).filter((model) => !allowed || allowed.has(model));
 }
 
 export function selectableModelsByCapability(config: AiConfig, capability?: ModelCapability) {
-    return filterModelsByCapability(config.models, capability);
+    if (!capability) return config.models;
+    const channels = config.channelMode === "remote" ? config.publicChannels.map((channel) => ({ protocol: channel.protocol, models: channel.models || [] })) : normalizeLocalChannels(config);
+    return filterChannelModelsByCapability(channels, capability, config.models);
 }
 
 function isAiConfigReady(config: AiConfig, model: string) {
@@ -388,9 +415,14 @@ export const useConfigStore = create<ConfigStore>()(
                         audioVoice: config.audioVoice || defaultConfig.audioVoice,
                         audioFormat: config.audioFormat || defaultConfig.audioFormat,
                         audioSpeed: config.audioSpeed || defaultConfig.audioSpeed,
+                        grokTtsVoice: config.grokTtsVoice || defaultConfig.grokTtsVoice,
+                        grokTtsLanguage: config.grokTtsLanguage || defaultConfig.grokTtsLanguage,
+                        grokTtsFormat: config.grokTtsFormat || defaultConfig.grokTtsFormat,
+                        grokTtsSpeed: config.grokTtsSpeed || defaultConfig.grokTtsSpeed,
                         glmTtsVoice: config.glmTtsVoice || defaultConfig.glmTtsVoice,
                         glmTtsFormat: config.glmTtsFormat || defaultConfig.glmTtsFormat,
                         glmTtsSpeed: config.glmTtsSpeed || defaultConfig.glmTtsSpeed,
+                        geminiTtsVoice: config.geminiTtsVoice || defaultConfig.geminiTtsVoice,
                         systemPrompts: config.systemPrompts?.image ? config.systemPrompts : defaultConfig.systemPrompts,
                         audioInstructions: config.audioInstructions || "",
                         videoSeconds: config.videoSeconds || "6",
@@ -405,10 +437,10 @@ export const useConfigStore = create<ConfigStore>()(
                         videoWatermark: config.videoWatermark || "false",
                         videoCharacterOrientation: config.videoCharacterOrientation === "image" ? "image" : "video",
                         canvasImageCount: config.canvasImageCount || "1",
-                        imageModels: filterModelsByCapability(localModels, "image"),
-                        videoModels: filterModelsByCapability(localModels, "video"),
-                        textModels: filterModelsByCapability(localModels, "text"),
-                        audioModels: filterModelsByCapability(localModels, "audio"),
+                        imageModels: filterChannelModelsByCapability(localChannels, "image"),
+                        videoModels: filterChannelModelsByCapability(localChannels, "video"),
+                        textModels: filterChannelModelsByCapability(localChannels, "text"),
+                        audioModels: filterChannelModelsByCapability(localChannels, "audio"),
                     },
                 };
             },
@@ -462,7 +494,7 @@ export function normalizeLocalChannels(config: Partial<AiConfig>): LocalModelCha
     const channels = Array.isArray(config.localChannels) ? config.localChannels : [];
     const normalized: LocalModelChannel[] = channels.map((channel, index) => ({
         id: channel.id || `local-${index + 1}`,
-        protocol: channel.protocol === "kie" || channel.protocol === "mimo" ? channel.protocol : "openai",
+        protocol: channel.protocol || "openai",
         name: typeof channel.name === "string" ? channel.name : `本地渠道 ${index + 1}`,
         baseUrl: channel.baseUrl || "",
         apiKey: channel.apiKey || "",
@@ -475,6 +507,14 @@ export function normalizeLocalChannels(config: Partial<AiConfig>): LocalModelCha
 }
 
 export function channelIdForActiveModel(config: AiConfig) {
+    const channels = config.channelMode === "remote" ? config.publicChannels : normalizeLocalChannels(config);
+    const selectedChannelId = config.model === config.imageModel ? config.imageChannelId : config.model === config.videoModel ? config.videoChannelId : config.model === config.audioModel ? config.audioChannelId : config.model === config.textModel ? config.textChannelId : "";
+    const selectedChannel = channels.find((channel) => channel.id === selectedChannelId);
+    if (selectedChannel?.protocol === "gemini") return selectedChannelId;
+    if (!selectedChannel) {
+        const geminiChannel = channels.find((channel) => channel.protocol === "gemini" && (channel.models || []).includes(config.model));
+        if (geminiChannel) return geminiChannel.id || "";
+    }
     if (modelMatchesCapability(config.model, "image") && config.imageChannelId) return config.imageChannelId;
     if (modelMatchesCapability(config.model, "video") && config.videoChannelId) return config.videoChannelId;
     if (modelMatchesCapability(config.model, "audio") && config.audioChannelId) return config.audioChannelId;
@@ -492,23 +532,16 @@ export function localChannelForActiveModel(config: AiConfig) {
     return channels.find((channel) => channel.id === preferredId && channel.models.includes(config.model)) || channels.find((channel) => channel.models.includes(config.model)) || channels.find((channel) => channel.id === preferredId) || channels[0];
 }
 
+export function channelProtocolForConfig(config: AiConfig): LocalModelChannel["protocol"] {
+    const channel = config.channelMode === "remote"
+        ? config.publicChannels.find((item) => item.id === channelIdForActiveModel(config)) || config.publicChannels[0]
+        : localChannelForActiveModel(config);
+    return channel?.protocol || "openai";
+}
+
 export type DirectAIProvider = "kie" | "apimart";
 
-const directAIProviderCache = new Map<string, DirectAIProvider | null>();
-
 export function directAIProviderForConfig(config: AiConfig): DirectAIProvider | null {
-    const channel = localChannelForActiveModel(config);
-    if (!channel) return null;
-    const protocol = channel.protocol.toLowerCase();
-    const baseUrl = channel.baseUrl.trim().toLowerCase();
-    const model = (config.model || "").trim().toLowerCase();
-    const key = `${protocol}\n${baseUrl}\n${model}`;
-    if (directAIProviderCache.has(key)) return directAIProviderCache.get(key) || null;
-    const provider = protocol === "kie" || baseUrl.includes("kie.ai") || model.includes("kie/")
-        ? "kie"
-        : baseUrl.includes("apimart.ai") || model.includes("apimart")
-            ? "apimart"
-            : null;
-    directAIProviderCache.set(key, provider);
-    return provider;
+    const protocol = channelProtocolForConfig(config);
+    return protocol === "kie" || protocol === "apimart" ? protocol : null;
 }

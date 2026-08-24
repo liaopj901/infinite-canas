@@ -12,17 +12,18 @@ import { AssetPickerModal, type InsertAssetPayload } from "@/app/(user)/canvas/c
 import { ModelPicker } from "@/components/model-picker";
 import { KlingV26WorkbenchPanel } from "@/app/(user)/video/components/kling-v26-workbench-panel";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
-import { VideoSettingsPanel, isKIEKlingV3Config, kieKlingOmniVariant, normalizeVideoResolutionValue, videoResolutionOptions, videoSizeForResolution, videoSizeOptions } from "@/components/video-settings-panel";
+import { VideoSettingsPanel, isKIEKlingV3Config, kieKlingOmniVariant, normalizeVideoResolutionValue, normalizeVideoSizeValue, videoResolutionOptions, videoSizeForResolution, videoSizeOptions } from "@/components/video-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
+import { isMiniMaxH3Config } from "@/lib/minimax-video";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
-import { COGVIDEOX3_DURATIONS, isCogVideoX3Model, modelKey, normalizeCogVideoX3Duration, supportsVideoAudioGeneration, supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
+import { COGVIDEOX3_DURATIONS, isAgnesVideoV25Model, isCogVideoX3Model, modelKey, normalizeCogVideoX3Duration, supportsVideoAudioGeneration, supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
 import { deleteStoredMedia, downloadRemoteMedia, resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer } from "@/services/file-storage";
 import { deleteStoredImages, loadStorageConfig, resolveImageUrl, shouldAutoSyncGeneratedMedia, uploadImage } from "@/services/image-storage";
 import { deleteVideoGenerationLogs, fetchVideoGenerationLogs, saveVideoGenerationLogs } from "@/services/api/generation-logs";
 import { createVideoGenerationTask, deleteVideoGenerationTask, listVideoGenerationTasks, pollVideoGenerationTaskStatus, VIDEO_POLL_INTERVAL_MS, VideoRequestError, type VideoResponse } from "@/services/api/video";
 import { useAssetStore } from "@/stores/use-asset-store";
-import { normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig, type VideoElementItem, type VideoElementReference } from "@/stores/use-config-store";
+import { channelProtocolForConfig, normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig, type VideoElementItem, type VideoElementReference } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useUserStore } from "@/stores/use-user-store";
 import { getAccountOwnerId, getAccountRecordStorageKey, getAccountStorageKey } from "@/lib/account-scope";
@@ -137,7 +138,7 @@ export default function VideoPage() {
     const [results, setResults] = useState<GenerationResult[]>([]);
     const [logs, setLogs] = useState<GenerationLog[]>([]);
     const [running, setRunning] = useState(false);
-    const [workbenchLayout, setWorkbenchLayoutState] = useState<WorkbenchLayout>("bottom");
+    const [workbenchLayout, setWorkbenchLayoutState] = useState<WorkbenchLayout>("side");
     const [bottomSettingsCollapsed, setBottomSettingsCollapsed] = useState(true);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
@@ -655,14 +656,14 @@ export default function VideoPage() {
                 return null;
             }
         }
-        if (!kling) {
+        if (!kling && !isMiniMaxH3Config(configValue, modelValue) && !isAgnesVideoV25Model(modelValue)) {
             const videoReferenceError = seedanceVideoReferenceError(videoReferenceItems);
             if (videoReferenceError) {
                 message.error(`${videoReferenceError}。${seedanceVideoReferenceHint}`);
                 return null;
             }
         }
-        const frameReferencesEnabled = !kling && supportsVideoFrameReferences(modelValue);
+        const frameReferencesEnabled = !kling && supportsVideoFrameReferences(modelValue, channelProtocolForConfig({ ...configValue, model: modelValue }));
         const normalizedConfig = buildVideoConfig({ ...configValue, videoNegativePrompt: currentNegativePrompt }, modelValue);
         if (omni === "reference-to-video" && videoReferenceItems.length) normalizedConfig.videoGenerateAudio = "false";
         const imageReferences = omni === "text-to-video" ? [] : omni === "reference-to-video" ? [...referenceItems] : [...referenceItems].slice(0, kling ? omni === "transformation" ? 4 : 2 : referenceItems.length);
@@ -1453,7 +1454,7 @@ function WorkbenchPanel({
     bottomSettingsCollapsed?: boolean;
     setBottomSettingsCollapsed?: (value: boolean) => void;
 }) {
-    const frameReferencesEnabled = supportsVideoFrameReferences(model);
+    const frameReferencesEnabled = supportsVideoFrameReferences(model, channelProtocolForConfig({ ...config, model }));
     const cogVideoX3 = isCogVideoX3Model(model);
     const audioGenerationEnabled = supportsVideoAudioGeneration(model);
     const generateAudio = boolConfig(config.videoGenerateAudio, false);
@@ -2927,19 +2928,18 @@ function resolveKlingWorkbenchConfig(config: AiConfig, model: string): { provide
 }
 
 function isAPIMartKlingModelConfig(config: AiConfig, model: string, key: string) {
-    return modelKey(model) === key && videoChannelText(config, model).includes("apimart");
+    return modelKey(model) === key && videoChannelProtocol(config, model) === "apimart";
 }
 
 function isKIEKlingModelConfig(config: AiConfig, model: string, key: string) {
-    return modelKey(model) === key && videoChannelText(config, model).includes("kie");
+    return modelKey(model) === key && videoChannelProtocol(config, model) === "kie";
 }
 
-function videoChannelText(config: AiConfig, model: string) {
+function videoChannelProtocol(config: AiConfig, model: string) {
     const channelId = resolveVideoChannelId(config, model, config.videoChannelId, config.activeChannelId);
     const channels = config.channelMode === "remote" ? config.publicChannels : normalizeLocalChannels(config);
     const channel = channels.find((item) => (item.id || "") === channelId && (item.models || []).includes(model)) || channels.find((item) => (item.models || []).includes(model)) || channels.find((item) => (item.id || "") === channelId);
-    const record = channel as { id?: string; name?: string; baseUrl?: string; remark?: string } | undefined;
-    return [record?.id, record?.name, record?.baseUrl, record?.remark].filter(Boolean).join(" ").toLowerCase();
+    return channel?.protocol || "openai";
 }
 
 const characterOrientationOptions = [{ value: "image", label: "图片" }, { value: "video", label: "视频" }];

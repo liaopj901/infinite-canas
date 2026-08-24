@@ -37,7 +37,7 @@ import {
     type CanvasAssistantSession,
     type CanvasNodeData,
 } from "../types";
-import { isCanvasImageNodeType } from "../utils/canvas-panorama";
+import { assistantReferenceContentFromNode } from "../utils/canvas-resource-references";
 import { AssistantReferenceChip, CanvasAssistantComposer } from "./canvas-assistant-composer";
 
 const PANEL_MOTION_MS = 500;
@@ -611,30 +611,8 @@ function MessageReferences({ message }: { message: CanvasAssistantMessage }) {
 }
 
 function nodeToReference(node: CanvasNodeData): CanvasAssistantReference | null {
-    if (isCanvasImageNodeType(node.type) && node.metadata?.content) {
-        return {
-            id: node.id,
-            type: node.type,
-            title: node.title,
-            dataUrl: node.metadata.content,
-            storageKey: node.metadata.storageKey,
-            mimeType: node.metadata.mimeType,
-        };
-    }
-    if (node.type === CanvasNodeType.Text && node.metadata?.content) {
-        return { id: node.id, type: node.type, title: node.title, text: node.metadata.content };
-    }
-    if ((node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) && node.metadata?.content) {
-        return {
-            id: node.id,
-            type: node.type,
-            title: node.title,
-            url: node.metadata.content,
-            storageKey: node.metadata.storageKey,
-            mimeType: node.metadata.mimeType,
-        };
-    }
-    return null;
+    const content = assistantReferenceContentFromNode(node);
+    return content ? { id: node.id, type: node.type, title: node.title, ...content } : null;
 }
 
 function buildAssistantReferences(nodes: CanvasNodeData[], selectedNodeIds: Set<string>) {
