@@ -226,11 +226,12 @@ function createImageRequestParams(config: AiConfig): ImageRequestParams {
 }
 
 function isGrokImageModel(model: string) {
-    return model.trim().toLowerCase().startsWith("grok-imagine-image");
+    const normalized = model.trim().toLowerCase();
+    return normalized.includes("grok") || normalized.includes("imagine");
 }
 
 function isGrok2APIImageConfig(config: AiConfig) {
-    return channelProtocolForConfig(config) === "grok2api" && isGrokImageModel(config.model);
+    return channelProtocolForConfig(config) === "grok2api" || isGrokImageModel(config.model);
 }
 
 function isZhipuImageModel(model: string) {

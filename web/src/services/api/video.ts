@@ -152,7 +152,8 @@ export async function pollCreatedVideoGenerationTask(config: AiConfig, task: Vid
     try {
         if (initialDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, initialDelayMs));
         for (; ;) {
-            const video = await cacheProtectedGeminiVideo(config, model, await pollOnce());
+            const polled = preserveVideoTaskIdentity(await pollOnce(), task);
+            const video = await cacheProtectedGeminiVideo(config, model, await cacheProtectedGrokVideo(config, model, polled));
             onPoll?.(video);
             if (isFailedVideoStatus(video.status)) throw new VideoRequestError(video.error?.message || "视频生成失败", video);
             if (typeof video.progress === "number") onProgress?.(video.progress, video);
@@ -180,9 +181,12 @@ export async function pollVideoGenerationTaskStatus(config: AiConfig, task: Vide
     const pollId = videoPollId(model, task);
     if (!pollId) throw new VideoRequestError("视频接口没有返回任务 ID", task);
     const directProvider = !usesAccountProxy(config) ? directAIProviderForConfig(config) : null;
-    const result = directProvider
-        ? await (await import("@/services/api/direct-ai")).pollDirectVideoTask(config, directProvider, pollId)
-        : unwrapVideoResponseForConfig(config, model, (await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data);
+    const result = preserveVideoTaskIdentity(
+        directProvider
+            ? await (await import("@/services/api/direct-ai")).pollDirectVideoTask(config, directProvider, pollId)
+            : unwrapVideoResponseForConfig(config, model, (await axios.get<ApiVideoResponse>(aiVideoPollUrl(config, model, pollId), { headers: aiHeaders(config), params: usesAccountProxy(config) ? { model } : undefined })).data),
+        task,
+    );
     return cacheProtectedGeminiVideo(config, model, await cacheProtectedGrokVideo(config, model, result));
 }
 
@@ -217,18 +221,24 @@ async function cacheProtectedGrokVideo(config: AiConfig, model: string, task: Vi
 }
 
 async function createGrok2APIVideoRequestBody(config: AiConfig, model: string, prompt: string, input: Required<VideoReferenceInput>) {
+    if (input.lastFrame) throw new VideoRequestError("Grok 视频生成不支持尾帧图片");
+    if (input.videoReferences.length) throw new VideoRequestError("Grok 视频生成不支持参考视频");
+    if (input.audioReferences.length) throw new VideoRequestError("Grok 视频生成暂不支持工作台参考音频");
+    if (input.firstFrame && input.references.length) throw new VideoRequestError("Grok 视频生成的首帧图片不能与普通参考图同时使用");
+
     const body: Record<string, unknown> = {
         model,
         prompt,
-        duration: Number(normalizeVideoSeconds(config.videoSeconds)),
+        duration: normalizeGrok2APIVideoDuration(config.videoSeconds),
         resolution: normalizeVideoResolution(config.vquality),
     };
     const aspectRatio = normalizeSeedanceRatio(config.size);
     if (aspectRatio !== "adaptive") body.aspect_ratio = aspectRatio;
-
-    const urls = await Promise.all(input.references.map((reference) => imageToDataUrl(reference)));
-    if (urls.length === 1) body.image = { url: urls[0] };
-    else if (urls.length > 1) body.reference_images = urls.map((url) => ({ url }));
+    if (input.firstFrame) body.image = { url: await imageToDataUrl(input.firstFrame) };
+    if (input.references.length) {
+        const urls = await Promise.all(input.references.map((reference) => imageToDataUrl(reference)));
+        body.reference_images = urls.map((url) => ({ url }));
+    }
 
     return body;
 }
@@ -616,9 +626,23 @@ function videoPollId(model: string, task: VideoResponse) {
     return isAgnesVideoModel(model) ? task.video_id || task.id : task.id || task.task_id || task.video_id || "";
 }
 
+// Grok2API 状态查询不回传 request_id；保留创建阶段的任务标识，避免后续轮询和受保护视频下载失去目标任务。
+function preserveVideoTaskIdentity(task: VideoResponse, previousTask: VideoResponse): VideoResponse {
+    return {
+        ...task,
+        id: firstString(task.id, task.task_id, task.video_id, previousTask.id, previousTask.task_id, previousTask.video_id),
+        task_id: firstString(task.task_id, task.id, previousTask.task_id, previousTask.id),
+        video_id: firstString(task.video_id, previousTask.video_id),
+    };
+}
+
 function normalizeVideoSeconds(value: string) {
     const seconds = Math.floor(Number(value) || 6);
     return String(Math.max(1, Math.min(30, seconds)));
+}
+
+function normalizeGrok2APIVideoDuration(value: string) {
+    return Math.min(15, Number(normalizeVideoSeconds(value)));
 }
 
 function isGeminiOmniFlashVideoModel(model: string) {
