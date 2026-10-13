@@ -33,6 +33,8 @@ type directAIRequestPlan struct {
 	ContentType string                    `json:"contentType"`
 	Body        any                       `json:"body"`
 	Uploads     map[string]directAIUpload `json:"uploads,omitempty"`
+	Protocol    string                    `json:"protocol,omitempty"`
+	FormData    bool                      `json:"formData,omitempty"`
 }
 
 type directAIUpload struct {
@@ -71,7 +73,7 @@ func prepareDirectAIRequest(input directAIRequestInput) (directAIRequestPlan, er
 	if input.Model == "" {
 		return directAIRequestPlan{}, errors.New("缺少模型名称")
 	}
-	if !isDirectAIEndpoint(input.Endpoint) {
+	if !isDirectAIEndpoint(input.Endpoint) && !(strings.EqualFold(input.Channel.Protocol, service.ModelChannelProtocolAutoDL) && input.Endpoint == "/audio/speech") {
 		return directAIRequestPlan{}, errors.New("当前接口不支持本地参数转译")
 	}
 	if err := validateDirectAIBaseURL(input.Channel.BaseURL); err != nil {
@@ -90,25 +92,21 @@ func prepareDirectAIRequest(input directAIRequestInput) (directAIRequestPlan, er
 		return directAIRequestPlan{}, errors.New("请求参数序列化失败")
 	}
 
-	provider := ""
 	contentType := "application/json"
 	upstreamPath := resolveAIProxyPath(channel, input.Model, input.Endpoint)
-	switch {
-	case isKIEChannel(channel, input.Model):
-		provider = "kie"
-		body, contentType, err = normalizeKIEVideoBody(body, contentType, input.Model, channel)
-	case isAPIMartChannel(channel, input.Model):
-		provider = "apimart"
-		if input.Endpoint == "/videos" {
-			body, contentType, err = normalizeAPIMartVideoBody(body, contentType, input.Model, channel)
-		} else {
-			body, contentType, err = normalizeAPIMartImageBody(body, contentType, input.Model, channel)
-		}
-	default:
+	prepared, provider, err := prepareAIProtocolRequest(aiProtocolRequest{
+		mode: aiProtocolDirectRequest, body: body, contentType: contentType, modelName: input.Model,
+		channel: channel, endpoint: input.Endpoint, path: upstreamPath,
+	})
+	if provider == "" {
 		return directAIRequestPlan{}, errors.New("当前渠道不支持本地复用后端转译")
 	}
 	if err != nil {
 		return directAIRequestPlan{}, err
+	}
+	body, contentType = prepared.body, prepared.contentType
+	if service.IsTokenDanceChannel(channel) {
+		upstreamPath = prepared.path
 	}
 
 	var translated any
@@ -128,6 +126,8 @@ func prepareDirectAIRequest(input directAIRequestInput) (directAIRequestPlan, er
 		ContentType: contentType,
 		Body:        translated,
 		Uploads:     uploads,
+		Protocol:    prepared.protocol,
+		FormData:    prepared.formData,
 	}, nil
 }
 
@@ -213,39 +213,10 @@ func directAIReferenceKind(value string) string {
 }
 
 func directAIUploads(provider string, channel model.ModelChannel, kinds map[string]bool) (map[string]directAIUpload, error) {
-	uploads := map[string]directAIUpload{}
-	switch provider {
-	case "kie":
-		paths := map[string]string{
-			"image": "images/user-uploads",
-			"video": "videos/user-uploads",
-			"audio": "audios/user-uploads",
+	for _, adapter := range builtinAIProtocols {
+		if adapter.id == provider && adapter.uploads != nil {
+			return adapter.uploads(channel, kinds)
 		}
-		for kind, uploadPath := range paths {
-			if !kinds[kind] {
-				continue
-			}
-			uploads[kind] = directAIUpload{
-				URL:           kieFileStreamUploadURL,
-				FileField:     "file",
-				FileNameField: "fileName",
-				ExtraFields:   map[string]string{"uploadPath": uploadPath},
-				ResponsePaths: []string{"data.downloadUrl", "data.fileUrl", "data.url"},
-			}
-		}
-	case "apimart":
-		if kinds["video"] || kinds["audio"] {
-			return nil, errors.New("APIMart 本地视频和音频参考暂不支持直传，请使用公网媒体地址")
-		}
-		if kinds["image"] {
-			uploads["image"] = directAIUpload{
-				URL:           service.BuildModelChannelURL(channel, apimartImageUploadPath),
-				FileField:     "file",
-				ResponsePaths: []string{"url"},
-			}
-		}
-	default:
-		return nil, fmt.Errorf("不支持的转译渠道：%s", provider)
 	}
-	return uploads, nil
+	return nil, fmt.Errorf("不支持的转译渠道：%s", provider)
 }

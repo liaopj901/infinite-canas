@@ -1,9 +1,11 @@
 import { Home, LogIn } from "lucide-react";
 import Link from "next/link";
+import { AnnouncementBanner } from "@/components/layout/announcement-banner";
 
 export default function NotFound() {
     return (
         <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+            <AnnouncementBanner />
             <main className="flex h-full min-h-0 items-center justify-center overflow-y-auto bg-background bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] px-6 py-10 text-stone-900 [background-size:16px_16px] dark:bg-[radial-gradient(rgba(245,245,244,.16)_1px,transparent_1px)] dark:text-stone-100">
                 <section className="w-full max-w-md text-center">
                     <div className="mx-auto mb-6 flex size-16 items-center justify-center rounded-lg border border-stone-200 bg-white text-2xl font-semibold shadow-sm dark:border-stone-800 dark:bg-stone-900">404</div>

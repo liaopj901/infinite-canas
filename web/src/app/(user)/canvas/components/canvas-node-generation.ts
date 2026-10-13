@@ -218,12 +218,16 @@ export function buildNodeChatMessages(context: NodeGenerationContext): ChatCompl
 }
 
 export async function hydrateNodeGenerationContext(context: NodeGenerationContext) {
+    const hydrateImage = async (image: ReferenceImage) => {
+        const url = image.url || (/^https?:\/\//i.test(image.dataUrl) ? image.dataUrl : undefined);
+        return url ? { ...image, url } : { ...image, dataUrl: await imageToDataUrl(image) };
+    };
     const { imageToDataUrl } = await import("@/services/image-storage");
     return {
         ...context,
-        referenceImages: await Promise.all(context.referenceImages.map(async (image) => ({ ...image, dataUrl: await imageToDataUrl(image) }))),
-        firstFrame: context.firstFrame ? { ...context.firstFrame, dataUrl: await imageToDataUrl(context.firstFrame) } : null,
-        lastFrame: context.lastFrame ? { ...context.lastFrame, dataUrl: await imageToDataUrl(context.lastFrame) } : null,
+        referenceImages: await Promise.all(context.referenceImages.map(hydrateImage)),
+        firstFrame: context.firstFrame ? await hydrateImage(context.firstFrame) : null,
+        lastFrame: context.lastFrame ? await hydrateImage(context.lastFrame) : null,
     };
 }
 

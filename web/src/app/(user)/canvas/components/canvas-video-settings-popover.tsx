@@ -6,8 +6,9 @@ import { FileText, Image as ImageIcon, Music2, Plus, Settings2, Trash2, Video as
 import { Button, Input, Switch } from "antd";
 
 import { VideoSettingsPanel, isAPIMartKlingMotionControlConfig, isKIEKlingMotionControlConfig, isAPIMartKlingV3Config, isKIEKlingV3Config, kieKlingOmniVariant, videoResolutionLabel, videoSecondsLabel, videoSizeLabel } from "@/components/video-settings-panel";
+import { isAutoDLConfig } from "@/lib/autodl";
 import { canvasThemes } from "@/lib/canvas-theme";
-import { supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
+import { modelKey, supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { channelProtocolForConfig, type AiConfig } from "@/stores/use-config-store";
 import type { CanvasNodeMetadata } from "../types";
@@ -37,6 +38,8 @@ export function CanvasVideoSettingsPopover({ config, onConfigChange, frameOption
     const panelRef = useRef<HTMLDivElement>(null);
     const [open, setOpen] = useState(false);
     const [buttonRect, setButtonRect] = useState<DOMRect | null>(null);
+    const model = visualOnly ? config.videoModel || config.model : config.model || config.videoModel;
+    const autodl = isAutoDLConfig(config, model);
 
     useEffect(() => {
         if (!open) return;
@@ -46,6 +49,7 @@ export function CanvasVideoSettingsPopover({ config, onConfigChange, frameOption
             if (!(target instanceof Node)) return;
             if (target instanceof Element && target.closest(".ant-select-dropdown")) return;
             if (buttonRef.current?.contains(target) || panelRef.current?.contains(target)) return;
+            if (autodl && document.activeElement instanceof HTMLElement && panelRef.current?.contains(document.activeElement)) document.activeElement.blur();
             setOpen(false);
         };
         syncPosition();
@@ -57,7 +61,7 @@ export function CanvasVideoSettingsPopover({ config, onConfigChange, frameOption
             window.removeEventListener("scroll", syncPosition, true);
             window.removeEventListener("pointerdown", closeOnOutsidePointer, true);
         };
-    }, [open]);
+    }, [open, autodl]);
 
     const panel = open && buttonRect ? <VideoSettingsPortal buttonRect={buttonRect} panelRef={panelRef} placement={placement} theme={theme} config={config} onConfigChange={onConfigChange} frameOptions={frameOptions} resourceOptions={resourceOptions} metadata={metadata} firstFrameNodeId={firstFrameNodeId} lastFrameNodeId={lastFrameNodeId} onFrameChange={onFrameChange} onMetadataChange={onMetadataChange} visualOnly={visualOnly} /> : null;
 
@@ -89,7 +93,7 @@ function VideoSettingsPortal({ buttonRect, panelRef, placement, theme, config, o
     const isAPIMartKlingV3 = isAPIMartKlingV3Config(config, model);
     const isKIEKlingV3 = isKIEKlingV3Config(config, model);
     const kieKlingOmni = kieKlingOmniVariant(config, model);
-    const isKlingMotionControl = isAPIMartKlingMotionControlConfig(config, model) || isKIEKlingMotionControlConfig(config, model);
+    const isKlingMotionControl = isAPIMartKlingMotionControlConfig(config, model) || isKIEKlingMotionControlConfig(config, model) || (channelProtocolForConfig({ ...config, model, videoModel: model }) === "tokendance" && modelKey(model) === "kling-3-0");
     const isKlingV3 = isAPIMartKlingV3 || isKIEKlingV3;
     const frameReferencesEnabled = !isKlingV3 && supportsVideoFrameReferences(model, channelProtocolForConfig({ ...config, model }));
     const optionIds = useMemo(() => new Set(frameOptions.map((item) => item.nodeId)), [frameOptions]);

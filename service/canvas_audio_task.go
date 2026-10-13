@@ -3,9 +3,9 @@ package service
 import (
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/repository"
-	"github.com/google/uuid"
 )
 
 type CanvasAudioTaskCreateInput struct {
@@ -18,6 +18,10 @@ type CanvasAudioTaskCreateInput struct {
 	ChannelID       string
 	UserChannelID   string
 	ChannelName     string
+	WorkflowRef     string
+	Credits         float64
+	BillingName     string
+	BillingPath     string
 	Prompt          string
 	Endpoint        string
 	ContentType     string
@@ -37,6 +41,8 @@ func CreateCanvasAudioTask(input CanvasAudioTaskCreateInput) (model.CanvasAudioT
 		ChannelID:       strings.TrimSpace(input.ChannelID),
 		UserChannelID:   strings.TrimSpace(input.UserChannelID),
 		ChannelName:     strings.TrimSpace(input.ChannelName),
+		WorkflowRef:     input.WorkflowRef,
+		Credits:         input.Credits,
 		Status:          "queued",
 		Progress:        0,
 		Prompt:          strings.TrimSpace(input.Prompt),
@@ -46,7 +52,17 @@ func CreateCanvasAudioTask(input CanvasAudioTaskCreateInput) (model.CanvasAudioT
 		CreatedAt:       current,
 		UpdatedAt:       current,
 	}
-	return repository.SaveCanvasAudioTask(task)
+	saved := task
+	var err error
+	if input.WorkflowRef != "" {
+		err = ConsumeUserCredits(task.UserID, input.BillingName, task.Credits, input.BillingPath, &task)
+	} else {
+		saved, err = repository.SaveCanvasAudioTask(task)
+	}
+	if err == nil {
+		WakeVideoTaskPoller()
+	}
+	return saved, err
 }
 
 func GetUserCanvasAudioTask(userID string, id string) (model.CanvasAudioTask, bool, error) {

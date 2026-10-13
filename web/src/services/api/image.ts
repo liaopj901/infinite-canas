@@ -1,13 +1,17 @@
 import axios from "axios";
+import { executeParameterTranslation, findParameterTranslation, normalizeTranslationAspectRatio, translationBody, translationHeaders, type TranslationInput } from "./channel-parameter-translation";
 
 import { isMiniMaxChannel, miniMaxModels } from "@/lib/minimax-video";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { isKIESeedreamLayerDecompositionModel } from "@/lib/kie-models";
 import { isMimoChannel, mimoModels } from "@/lib/mimo-tts";
+import { modelChannelAttributionHeaders } from "@/lib/model-channel";
 import { dataUrlToGeminiInlineData, geminiActionUrl, geminiDirectHeaders, geminiErrorMessage, isGeminiConfig, normalizeGeminiBaseUrl } from "@/lib/gemini";
-import { imageToDataUrl, isProtectedImageUrl, resolveImageUrl } from "@/services/image-storage";
+import { autoSyncImage, imageToDataUrl, isProtectedImageUrl, resolveImageUrl, type UploadedImage } from "@/services/image-storage";
 import { buildApiUrl, channelIdForActiveModel, channelProtocolForConfig, directAIProviderForConfig, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
+import { fetchAutoDLWorkflows } from "./autodl";
+import { tokenDanceRecoveryMessage } from "./protocols/tokendance";
 import type { ReferenceImage } from "@/types/image";
 import { nanoid } from "nanoid";
 
@@ -39,7 +43,7 @@ type ChatImagesApiResponse = {
     msg?: string;
 };
 
-type GeneratedImage = { id: string; dataUrl: string; seed?: number };
+type GeneratedImage = { id: string; dataUrl: string; seed?: number } & Partial<UploadedImage>;
 export type CanvasImageTask = {
     id: string;
     parent_task_id?: string;
@@ -50,6 +54,7 @@ export type CanvasImageTask = {
     channelId?: string;
     userChannelId?: string;
     channelName?: string;
+    workflowRef?: string;
     model?: string;
     prompt?: string;
     status: "queued" | "processing" | "completed" | "failed" | string;
@@ -57,6 +62,7 @@ export type CanvasImageTask = {
     url?: string;
     image_url?: string;
     image_urls?: string[];
+    imageStorage?: Array<UploadedImage | null>;
     storageKey?: string;
     storageKeys?: string[];
     width?: number;
@@ -71,7 +77,7 @@ export type CanvasImageTask = {
     error?: { message?: string };
     error_detail?: string;
 };
-export type CanvasImageTaskOptions = { nodeId?: string; source?: "canvas" | "image-workbench" | "workflow"; sourceId?: string; clientTaskId?: string };
+export type CanvasImageTaskOptions = { nodeId?: string; source?: "canvas" | "image-workbench" | "workflow"; sourceId?: string; clientTaskId?: string; signal?: AbortSignal; onServerTask?: () => void };
 
 type ParsedImageResponse = {
     images: GeneratedImage[];
@@ -146,6 +152,7 @@ type ImageRequestParams = {
     size?: string;
     timeoutSeconds: number;
     streamPartialImages: number;
+    signal?: AbortSignal;
 };
 
 const QUALITY_BASE: Record<string, number> = {
@@ -447,7 +454,7 @@ async function withTimeout<T>(timeoutSeconds: number, run: (signal: AbortSignal)
     signal?.addEventListener("abort", abort, { once: true });
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000);
     try {
-        return await run(controller.signal);
+        return await run(signal ? AbortSignal.any([controller.signal, signal]) : controller.signal);
     } catch (error) {
         if (signal?.aborted) throw abortError(signal);
         if (controller.signal.aborted) throw new Error(timeoutError(timeoutSeconds));
@@ -536,7 +543,7 @@ function parseServerSentEventBlock(block: string) {
     return JSON.parse(data) as Record<string, unknown>;
 }
 
-async function readJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void, signal?: AbortSignal) {
+export async function readJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void, signal?: AbortSignal) {
     if (!response.body) throw new ImageRequestError("接口未返回可读取的流式响应", `${response.status} ${response.statusText}`);
     throwIfAborted(signal);
     const reader = response.body.getReader();
@@ -585,7 +592,7 @@ async function readJsonServerSentEvents(response: Response, onEvent: (event: Rec
     }
 }
 
-function isEventStreamResponse(response: Response) {
+export function isEventStreamResponse(response: Response) {
     return response.headers.get("Content-Type")?.toLowerCase().includes("text/event-stream") ?? false;
 }
 
@@ -683,6 +690,7 @@ export function aiHeaders(config: AiConfig, contentType?: string) {
     if (isGeminiConfig(config)) return geminiDirectHeaders(config);
     return {
         Authorization: `Bearer ${(localChannelForActiveModel(config)?.apiKey || config.apiKey).trim()}`,
+                ...modelChannelAttributionHeaders(channelProtocolForConfig(config)),
         ...(contentType ? { "Content-Type": contentType } : {}),
     };
 }
@@ -1092,8 +1100,14 @@ async function requestAndParseImages(config: AiConfig, endpoint: string, request
 
 async function requestImages(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], abortSignal?: AbortSignal): Promise<GeneratedImage[]> {
     throwIfAborted(abortSignal);
+	const translation = await findParameterTranslation(config);
+	if (translation) {
+		const input = await imageTranslationInput(config,prompt,references,createImageRequestParams(config));
+		const result = await executeParameterTranslation(config,translation,input,abortSignal);
+		return result.urls.map((dataUrl) => ({id:nanoid(),dataUrl}));
+	}
     assertImageReferencesSupported(config.model, references);
-    const params = createImageRequestParams(config);
+    const params = { ...createImageRequestParams(config), signal: abortSignal };
     const inputImageDataUrls = references.length ? await Promise.all(references.map((image) => imageToDataUrl(image))) : [];
     throwIfAborted(abortSignal);
     const useConcurrentSingleRequests = isGeminiConfig(config) || config.apiMode === "responses" || config.apiMode === "chat" || config.codexCli || config.streamImages || isZhipuImageModel(config.model);
@@ -1118,11 +1132,46 @@ async function requestImages(config: AiConfig & { seedIndex?: number; seedCount?
         : requestImageGenerationSingle(config, prompt, params, abortSignal);
 }
 
+async function imageTranslationInput(config: AiConfig, prompt: string, references: ReferenceImage[], params: ImageRequestParams): Promise<TranslationInput> {
+    return {
+        kind: "image",
+        variables: {
+            model: config.model,
+            prompt: withPromptGuard(config, withSystemPrompt(config, prompt)),
+            size: params.size,
+            aspectRatio: normalizeTranslationAspectRatio(config.size),
+            quality: config.quality,
+            count: params.n,
+            images: await Promise.all(references.map(async (ref) => publicHttpUrl(ref.url) || publicHttpUrl(ref.dataUrl) || imageToDataUrl(ref))),
+        },
+    };
+}
+
+async function syncGeneratedImages(images: GeneratedImage[], requestToken: string) {
+    if (useUserStore.getState().token !== requestToken) return images;
+    return Promise.all(images.map(async (image) => {
+        const stored = await autoSyncImage(image.dataUrl, image.id, image.storageKey);
+        return stored ? { id: image.id, dataUrl: stored.url, seed: image.seed, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType } : image;
+    }));
+}
+
+async function syncCanvasImageTask(task: CanvasImageTask, resultId = task.started_at, requestToken = useUserStore.getState().token): Promise<CanvasImageTask> {
+    if (useUserStore.getState().token !== requestToken) return task;
+    if (!["completed", "complete", "done", "succeeded", "success"].includes((task.status || "").toLowerCase())) return task;
+    const urls = [...new Set([...(task.image_urls || []), task.image_url || task.url || ""].map((url) => url.trim()).filter(Boolean))];
+    const imageStorage = await Promise.all(urls.map((url, index) => autoSyncImage(url, `${task.id}:${resultId}:${index}`, (index === 0 ? task.storageKey : undefined) || canvasImageTaskStorageKey(url))));
+    if (!imageStorage.some(Boolean)) return task;
+    const syncedUrls = urls.map((url, index) => imageStorage[index]?.url || url);
+    const stored = imageStorage[0];
+    return { ...task, ...(stored ? { storageKey: stored.storageKey, bytes: stored.bytes, mimeType: stored.mimeType } : {}), url: syncedUrls[0], image_url: syncedUrls[0], ...(task.image_urls?.length ? { image_urls: syncedUrls } : {}), imageStorage };
+}
+
 export async function requestGeneration(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, signal?: AbortSignal) {
+    const requestToken = useUserStore.getState().token;
     try {
         const images = await requestImages(config, prompt, [], signal);
         refreshRemoteUser(config);
-        return images;
+        return syncGeneratedImages(images, requestToken);
     } catch (error) {
         if (isAbortError(error)) throw error;
         if (error instanceof ImageRequestError) throw error;
@@ -1131,10 +1180,11 @@ export async function requestGeneration(config: AiConfig & { seedIndex?: number;
 }
 
 export async function requestEdit(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], signal?: AbortSignal) {
+    const requestToken = useUserStore.getState().token;
     try {
         const images = await requestImages(config, prompt, references, signal);
         refreshRemoteUser(config);
-        return images;
+        return syncGeneratedImages(images, requestToken);
     } catch (error) {
         if (isAbortError(error)) throw error;
         if (error instanceof ImageRequestError) throw error;
@@ -1143,11 +1193,14 @@ export async function requestEdit(config: AiConfig & { seedIndex?: number; seedC
 }
 
 export async function createCanvasImageTask(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], options: CanvasImageTaskOptions = {}): Promise<CanvasImageTask> {
+    const requestToken = useUserStore.getState().token;
+	const translation = await findParameterTranslation(config);
     if (!usesAccountProxy(config)) {
-        const images = await requestImages({ ...config, count: "1" }, prompt, references);
+        const images = await requestImages({ ...config, count: "1" }, prompt, references, options.signal);
+        options.signal?.throwIfAborted();
         const [image] = images;
         if (!image) throw new Error("接口没有返回图片");
-        return {
+        return syncCanvasImageTask({
             id: options.clientTaskId || nanoid(),
             source: options.source || "canvas",
             source_id: options.sourceId || "",
@@ -1157,11 +1210,13 @@ export async function createCanvasImageTask(config: AiConfig & { seedIndex?: num
             status: "completed",
             progress: 100,
             image_url: image.dataUrl,
-            ...(isKIESeedreamLayerDecompositionModel(config.model) ? { image_urls: images.map((item) => item.dataUrl) } : {}),
-        };
+            ...(translation || isKIESeedreamLayerDecompositionModel(config.model) ? { image_urls: images.map((item) => item.dataUrl) } : {}),
+        }, image.id, requestToken);
     }
     const params = createImageRequestParams({ ...config, count: "1" });
-    const request = await createCanvasImageTaskRequest({ ...config, count: "1" }, prompt, references, params, options);
+    const request: RequestInit = translation ? {method:"POST",headers:translationHeaders(config,translation),body:JSON.stringify({endpoint:references.length ? "/images/edits" : "/images/generations",nodeId:options.nodeId || "",source:options.source || "canvas",sourceId:options.sourceId || "",clientTaskId:options.clientTaskId || "",prompt,request:translationBody(config,await imageTranslationInput(config,prompt,references,params))})} : await createCanvasImageTaskRequest({ ...config, count: "1" }, prompt, references, params, options);
+    options.signal?.throwIfAborted();
+    options.onServerTask?.();
     const response = await fetch("/api/v1/canvas/image-tasks", request);
     if (!response.ok) {
         const error = await fetchErrorDetail(response, "图片任务创建失败");
@@ -1170,13 +1225,14 @@ export async function createCanvasImageTask(config: AiConfig & { seedIndex?: num
     const payload = (await response.json()) as { code?: number; msg?: string; data?: CanvasImageTask };
     if (payload.code !== 0 || !payload.data) throw new ImageRequestError(payload.msg || "图片任务创建失败", payload);
     refreshRemoteUser(config);
-    return resolveCanvasImageTask(payload.data);
+    return resolveCanvasImageTask(await syncCanvasImageTask(payload.data, undefined, requestToken));
 }
 
-export async function pollCanvasImageTaskStatus(taskId: string): Promise<CanvasImageTask> {
+export async function pollCanvasImageTaskStatus(taskId: string, signal?: AbortSignal): Promise<CanvasImageTask> {
     const token = useUserStore.getState().token;
     if (!token) throw new Error("请先登录后再使用云端渠道");
     const response = await fetch(`/api/v1/canvas/image-tasks/${encodeURIComponent(taskId)}`, {
+        signal,
         headers: { Authorization: `Bearer ${token}` },
     });
     if (!response.ok) {
@@ -1185,7 +1241,7 @@ export async function pollCanvasImageTaskStatus(taskId: string): Promise<CanvasI
     }
     const payload = (await response.json()) as { code?: number; msg?: string; data?: CanvasImageTask };
     if (payload.code !== 0 || !payload.data) throw new ImageRequestError(payload.msg || "读取图片任务失败", payload);
-    return resolveCanvasImageTask(payload.data);
+    return resolveCanvasImageTask(await syncCanvasImageTask(payload.data, undefined, token));
 }
 
 async function createCanvasImageTaskRequest(config: AiConfig & { seedIndex?: number; seedCount?: number }, prompt: string, references: ReferenceImage[], params: ImageRequestParams, options: CanvasImageTaskOptions): Promise<RequestInit> {
@@ -1319,7 +1375,11 @@ export async function requestImageQuestion(config: AiConfig, messages: ChatCompl
             });
             if (!response.ok) {
                 const error = await fetchErrorDetail(response, "请求失败");
-                throw new ImageRequestError(error.message, error.detail);
+                throw new ImageRequestError(
+                    tokenDanceRecoveryMessage(channelProtocolForConfig(config) === "tokendance" ? response.headers.get("TokenDance-Recovery-Action") : null)
+                        || error.message,
+                    error.detail,
+                );
             }
             if (isEventStreamResponse(response)) {
                 await readJsonServerSentEvents(response, (event) => {
@@ -1356,12 +1416,33 @@ export async function fetchImageModels(config: AiConfig) {
     if (config.channelMode === "remote") return config.models;
     const channel = localChannelForActiveModel(config);
     if (channel?.protocol === "gemini") return fetchGeminiModels(channel.baseUrl, channel.apiKey);
+    if (channel?.protocol === "autodl") return (await fetchAutoDLWorkflows(channel.baseUrl)).map((workflow) => workflow.uuid);
     if (isMiniMaxChannel(channel)) return [...miniMaxModels];
     if (isMimoChannel(channel || { baseUrl: config.baseUrl })) return [...mimoModels];
+    if (channel?.protocol === "ark" && buildApiUrl(channel.baseUrl, "").toLowerCase().endsWith("/api/plan/v3")) return [
+        "doubao-seed-2.0-mini",
+        "doubao-seed-2.0-lite",
+        "deepseek-v4-flash",
+        "glm-5.3-flash",
+        "doubao-seed-2.1-turbo",
+        "doubao-seed-evolving",
+        "minimax-m3",
+        "glm-5.3",
+        "kimi-k2.7-code",
+        "deepseek-v4-pro",
+        "kimi-k3",
+        "deepseek-v4.1-flash",
+        "doubao-seedance-2.5",
+        "doubao-seedance-2.0",
+        "doubao-seedance-2.0-fast",
+        "doubao-seedance-2.0-mini",
+        "doubao-seedance-1.5-pro",
+    ];
     try {
         const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string }; msg?: string; message?: string; code?: number }>(buildApiUrl((channel?.baseUrl || config.baseUrl).trim(), "/models"), {
             headers: {
                 Authorization: `Bearer ${(channel?.apiKey || config.apiKey).trim()}`,
+        ...modelChannelAttributionHeaders(channel?.protocol || ""),
             },
             timeout: IMAGE_REQUEST_TIMEOUT_SECONDS * 1000,
         });
@@ -1672,7 +1753,7 @@ export async function batchCanvasImageTaskStatus(config: AiConfig, ids: string[]
     }
     const payload = (await response.json()) as { code?: number; msg?: string; data?: CanvasImageTask[] };
     if (payload.code !== 0 || !Array.isArray(payload.data)) throw new ImageRequestError(payload.msg || "读取图片任务失败", payload);
-    return Promise.all(payload.data.map(resolveCanvasImageTask));
+    return Promise.all(payload.data.map(async (task) => resolveCanvasImageTask(await syncCanvasImageTask(task, undefined, token))));
 }
 
 export async function deleteCanvasImageTask(config: AiConfig, task?: CanvasImageTask | null) {

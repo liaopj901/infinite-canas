@@ -48,6 +48,7 @@ export type UserStorageProvider = UserS3StorageProvider | UserWebDAVStorageProvi
 
 type UploadImageOptions = {
     localOnly?: boolean;
+    token?: string;
 };
 
 export type StorageRequestContext = {
@@ -61,6 +62,7 @@ export type StorageConfig = {
     allowUserGlobalProvider: boolean;
     autoSyncGeneratedMedia: boolean;
     autoSyncLocalGeneratedMedia: boolean;
+    autoSyncAllAssets: boolean;
 };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
@@ -91,6 +93,57 @@ export function isProtectedImageUrl(value?: string) {
 export const USER_STORAGE_PROVIDER_KEY = "infinite-canvas:user_storage_provider";
 export const USER_WEBDAV_STORAGE_PROVIDER_KEY = "infinite-canvas:user_webdav_storage_provider";
 let storageConfigPromise: Promise<StorageConfig> | null = null;
+export const STORAGE_SYNC_FAILED_EVENT = "infinite-canvas:storage-sync-failed";
+const autoSyncRequests = new Map<string | Blob, Promise<{ storageKey: string } | null>>();
+let autoSyncOwner = "";
+
+export async function autoSyncToCloud<T extends { storageKey: string }>(source: string | Blob, upload: () => Promise<T | null>): Promise<T | null> {
+    const requestOwnerId = getAccountOwnerId();
+    const owner = useUserStore.getState().token;
+    const config = await loadStorageConfig().catch(() => null);
+    // 配置加载和上传都会跨越账号切换；旧请求不能占用新账号的同步缓存。
+    if (getAccountOwnerId() !== requestOwnerId || useUserStore.getState().token !== owner) return null;
+    if (!config?.autoSyncAllAssets || (!canUseGlobalStorage(config) && !(config.allowUserProvider && loadUserStorageProvider()))) return null;
+    if (autoSyncOwner !== owner) {
+        autoSyncRequests.clear();
+        autoSyncOwner = owner;
+    }
+    const existing = autoSyncRequests.get(source);
+    if (existing) return existing as Promise<T | null>;
+    const request = upload().catch((error) => {
+        reportStorageSyncFailure(error);
+        return null;
+    });
+    autoSyncRequests.set(source, request);
+    const result = await request;
+    if ((source instanceof Blob || !result) && autoSyncRequests.get(source) === request) autoSyncRequests.delete(source);
+    return getAccountOwnerId() === requestOwnerId && useUserStore.getState().token === owner ? result : null;
+}
+
+export function clearAutoSyncCache(storageKey: string) {
+    for (const [source, request] of autoSyncRequests) {
+        void request.then((result) => {
+            if (result?.storageKey === storageKey && autoSyncRequests.get(source) === request) autoSyncRequests.delete(source);
+        });
+    }
+}
+
+export async function autoSyncImage(url: string, resultId: string, storageKey?: string) {
+    if (!url || storageKey) return null;
+    return autoSyncToCloud(`image:${resultId}`, async () => {
+        try {
+            return await uploadRemoteImageToServer(url, "image");
+        } catch (error) {
+            if (!url.startsWith("data:") && !url.startsWith("blob:")) throw error;
+            reportStorageSyncFailure(error);
+            return uploadImage(url, { localOnly: true });
+        }
+    });
+}
+
+function reportStorageSyncFailure(error: unknown) {
+    window.dispatchEvent(new CustomEvent(STORAGE_SYNC_FAILED_EVENT, { detail: error instanceof Error ? error.message : "" }));
+}
 
 export function canUseGlobalStorage(config: StorageConfig) {
     const user = useUserStore.getState().user;
@@ -99,7 +152,7 @@ export function canUseGlobalStorage(config: StorageConfig) {
 
 export function shouldAutoSyncGeneratedMedia(config: StorageConfig, channelMode: AiConfig["channelMode"]) {
     // 必须按生成时的渠道判断，不能让用户后续切换渠道改变历史结果的上传策略。
-    return channelMode === "local" ? config.autoSyncLocalGeneratedMedia : config.autoSyncGeneratedMedia;
+    return config.autoSyncAllAssets || (channelMode === "local" ? config.autoSyncLocalGeneratedMedia : config.autoSyncGeneratedMedia);
 }
 
 function isLocalNetworkHost(hostname: string) {
@@ -159,7 +212,8 @@ export function getProxyUrl(url: string): string {
 
 export async function uploadImage(input: string | Blob, options: UploadImageOptions = {}): Promise<UploadedImage> {
     const requestOwnerId = getAccountOwnerId();
-    const requestToken = useUserStore.getState().token;
+    const requestToken = options.token ?? useUserStore.getState().token;
+    if (options.token !== undefined && useUserStore.getState().token !== requestToken) throw new Error("登录状态已变化");
     const blob = await loadImageBlob(typeof input === "string" ? getProxyUrl(input) : input);
 
     if (options.localOnly) return saveImageToBrowser(blob);
@@ -473,7 +527,7 @@ export async function deleteStoredImages(keys: Iterable<string>, request: Storag
     );
     await Promise.all(
         Array.from(new Set(keys)).map(async (key) => {
-            if (assetKeys.has(key)) return;
+            if (assetKeys.has(key) || (getAccountOwnerId() !== ownerId || useUserStore.getState().token !== token)) return;
             if (key.startsWith("server:")) {
                 await deleteServerImage(key, ownerId, token);
                 return;
@@ -486,27 +540,38 @@ export async function deleteStoredImages(keys: Iterable<string>, request: Storag
             if (url) URL.revokeObjectURL(url);
             objectUrls.delete(key);
             await store.removeItem(key);
+            clearAutoSyncCache(key);
         }),
     );
 }
 
-export async function cleanupUnusedImages(usedData: unknown) {
-    const usedKeys = collectImageStorageKeys(usedData);
-    const unused: string[] = [];
+export async function cleanupUnusedImages(usedData: unknown, storageKeys: ReadonlyMap<string, string> = new Map(), ownerToken?: string) {
+    const usedKeys = collectImageStorageKeys(usedData, new Set(), storageKeys);
+    const unused = Array.from(new Set(storageKeys.values())).filter((key) => key.startsWith("server:") && !usedKeys.has(key));
     await store.iterate((_value, key) => {
         if (!usedKeys.has(key)) unused.push(key);
     });
-    await deleteStoredImages(unused);
+    await deleteStoredImages(unused, { token: ownerToken });
 }
 
-export function collectImageStorageKeys(value: unknown, keys = new Set<string>()) {
+export function collectImageStorageKeys(value: unknown, keys = new Set<string>(), knownUrls?: ReadonlyMap<string, string>, capturedUrls?: Map<string, string>) {
     if (typeof value === "string") {
-        if (value.startsWith("image:") || value.startsWith("server:") || value.startsWith("local:")) keys.add(value);
+        if (value.startsWith("image:") || (value.startsWith("server:") || value.startsWith("local:"))) keys.add(value);
+        const referencedKey = knownUrls?.get(value);
+        if (referencedKey) keys.add(referencedKey);
         return keys;
     }
     if (!value || typeof value !== "object") return keys;
-    if ("storageKey" in value && typeof value.storageKey === "string" && (value.storageKey.startsWith("image:") || value.storageKey.startsWith("server:") || value.storageKey.startsWith("local:"))) keys.add(value.storageKey);
-    Object.values(value).forEach((item) => (Array.isArray(item) ? item.forEach((child) => collectImageStorageKeys(child, keys)) : collectImageStorageKeys(item, keys)));
+    if ("storageKey" in value && typeof value.storageKey === "string" && (value.storageKey.startsWith("image:") || (value.storageKey.startsWith("server:") || value.storageKey.startsWith("local:")))) {
+        keys.add(value.storageKey);
+        if (capturedUrls) {
+            for (const field of ["content", "url", "dataUrl"]) {
+                const url = (value as Record<string, unknown>)[field];
+                if (typeof url === "string" && url) capturedUrls.set(url, value.storageKey);
+            }
+        }
+    }
+    Object.values(value).forEach((item) => (Array.isArray(item) ? item.forEach((child) => collectImageStorageKeys(child, keys, knownUrls, capturedUrls)) : collectImageStorageKeys(item, keys, knownUrls, capturedUrls)));
     return keys;
 }
 
@@ -664,6 +729,10 @@ async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId
     } else if (provider?.type === "webdav" && getAccountOwnerId() === ownerId && useUserStore.getState().token === token) {
         const direct = await import("@/services/webdav-direct-storage");
         if (await direct.deletePersistedDirectWebDAV(provider, storageKey)) {
+            clearAutoSyncCache(storageKey);
+            const url = objectUrls.get(storageKey);
+            if (url) URL.revokeObjectURL(url);
+            objectUrls.delete(storageKey);
             await store.removeItem(storageKey);
             return;
         }
@@ -672,6 +741,10 @@ async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId
     if (!token) {
         if (!provider) return;
         await deleteAnonymousStorageFile(id, toProviderPayload(provider));
+        clearAutoSyncCache(storageKey);
+        const url = objectUrls.get(storageKey);
+        if (url) URL.revokeObjectURL(url);
+        objectUrls.delete(storageKey);
         await store.removeItem(storageKey);
         return;
     }
@@ -684,6 +757,7 @@ async function deleteServerImage(storageKey: string, ownerId = getAccountOwnerId
     const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string } | null;
     if (!response.ok || payload?.code !== 0) throw new Error(payload?.msg || "删除服务端图片失败");
     await store.removeItem(storageKey);
+    clearAutoSyncCache(storageKey);
 }
 
 function blobToDataUrl(blob: Blob) {

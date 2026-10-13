@@ -44,7 +44,7 @@ type CanvasProject = {
 - `createdAt` / `updatedAt`：ISO 字符串。
 - `nodes`：画布节点列表。
 - `connections`：节点连线列表。
-- `chatSessions`：右侧画布助手会话。
+- `chatSessions`：右侧 Agent 会话。
 - `activeChatId`：当前选中的助手会话 ID。
 - `backgroundMode`：画布背景模式。
 - `viewport`：视口变换，`x/y` 是屏幕平移，`k` 是缩放比例。

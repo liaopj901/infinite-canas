@@ -31,6 +31,8 @@ description: 当前后端主要数据表与字段说明
 - `image_generation_logs`
 - `canvas_image_tasks`
 - `canvas_audio_tasks`
+- `comfy_bridges`
+- `comfy_bridge_requests`
 - `canvas_projects`
 - `user_configs`
 - `storage_objects`
@@ -51,7 +53,7 @@ description: 当前后端主要数据表与字段说明
 | `display_name` | string | 昵称 |
 | `avatar_url` | string | 头像地址 |
 | `role` | string | 角色：`user`、`admin` |
-| `credits` | number | 算力点余额 |
+| `credits` | decimal(20,2) | 算力点余额 |
 | `aff_code` | string | 用户自己的邀请码，唯一索引 |
 | `aff_count` | number | 已邀请用户数量，冗余统计字段 |
 | `inviter_id` | string | 邀请人用户 ID |
@@ -71,7 +73,7 @@ description: 当前后端主要数据表与字段说明
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `user_id` | string | 用户 ID，主键 |
-| `model_config` | text | 模型与偏好配置 JSON；S3/R2 和 WebDAV 的自动同步开关分别为 `syncStorageConfig`、`syncWebDAVStorageConfig` |
+| `model_config` | 大文本 | 模型与偏好配置 JSON，个人工作流的 `workflowChannels` 完整条目也暂存在这里；S3/R2 和 WebDAV 的自动同步开关分别为 `syncStorageConfig`、`syncWebDAVStorageConfig` |
 | `storage_provider` | text | 用户存储配置 JSON，内部结构为 `{ "s3": {...}, "webdav": {...} }`，两类配置可保留但不能同时启用 |
 | `image_history` | text | 用户图片历史同步数据 |
 | `asset_data` | text | 用户素材同步数据 |
@@ -209,9 +211,10 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `model` | string | 模型名称 |
 | `channel_id` | string | 模型渠道 ID |
 | `channel_name` | string | 模型渠道名称 |
-| `source` | string | 任务来源：`video-workbench`、`canvas` |
+| `source` | string | 任务来源：`video-workbench`、`canvas`、`workflow` |
 | `source_id` | string | 来源内 ID，画布任务记录画布节点 ID，视频创作台为空 |
 | `upstream_task_id` | string | 上游任务 ID |
+| `workflow_ref` | text | 仅新工作流任务使用的渠道/条目精确引用；旧视频任务为空 |
 | `upstream_video_id` | string | 上游视频 ID，例如 Agnes 的 `video_...` |
 | `status` | string | 状态：`queued`、`processing`、`completed`、`failed` |
 | `progress` | number | 生成进度，0-100 |
@@ -221,9 +224,10 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `error` | text | 失败摘要 |
 | `error_detail` | text | 失败详情或最近一次轮询错误详情 |
 | `request_body` | text | 创建任务时的请求摘要 |
+| `parameter_translation_snapshot` | text | 自定义转译视频的规则原文、变量、任务 ID 和已完成结果快照；不保存渠道密钥，不通过 JSON 响应返回 |
 | `response_body` | text | 创建任务时的响应摘要 |
 | `last_response` | text | 最近一次状态响应摘要 |
-| `credits` | number | 创建任务时预扣算力点 |
+| `credits` | decimal(20,2) | 创建任务时预扣算力点 |
 | `created_at` | string | 创建时间 |
 | `updated_at` | string | 更新时间 |
 | `started_at` | string | 上游开始时间 |
@@ -280,7 +284,9 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `node_id` | string | 画布节点 ID |
 | `model` | string | 模型名称 |
 | `channel_id` | string | 模型渠道 ID |
-| `status` | string | 状态：`queued`、`processing`、`completed`、`failed` |
+| `workflow_ref` | text | 工作流渠道、条目和任务状态的精确引用，供后台轮询恢复 |
+| `credits` | decimal(20,2) | 工作流任务扣除的站内额度，失败或停止时用于退款 |
+| `status` | string | 状态：`queued`、`processing`、`running`、`in_progress`、`completed`、`failed`、`cancelled` |
 | `progress` | number | 生成进度 |
 | `prompt` | text | 提示词 |
 | `generation_type` | string | `generation` 或 `edit` |
@@ -317,6 +323,7 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `node_id` | string | 画布节点 ID |
 | `model` | string | 模型名称 |
 | `channel_id` | string | 模型渠道 ID |
+| `workflow_ref` | text | 仅新工作流任务使用的渠道/条目精确引用；旧音频任务为空 |
 | `status` | string | 状态：`queued`、`processing`、`completed`、`failed` |
 | `progress` | number | 生成进度 |
 | `prompt` | text | 提示词 |
@@ -330,6 +337,53 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `completed_at` | string | 完成时间 |
 
 索引：`idx_canvas_audio_tasks_user_source_node (user_id, source, source_id, node_id)`
+
+### comfy_bridges
+
+ComfyUI Bridge 设备表。每台可访问一处 ComfyUI 的独立程序注册一条设备；工作流配置仍保存在系统设置或用户模型配置 JSON 中，不在此表重复保存。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | Bridge ID，主键 |
+| `owner_scope` | string | `system` 或 `personal` |
+| `owner_id` | string | 系统设备为 `system`，个人设备为用户 ID |
+| `name` | string | 设备显示名称 |
+| `token_hash` | string | 专用 Token 的 SHA-256 摘要，唯一索引；不保存明文 Token |
+| `enabled` | boolean | Token 有效标记；删除设备时整行移除 |
+| `last_seen_at` | datetime | 最近一次心跳时间，用于判断在线状态 |
+| `capabilities_json` | 大文本 | ComfyUI 地址、工作流目录及发现的工作流 ID/标题清单 |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_comfy_bridges_owner (owner_scope, owner_id)`。
+
+### comfy_bridge_requests
+
+Bridge 持久化请求队列表。普通执行请求由服务端按设备分配，Bridge 通过短租约领取和续租；ComfyUI 媒体只回传本机结果地址等小型元数据，服务端结算关联业务任务，删除设备或超过一小时硬截止的未完成请求标记失败，Bridge 确认不再需要重传后进入十分钟清理等待期。`inspect_workflow` 检查请求的硬截止为三十秒，调用方读取结果后立即删除；服务异常中断遗留的已完成检查请求由现有后台循环在三十秒后清理。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 请求 ID，主键 |
+| `bridge_id` | string | 目标 Bridge ID |
+| `owner_scope` | string | `system` 或 `personal` |
+| `owner_id` | string | 系统或用户归属 ID |
+| `task_id` | string | 对应图片、视频或音频任务 ID；检查请求为空 |
+| `kind` | string | 输出用途：`image`、`video`、`audio`，或按需读取工作流的 `inspect_workflow` |
+| `status` | string | `pending`、`claimed`、`succeeded`、`failed` |
+| `payload_json` | 大文本 | 执行请求的工作流、字段覆盖及媒体输入，或检查请求的工作流 ID/JSON |
+| `result_json` | 大文本 | Bridge 回传的本机结果地址、文件名、MIME 等小型媒体元数据，或按需检查得到的工作流 JSON、字段和拓扑 |
+| `error` | text | 失败原因 |
+| `claimed_at` | datetime | 领取或重新领取时间 |
+| `lease_token` | string | 当前领取者的租约令牌；续租、检查点和结果回传必须匹配 |
+| `lease_expires_at` | datetime | 短租约到期时间；到期的 `claimed` 请求可以重新领取 |
+| `checkpoint_json` | text | Bridge 已持久化的执行检查点，包括提交中状态与 ComfyUI `prompt_id`；提交状态不明确时按失败退款处理，不重复提交 |
+| `completed_at` | datetime | 完成或失败时间 |
+| `cleanup_ready_at` | datetime | 普通执行请求在业务任务完成结算且 Bridge 已确认结果后写入，超过十分钟由后台循环物理删除；检查请求完成时写入，正常由调用方立即删除，服务异常中断遗留记录在三十秒后由后台循环清理 |
+| `expires_at` | datetime | 普通执行请求为一小时硬截止，`inspect_workflow` 为三十秒硬截止，均不因续租延长 |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_comfy_bridge_queue (bridge_id, status)`、`task_id`、`lease_expires_at`、`cleanup_ready_at`、`expires_at`。
 
 ### canvas_projects
 
@@ -360,6 +414,7 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 
 `public.value` 常放前端展示和可公开读取的配置，例如模型列表、登录开关等。  
 `private.value` 常放渠道密钥、登录密钥、后台内部开关等。
+`private.value.storage.autoSyncAllAssets` 为“全部素材云端同步”开关，默认 `false`，控制前端新增媒体和生成结果的自动转存；使用现有配置 JSON 保存，不增加数据表。
 
 当前系统设置接口会按后端结构体序列化和反序列化已知字段；数据库 JSON 中额外存在的旧字段会被忽略。
 
@@ -394,6 +449,7 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `availableModels` | string[] | 系统可用模型列表 |
+| `availableWorkflows` | string[] | 对用户开放的系统工作流标识列表；空列表表示开放全部已启用工作流，非空时只开放勾选项 |
 | `modelCosts` | object[] | 模型算力点配置 |
 | `defaultModel` | string | 默认模型 |
 | `defaultImageModel` | string | 默认图片模型 |
@@ -407,7 +463,7 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `model` | string | 模型名称 |
-| `credits` | number | 每次后端模型接口调用前预扣的算力点，未配置默认不扣除 |
+| `credits` | number | 图片每张、视频每秒、文本和音频每次调用预扣的算力点，最多保留两位小数；视频智能时长 `-1` 按 15 秒计算，未配置默认不扣除 |
 
 `auth.linuxDo` 当前字段：
 
@@ -428,14 +484,20 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `protocol` | string | 协议，支持 OpenAI、Gemini、Grok2API、MiniMax、APIMart、KIE、MiMo |
+| `protocol` | string | 协议；原模型协议保持不变，另支持 `runninghub`、`comfyui` 工作流渠道 |
 | `name` | string | 渠道名称 |
 | `baseUrl` | string | 渠道接口地址 |
 | `apiKey` | string | 渠道密钥 |
 | `models` | string[] | 渠道可用模型列表 |
+| `modelCapabilities` | object | 当前渠道手动修改过的模型分类，键为模型名称，值为 `image`、`video`、`text`、`audio`；未设置的模型沿用系统识别。公开渠道同时下发可用模型的分类，个人渠道随用户模型配置保存 |
 | `weight` | number | 渠道权重，同一模型命中多个渠道时按权重随机 |
 | `enabled` | bool | 是否启用 |
 | `remark` | string | 备注 |
+| `uploadApiKey` | string | RunningHub 企业级素材上传 Key，仅私有设置保存 |
+| `bridgeId` | string | ComfyUI 渠道绑定的 Bridge 设备 ID |
+| `comfyUrl` | string | 生成 Bridge 启动命令时使用的 ComfyUI 地址，仅在私有设置保存 |
+| `workflowDir` | string | 生成 Bridge 启动命令时使用的工作流目录，仅在私有设置保存 |
+| `workflows` | object[] | 工作流条目、逐条启停、字段映射及 API JSON；只在私有设置保存完整内容 |
 
 `promptSync` 字段：
 
@@ -466,6 +528,8 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 
 后端请求模型时，先按模型名筛选启用且包含该模型的渠道，再按 `weight` 加权随机选择一个渠道。
 
+RunningHub/ComfyUI 不加入上述普通模型筛选：系统工作流公开列表为空时下发全部已启用条目，非空时只下发已启用且已勾选条目的名称、ID 和用途；不会公开密钥、Bridge Token、字段映射或完整工作流 JSON。个人工作流在 `user_configs.model_config.workflowChannels` 中按账号隔离。
+
 ### credit_logs
 
 用户算力点变更流水表。当前记录后台手动调整、模型调用预扣和模型调用失败返还。
@@ -475,8 +539,8 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `id` | string | 主键 |
 | `user_id` | string | 关联用户 ID |
 | `type` | string | 类型：`admin_adjust`、`ai_consume`、`ai_refund` |
-| `amount` | number | 本次变动数量，增加为正，扣减为负 |
-| `balance` | number | 变动后的用户算力点余额 |
+| `amount` | decimal(20,2) | 本次变动数量，增加为正，扣减为负 |
+| `balance` | decimal(20,2) | 变动后的用户算力点余额 |
 | `related_id` | string | 关联业务 ID，可为空 |
 | `remark` | string | 备注 |
 | `extra` | json | 扩展信息 |

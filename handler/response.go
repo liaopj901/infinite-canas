@@ -62,6 +62,7 @@ func parseQuery(r *http.Request) model.Query {
 	pageSize, _ := strconv.Atoi(q.Get("pageSize"))
 	return model.Query{
 		Keyword:  q.Get("keyword"),
+		Date:     q.Get("date"),
 		Tags:     q["tag"],
 		Category: q.Get("category"),
 		Type:     q.Get("type"),

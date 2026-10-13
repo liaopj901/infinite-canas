@@ -1,37 +1,56 @@
 "use client";
 
 import { ReloadOutlined } from "@ant-design/icons";
-import { App, Button, Checkbox, Flex, Input, Modal, Space, Tabs, Typography } from "antd";
+import { App, Button, Checkbox, Flex, Input, Modal, Segmented, Space, Tabs, Typography } from "antd";
+import dynamic from "next/dynamic";
 import { useMemo, useState } from "react";
+import { useAutoDLWorkflowNames } from "@/hooks/use-autodl-workflow";
+import { modelMatchesCapability, type ModelCapabilities, type ModelCapability } from "@/stores/use-config-store";
 
 type ModelSelectTabKey = "new" | "current";
+const ChannelParameterTranslationEditor = dynamic(() => import("@/components/channel-parameter-translation-editor").then((module) => module.ChannelParameterTranslationEditor), { ssr: false });
+const capabilityOptions: Array<{ label: string; value: ModelCapability }> = [
+    { label: "生图", value: "image" },
+    { label: "视频", value: "video" },
+    { label: "文本", value: "text" },
+    { label: "音频", value: "audio" },
+];
 
 type ChannelModelSelectorModalProps = {
+    channel?: { name?: string; protocol?: string; baseUrl?: string; modelCapabilities?: ModelCapabilities };
+    parameterTranslation?: string;
     models: string[];
     sourceModels?: string[];
     onCancel: () => void;
-    onConfirm: (models: string[]) => void;
+    onConfirm: (models: string[], modelCapabilities: ModelCapabilities, parameterTranslation: string) => void | Promise<void>;
     onFetchModels: () => Promise<string[] | undefined>;
     onModelsFetched?: (models: string[]) => void;
 };
 
-export function ChannelModelSelectorModal({ models, sourceModels = [], onCancel, onConfirm, onFetchModels, onModelsFetched }: ChannelModelSelectorModalProps) {
+export function ChannelModelSelectorModal({ channel, parameterTranslation, models, sourceModels = [], onCancel, onConfirm, onFetchModels, onModelsFetched }: ChannelModelSelectorModalProps) {
     const { message } = App.useApp();
+    const modelLabel = useAutoDLWorkflowNames(channel ? [channel] : []);
     const [source, setSource] = useState(() => uniqueModels(sourceModels));
     const [existing, setExisting] = useState(() => uniqueModels(models));
     const [selected, setSelected] = useState(() => uniqueModels(models));
     const [keyword, setKeyword] = useState("");
     const [newModel, setNewModel] = useState("");
-    const [activeTab, setActiveTab] = useState<ModelSelectTabKey>("current");
+    const [activeTab, setActiveTab] = useState<ModelSelectTabKey | "classification">("current");
     const [fetching, setFetching] = useState(false);
+    const [saving, setSaving] = useState(false);
+    const [translation, setTranslation] = useState<string>();
+    const [isTranslationOpen, setIsTranslationOpen] = useState(false);
+    const [modelCapabilities, setModelCapabilities] = useState<ModelCapabilities>(() => ({ ...channel?.modelCapabilities }));
+    const isClassifying = activeTab === "classification";
     const groups = useMemo(() => buildModelGroups(source, existing), [source, existing]);
     const activeModels = useMemo(() => {
         const normalizedKeyword = keyword.trim().toLowerCase();
-        return groups[activeTab].filter((model) => model.toLowerCase().includes(normalizedKeyword));
-    }, [activeTab, groups, keyword]);
+        return (activeTab === "classification" ? selected : groups[activeTab]).filter((model) => `${model} ${modelLabel(model, channel)}`.toLowerCase().includes(normalizedKeyword));
+    }, [activeTab, channel, groups, keyword, modelLabel, selected]);
     const activeSelectedCount = activeModels.filter((model) => selected.includes(model)).length;
 
     const fetchModels = async () => {
+        setActiveTab("new");
         setFetching(true);
         try {
             const fetchedModels = await onFetchModels();
@@ -74,8 +93,19 @@ export function ChannelModelSelectorModal({ models, sourceModels = [], onCancel,
         const active = new Set(activeModels);
         setSelected((current) => current.filter((model) => !active.has(model)));
     };
+    const confirm = async () => {
+        setSaving(true);
+        try {
+            await onConfirm(uniqueModels(selected), modelCapabilities, translation ?? parameterTranslation ?? "");
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "保存渠道配置失败");
+        } finally {
+            setSaving(false);
+        }
+    };
 
     return (
+        <>
         <Modal
             title={
                 <Space size={12}>
@@ -91,7 +121,7 @@ export function ChannelModelSelectorModal({ models, sourceModels = [], onCancel,
             footer={
                 <Space>
                     <Button onClick={onCancel}>取消</Button>
-                    <Button type="primary" onClick={() => onConfirm(uniqueModels(selected))}>
+                    <Button type="primary" loading={saving} onClick={() => void confirm()}>
                         确定
                     </Button>
                 </Space>
@@ -102,7 +132,7 @@ export function ChannelModelSelectorModal({ models, sourceModels = [], onCancel,
                 <Flex gap={12} wrap>
                     <Input.Search placeholder="搜索模型" allowClear value={keyword} onChange={(event) => setKeyword(event.target.value)} style={{ flex: "1 1 260px" }} />
                     <Space.Compact style={{ flex: "1 1 320px" }}>
-                        <Input value={newModel} placeholder="输入模型名称" onChange={(event) => setNewModel(event.target.value)} onPressEnter={addModel} />
+                        <Input value={newModel} placeholder={channel?.protocol === "autodl" ? "输入工作流 ID" : "输入模型名称"} onChange={(event) => setNewModel(event.target.value)} onPressEnter={addModel} />
                         <Button onClick={addModel}>增加模型</Button>
                         <Button icon={<ReloadOutlined />} loading={fetching} onClick={() => void fetchModels()}>
                             拉取模型列表
@@ -111,6 +141,7 @@ export function ChannelModelSelectorModal({ models, sourceModels = [], onCancel,
                 </Flex>
                 <Tabs
                     activeKey={activeTab}
+                    styles={{ indicator: { display: isClassifying ? "none" : undefined } }}
                     onChange={(key) => setActiveTab(key as ModelSelectTabKey)}
                     items={[
                         { key: "new", label: `新获取的模型 (${groups.new.length})` },
@@ -122,20 +153,39 @@ export function ChannelModelSelectorModal({ models, sourceModels = [], onCancel,
                         当前列表已选择 {activeSelectedCount} / {activeModels.length}
                     </Typography.Text>
                     <Space size={8}>
-                        <Button size="small" disabled={!activeModels.length || activeSelectedCount === activeModels.length} onClick={selectActiveModels}>
+                        <Button size="small" type={isClassifying ? "primary" : "default"} disabled={!selected.length} onClick={() => { setActiveTab("classification"); setKeyword(""); }}>
+                            模型分类设置
+                        </Button>
+                        <Button size="small" disabled={parameterTranslation === undefined} onClick={() => setIsTranslationOpen(true)}>
+                            自定传参转译
+                        </Button>
+                        <Button size="small" disabled={isClassifying || !activeModels.length || activeSelectedCount === activeModels.length} onClick={selectActiveModels}>
                             全选当前列表
                         </Button>
-                        <Button size="small" disabled={!activeSelectedCount} onClick={clearActiveModels}>
+                        <Button size="small" disabled={isClassifying || !activeSelectedCount} onClick={clearActiveModels}>
                             取消当前列表
                         </Button>
                     </Space>
                 </Flex>
-                <div style={{ maxHeight: 420, overflowY: "auto", borderTop: "1px solid var(--ant-color-border-secondary)", paddingTop: 12 }}>
+                <div style={{ maxHeight: 420, overflowY: "auto", scrollbarGutter: "stable", borderTop: "1px solid var(--ant-color-border-secondary)", paddingTop: 12 }}>
                     {activeModels.length ? (
-                        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", columnGap: 24, rowGap: 12 }}>
-                            {activeModels.map((model) => (
+                        <div style={{ display: "grid", gridTemplateColumns: isClassifying ? "1fr" : "repeat(2, minmax(0, 1fr))", columnGap: 24, rowGap: 12, paddingRight: isClassifying ? 5 : 0 }}>
+                            {activeModels.map((model) => isClassifying ? (
+                                <Flex key={model} justify="space-between" align="center" gap={16}>
+                                    <Typography.Text title={model} style={{ flex: 1, minWidth: 0, wordBreak: "break-all" }}>
+                                        {modelLabel(model, channel)}
+                                    </Typography.Text>
+                                    <Segmented
+                                        size="small"
+                                        options={capabilityOptions}
+                                        value={capabilityOptions.find((option) => modelMatchesCapability(model, option.value, channel?.protocol, modelCapabilities))?.value ?? ""}
+                                        onChange={(value) => setModelCapabilities((current) => ({ ...current, [model]: value as ModelCapability }))}
+                                        style={{ flexShrink: 0 }}
+                                    />
+                                </Flex>
+                            ) : (
                                 <Checkbox key={model} checked={selected.includes(model)} onChange={(event) => toggleModel(model, event.target.checked)}>
-                                    <Typography.Text style={{ wordBreak: "break-all" }}>{model}</Typography.Text>
+                                    <Typography.Text title={model} style={{ wordBreak: "break-all" }}>{modelLabel(model, channel)}</Typography.Text>
                                 </Checkbox>
                             ))}
                         </div>
@@ -147,6 +197,8 @@ export function ChannelModelSelectorModal({ models, sourceModels = [], onCancel,
                 </div>
             </Flex>
         </Modal>
+        {isTranslationOpen && <ChannelParameterTranslationEditor name={channel?.name} baseUrl={channel?.baseUrl} models={selected} value={translation ?? parameterTranslation ?? ""} onSave={setTranslation} onClose={() => setIsTranslationOpen(false)} />}
+        </>
     );
 }
 

@@ -2,7 +2,7 @@
 
 import { Button, Modal } from "antd";
 
-import { deleteCanvasProjects, deleteCanvasTasks } from "@/services/api/canvas-tasks";
+import { deleteCanvasProjects } from "@/services/api/canvas-tasks";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useCanvasStore } from "../stores/use-canvas-store";
 import { useCanvasUiStore } from "../stores/use-canvas-ui-store";
@@ -14,10 +14,7 @@ export function CanvasDeleteProjectsDialog() {
     const deleteProjects = useCanvasStore((state) => state.deleteProjects);
     const cleanupImages = useAssetStore((state) => state.cleanupImages);
     const confirm = () => {
-        void Promise.all([
-            deleteCanvasProjects(ids),
-            Promise.all(ids.map((id) => deleteCanvasTasks(id))),
-        ]).catch(() => undefined);
+        void deleteCanvasProjects(ids).catch(() => undefined);
         deleteProjects(ids);
         cleanupImages();
         removeSelectedIds(ids);

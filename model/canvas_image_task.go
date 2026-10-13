@@ -22,6 +22,10 @@ type CanvasImageTask struct {
 	UserChannelID string `json:"userChannelId"`
 	// ChannelName 是任务创建时的渠道名称。
 	ChannelName string `json:"channelName"`
+	// WorkflowRef 保存工作流协议状态，供轮询恢复任务。
+	WorkflowRef string `json:"workflowRef,omitempty" gorm:"type:text"`
+	// Credits 是本次工作流扣除的站内额度，供失败或停止时退回。
+	Credits float64 `json:"credits,omitempty" gorm:"type:decimal(20,2)"`
 	// Status 是任务当前状态。
 	Status string `json:"status"`
 	// Progress 是任务进度百分比。

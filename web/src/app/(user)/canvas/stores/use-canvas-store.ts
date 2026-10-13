@@ -16,7 +16,7 @@ export type CanvasSidePanelState = {
 };
 
 export const DEFAULT_CANVAS_SIDE_PANEL: CanvasSidePanelState = { open: true, width: 280 };
-export const DEFAULT_CANVAS_AGENT_PANEL: CanvasSidePanelState = { open: false, width: 390 };
+export const DEFAULT_CANVAS_AGENT_PANEL: CanvasSidePanelState = { open: false, width: 464 };
 
 export type CanvasProject = {
     id: string;
@@ -265,7 +265,7 @@ export const useCanvasStore = create<CanvasStore>()(
                     updatedAt: now,
                     nodes: source.nodes || [],
                     connections: source.connections || [],
-                    chatSessions: source.chatSessions || [],
+                    chatSessions: (source.chatSessions || []).map((session) => ({ ...session, codexThreadId: undefined, codexServiceId: undefined })),
                     activeChatId: source.activeChatId || null,
                     agentConfig: source.agentConfig || null,
                     autoTitlePending: false,

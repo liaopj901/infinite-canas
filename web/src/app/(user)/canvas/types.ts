@@ -20,7 +20,7 @@ export enum CanvasNodeType {
     Group = "group",
 }
 
-export type CanvasNodeStatus = "idle" | "success" | "loading" | "error";
+export type CanvasNodeStatus = "idle" | "success" | "loading" | "stopping" | "stopped" | "error";
 export type CanvasGenerationMode = "text" | "image" | "video" | "audio";
 export type CanvasImageGenerationType = "generation" | "edit";
 
@@ -45,6 +45,7 @@ export type CanvasNodeMetadata = {
     generationType?: CanvasImageGenerationType;
     model?: string;
     channelMode?: "local" | "remote";
+    workflowRef?: import("@/lib/workflow-channel").WorkflowRef;
     channelId?: string;
     size?: string;
     quality?: string;
@@ -72,6 +73,7 @@ export type CanvasNodeMetadata = {
     mimoVoiceDesignPrompt?: string;
     geminiTtsVoice?: string;
     mimoVoiceCloneAudioNodeId?: string;
+    referenceAudioNodeId?: string;
     references?: string[];
     naturalWidth?: number;
     naturalHeight?: number;
@@ -88,12 +90,15 @@ export type CanvasNodeMetadata = {
     durationMs?: number;
     startedAt?: number;
     progress?: number;
+    clientTaskId?: string;
+    taskBackend?: "account" | "workflow";
     imageTaskId?: string;
     imageTaskResultId?: string;
     audioTaskId?: string;
     audioTaskResultId?: string;
     videoTaskId?: string;
     videoTaskVideoId?: string;
+    videoTaskTranslation?: import("@/services/api/video").VideoResponse["translationSnapshot"];
     firstFrameNodeId?: string;
     lastFrameNodeId?: string;
     multiShot?: string;
@@ -172,6 +177,7 @@ export type PendingAgentAsset = {
 export type CanvasPendingAgentRequest = {
     prompt: string;
     assets: PendingAgentAsset[];
+    skills: CanvasAgentSkillSelection[];
 };
 
 export type CanvasAssistantImage = {
@@ -203,7 +209,12 @@ export type CanvasAgentPhase =
     | "complete";
 
 export type CanvasAgentConfig = {
+    mode?: "api" | "codex";
+    codexModel?: string;
+    codexEffort?: string;
     textApiMode: "chat" | "responses";
+    textStreaming?: boolean;
+    textReasoningEnabled?: boolean;
     autoGenerateMedia: boolean;
     imageQuality: string;
     imageSize: string;
@@ -233,6 +244,7 @@ export type CanvasAgentToolCall = {
     id: string;
     name: string;
     arguments: Record<string, unknown>;
+    argumentsError?: string;
 };
 
 export type CanvasAgentProtocolMessage =
@@ -254,12 +266,20 @@ export type CanvasAssistantMessage = {
     skillsSelected?: boolean;
 };
 
+export type CanvasAgentJsonFallbackMode = "structured-json" | "prompt-json";
+export type CanvasAgentToolMode = "native" | CanvasAgentJsonFallbackMode;
+
 export type CanvasAssistantSession = {
+    provider?: "api" | "codex";
+    codexThreadId?: string;
+    codexServiceId?: string;
     id: string;
     title: string;
     messages: CanvasAssistantMessage[];
     agentState: CanvasAgentState;
     protocolMessages: CanvasAgentProtocolMessage[];
+    jsonToolFallbackKey?: string;
+    jsonToolFallbackMode?: CanvasAgentJsonFallbackMode;
     activeSkills?: CanvasAgentSkillSelection[];
     contextCheckpoint?: string;
     createdAt: string;

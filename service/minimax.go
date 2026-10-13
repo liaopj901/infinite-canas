@@ -6,7 +6,7 @@ import (
 	"github.com/tigerowo/infinite-canvas/model"
 )
 
-const ModelChannelProtocolMiniMax = "metaso"
+const ModelChannelProtocolMiniMax = "minimax"
 
 func MiniMaxModels() []string {
 	return []string{"MiniMax-H3"}

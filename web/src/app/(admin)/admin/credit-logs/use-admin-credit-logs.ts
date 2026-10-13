@@ -15,12 +15,13 @@ export function useAdminCreditLogs() {
     const token = useUserStore((state) => state.token);
     const clearSession = useUserStore((state) => state.clearSession);
     const [keyword, setKeyword] = useState("");
+    const [date, setDate] = useState("");
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(defaultPageSize);
 
     const query = useQuery({
-        queryKey: ["admin", "credit-logs", token, keyword, page, pageSize],
-        queryFn: () => fetchAdminCreditLogs(token, { keyword, page, pageSize }),
+        queryKey: ["admin", "credit-logs", token, keyword, date, page, pageSize],
+        queryFn: () => fetchAdminCreditLogs(token, { keyword, date, page, pageSize }),
         enabled: Boolean(token),
         retry: false,
     });
@@ -51,10 +52,11 @@ export function useAdminCreditLogs() {
         }
     }, [clearSession, message, query.error, query.isError]);
 
-    const updateFilters = (next: Partial<{ keyword: string; page: number; pageSize: number }>) => {
-        const queryState = { keyword, page, pageSize, ...next };
-        if (next.keyword !== undefined || next.pageSize !== undefined) queryState.page = 1;
+    const updateFilters = (next: Partial<{ keyword: string; date: string; page: number; pageSize: number }>) => {
+        const queryState = { keyword, date, page, pageSize, ...next };
+        if (next.keyword !== undefined || next.date !== undefined || next.pageSize !== undefined) queryState.page = 1;
         setKeyword(queryState.keyword);
+        setDate(queryState.date);
         setPage(queryState.page);
         setPageSize(queryState.pageSize);
     };
@@ -64,14 +66,15 @@ export function useAdminCreditLogs() {
     return {
         logs: data?.items || [],
         keyword,
+        date,
         page,
         pageSize,
         total: data?.total || 0,
         isLoading: query.isFetching || saveMutation.isPending || deleteMutation.isPending,
-        searchLogs: (value = keyword) => updateFilters({ keyword: value }),
+        searchLogs: (value = keyword, selectedDate = date) => updateFilters({ keyword: value, date: selectedDate }),
         changePage: (value: number) => updateFilters({ page: value }),
         changePageSize: (value: number) => updateFilters({ pageSize: value }),
-        resetFilters: () => updateFilters({ keyword: "", page: 1, pageSize: defaultPageSize }),
+        resetFilters: () => updateFilters({ keyword: "", date: "", page: 1, pageSize: defaultPageSize }),
         refreshLogs: () => query.refetch(),
         saveLog: (log: Partial<AdminCreditLog>) => saveMutation.mutateAsync(log),
         deleteLog: (id: string) => deleteMutation.mutateAsync(id),

@@ -897,9 +897,9 @@ export function CreativeWorkflowWorkspace({
             const autoUpload = Boolean(storageConfig) && shouldAutoSyncGeneratedMedia(storageConfig, runConfig.channelMode);
             const storedImages = await Promise.all(
                 flattened.map(async (image, index) => {
-                    const meta = await readImageMeta(image.dataUrl);
+                    const meta = image.width && image.height && image.mimeType ? { width: image.width, height: image.height, mimeType: image.mimeType } : await readImageMeta(image.dataUrl);
                     let saved = null;
-                    if (taskToken) {
+                    if (taskToken && !image.storageKey) {
                         try {
                             saved = await saveGeneratedImage(
                                 image.dataUrl,
@@ -920,13 +920,13 @@ export function CreativeWorkflowWorkspace({
                         id: image.id,
                         dataUrl: saved?.url || image.dataUrl,
                         displayUrl: saved?.url || image.dataUrl,
-                        storageKey: saved?.storageKey || "",
+                        storageKey: saved?.storageKey || image.storageKey || "",
                         storageStatus: saved?.storageStatus,
                         storageMessage: saved?.storageMessage,
                         durationMs,
                         width: saved?.width || meta.width,
                         height: saved?.height || meta.height,
-                        bytes: saved?.bytes || getDataUrlByteSize(image.dataUrl),
+                        bytes: saved?.bytes || image.bytes || getDataUrlByteSize(image.dataUrl),
                         mimeType: saved?.mimeType || meta.mimeType,
                     };
                 }),

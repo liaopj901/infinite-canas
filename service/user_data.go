@@ -39,7 +39,11 @@ type UserStorageProviders struct {
 }
 
 type userModelConfigInput struct {
-	LocalChannels []userLocalModelChannelInput `json:"localChannels"`
+	LocalChannels       []userLocalModelChannelInput `json:"localChannels"`
+	ChannelTranslations []struct {
+		ChannelID            string `json:"channelId"`
+		ParameterTranslation string `json:"parameterTranslation"`
+	} `json:"channelTranslations"`
 }
 
 type userLocalModelChannelInput struct {
@@ -92,16 +96,24 @@ func SelectUserLocalModelChannelForModel(userID string, modelName string, channe
 		if protocol == "" {
 			protocol = "openai"
 		}
+		parameterTranslation := ""
+		for _, translation := range modelConfig.ChannelTranslations {
+			if translation.ChannelID == channelID {
+				parameterTranslation = translation.ParameterTranslation
+				break
+			}
+		}
 		return model.ModelChannel{
-			ID:       channelID,
-			Protocol: protocol,
-			Name:     firstVideoTaskValue(strings.TrimSpace(channel.Name), "本地直连"),
-			BaseURL:  baseURL,
-			APIKey:   apiKey,
-			Models:   models,
-			Weight:   1,
-			Timeout:  600,
-			Enabled:  true,
+			ID:                   channelID,
+			Protocol:             protocol,
+			Name:                 firstVideoTaskValue(strings.TrimSpace(channel.Name), "本地直连"),
+			BaseURL:              baseURL,
+			APIKey:               apiKey,
+			Models:               models,
+			Weight:               1,
+			Timeout:              600,
+			Enabled:              true,
+			ParameterTranslation: parameterTranslation,
 		}, nil
 	}
 	return model.ModelChannel{}, errors.New("本地渠道不存在")
@@ -199,6 +211,22 @@ func SaveCurrentUserModelConfig(ctx context.Context, raw json.RawMessage) (UserC
 	if config.UserID == "" {
 		config.UserID = user.ID
 		config.CreatedAt = current
+	}
+	var incoming, saved map[string]json.RawMessage
+	if json.Unmarshal(raw, &incoming) == nil && incoming != nil {
+		var input userModelConfigInput
+		if json.Unmarshal(raw, &input) != nil {
+			return UserConfigPayload{}, errors.New("模型配置格式错误")
+		}
+		for _, translation := range input.ChannelTranslations {
+			if _, err := ParameterTranslationModels(translation.ParameterTranslation); err != nil {
+				return UserConfigPayload{}, err
+			}
+		}
+		if _, supplied := incoming["channelTranslations"]; !supplied && json.Unmarshal([]byte(config.ModelConfig), &saved) == nil && saved["channelTranslations"] != nil {
+			incoming["channelTranslations"] = saved["channelTranslations"]
+			raw, _ = json.Marshal(incoming)
+		}
 	}
 	config.ModelConfig = string(raw)
 	config.UpdatedAt = current

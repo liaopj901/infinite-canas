@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/tigerowo/infinite-canvas"><img src="https://img.shields.io/github/stars/tigerowo/infinite-canvas?style=flat-square&logo=github" alt="GitHub stars"></a>
-  <a href="VERSION"><img src="https://img.shields.io/badge/version-v0.6.0-2563eb?style=flat-square" alt="Version"></a>
+  <a href="VERSION"><img src="https://img.shields.io/badge/version-v0.8.1-2563eb?style=flat-square" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-f97316?style=flat-square" alt="License"></a>
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-ready-2496ed?style=flat-square&logo=docker&logoColor=white" alt="Docker ready"></a>
   <a href="https://nextjs.org/"><img src="https://img.shields.io/badge/Next.js-16.2-000000?style=flat-square&logo=nextdotjs" alt="Next.js"></a>
@@ -38,6 +38,14 @@
 <table>
   <tr>
     <td width="190" align="center">
+      <a href="https://tokendance.space/" target="_blank" rel="noopener"><img src="https://tokendance.space/TokenDance%E5%93%81%E7%89%8C%E5%9B%BE%E6%A0%87-%E9%BB%91%E8%89%B2%E5%BA%95.svg" width="163" alt="TokenDance 词元跳动"></a>
+    </td>
+    <td>
+      <strong>观猹 × TokenDance｜从产品诞生到持续增长</strong> 观猹是面向 AI 产品与 AI Builder 的产品社区和创新生态，帮助好产品找到真正懂它的用户。同时，<a href="https://tokendance.space/" target="_blank" rel="noopener noreferrer">TokenDance</a> 为开发者提供统一、低成本的多模型调用入口，并通过“百亿 Token 补贴”“开发者计划”等福利降低早期产品的模型调用成本。观猹与 TokenDance 希望让每一个想法都能更轻松地从 Demo 走向真实世界。
+    </td>
+  </tr>
+  <tr>
+    <td width="190" align="center">
       <a href="https://metaso.cn/minimax-h3/?s=tt" target="_blank" rel="noopener"><img src="assets/metaso.png" width="163" alt="秘塔科技"></a>
     </td>
     <td>
@@ -46,9 +54,6 @@
   </tr>
 </table>
 
-<p align="center">
-  <a href="https://metaso.cn/minimax-h3/?s=tt" target="_blank" rel="noopener"><img src="https://raw.githubusercontent.com/tigerowo/cdn-tdeh/v0.6/img/infinite-canvas/metaso.webp" alt="3D 导演台时间轴" /></a>
-</p>
 <p align="center">
   <img src="https://raw.githubusercontent.com/tigerowo/cdn-tdeh/v0.5/img/infinite-canvas/3ddirectortl.webp" alt="3D 导演台时间轴" />
 </p>
@@ -71,6 +76,7 @@
 
 ## 核心功能
 
+- Agent：围绕选中节点和上游节点分析、规划并生成图片或视频，支持选择 Skill 指导当前创作任务，并将结果插回画布
 - 全景图：支持文字生成、参考图生成和本地 2:1 全景图导入，可作为导演台的场景环境背景
 - 导演台：在独立 3D 场景中布置角色、模型、全景环境和机位，支持镜头管理、截图，并将机位画面自动发送为连线图片节点
 - 摄像机控制：图片、视频和生成配置节点支持独立设置相机、镜头、焦距和光圈，将镜头参数自动写入生成提示词，并随节点保存和复制
@@ -78,7 +84,6 @@
 - AI 创作：支持 OpenAI 兼容接口的 Images API、Responses API、图生图、参考图编辑、流式接收、Base64 图片返回；Seedance 2.0 可通过火山方舟 Agent Plan 接入
 - 生图工作台：支持侧边/悬浮底部工作台、多任务并发、历史结果合并展示、分类管理、失败详情、参考图缩略图、图片体积展示和“我的素材”复用
 - 创作工作流：支持公开/个人模板、变量表单、AI 创建工作流、单图/多图系列工作流、参考图输入和结果自动进入生图历史
-- 画布助手：围绕选中节点和上游节点对话、生图，并把结果插回画布
 - 提示词库：抓取多个 GitHub 开源项目，按案例整理数百个图片提示词
 - 提示词与素材：提示词库、服务器素材库和“我的素材”可在生图、画布 AI 和工作流中复用
 

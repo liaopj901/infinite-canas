@@ -1,8 +1,8 @@
 "use client";
 
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
+import { DeleteOutlined, EditOutlined, PlusOutlined } from "@ant-design/icons";
 import { ProTable, type ProColumns } from "@ant-design/pro-components";
-import { Button, Card, Col, Form, Input, InputNumber, Modal, Row, Space, Tag, Tooltip, Typography } from "antd";
+import { Button, Card, Col, DatePicker, Form, Input, InputNumber, Modal, Row, Space, Tag, theme, Tooltip, Typography } from "antd";
 import dayjs from "dayjs";
 import { useEffect, useState } from "react";
 
@@ -18,7 +18,8 @@ const creditLogTypeLabels: Record<string, string> = {
 };
 
 export default function AdminCreditLogsPage() {
-    const { logs, keyword, page, pageSize, total, isLoading, searchLogs, changePage, changePageSize, resetFilters, refreshLogs, saveLog: saveAdminLog, deleteLog } = useAdminCreditLogs();
+    const { token } = theme.useToken();
+    const { logs, keyword, date, page, pageSize, total, isLoading, searchLogs, changePage, changePageSize, resetFilters, refreshLogs, saveLog: saveAdminLog, deleteLog } = useAdminCreditLogs();
     const [form] = Form.useForm<CreditLogFormValues>();
     const [keywordText, setKeywordText] = useState(keyword);
     const [editingLog, setEditingLog] = useState<Partial<AdminCreditLog> | null>(null);
@@ -37,6 +38,12 @@ export default function AdminCreditLogsPage() {
     };
 
     const columns: ProColumns<AdminCreditLog>[] = [
+        {
+            title: "用户",
+            dataIndex: "userDisplayName",
+            width: 150,
+            render: (_, item) => item.userDisplayName || "-",
+        },
         {
             title: "用户 ID",
             dataIndex: "userId",
@@ -97,7 +104,10 @@ export default function AdminCreditLogsPage() {
                         <Row gutter={16} align="bottom">
                             <Col flex="360px">
                                 <Form.Item label="关键词">
-                                    <Input.Search value={keywordText} placeholder="搜索用户 ID、类型、备注或关联 ID" allowClear enterButton={<SearchOutlined />} onSearch={() => searchLogs(keywordText)} onChange={(event) => setKeywordText(event.target.value)} />
+                                    <Space.Compact block>
+                                        <Input style={{ flex: 1, minWidth: 0 }} value={keywordText} placeholder="搜索用户名、用户 ID、类型、备注或关联 ID" allowClear onPressEnter={() => searchLogs(keywordText)} onChange={(event) => setKeywordText(event.target.value)} />
+                                        <DatePicker style={{ width: 46, height: token.controlHeight, padding: 0, cursor: "pointer", background: token.colorPrimary, borderColor: token.colorPrimary }} styles={{ input: { opacity: 0, cursor: "pointer" }, suffix: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", marginInlineStart: 0, color: token.colorTextLightSolid } }} value={date ? dayjs(date) : null} format={() => ""} placeholder="" inputReadOnly allowClear={false} title={date || "选择日期"} onChange={(value) => searchLogs(keywordText, value?.format("YYYY-MM-DD") || "")} />
+                                    </Space.Compact>
                                 </Form.Item>
                             </Col>
                             <Col flex="none">
@@ -111,7 +121,7 @@ export default function AdminCreditLogsPage() {
                                         >
                                             重置
                                         </Button>
-                                        <Button type="primary" icon={<ReloadOutlined />} onClick={() => searchLogs(keywordText)}>
+                                        <Button type="primary" onClick={() => searchLogs(keywordText)}>
                                             查询
                                         </Button>
                                     </Space>
@@ -168,12 +178,12 @@ export default function AdminCreditLogsPage() {
                         </Col>
                         <Col span={12}>
                             <Form.Item name="amount" label="变动数量" rules={[{ required: true, message: "请输入变动数量" }]}>
-                                <InputNumber precision={0} style={{ width: "100%" }} />
+                                <InputNumber step={0.01} precision={2} style={{ width: "100%" }} />
                             </Form.Item>
                         </Col>
                         <Col span={12}>
                             <Form.Item name="balance" label="变动后余额" rules={[{ required: true, message: "请输入变动后余额" }]}>
-                                <InputNumber min={0} precision={0} style={{ width: "100%" }} />
+                                <InputNumber min={0} step={0.01} precision={2} style={{ width: "100%" }} />
                             </Form.Item>
                         </Col>
                         <Col span={12}>

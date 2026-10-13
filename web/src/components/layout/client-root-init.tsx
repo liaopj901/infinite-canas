@@ -1,14 +1,16 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { usePathname } from "next/navigation";
 import { App } from "antd";
 
 import { fetchUserConfig } from "@/services/api/user-config";
-import { defaultUserStorageProvider, defaultUserWebDAVStorageProvider, saveUserStorageProvider, saveUserWebDAVStorageProvider } from "@/services/image-storage";
-import { useConfigStore, type AiConfig } from "@/stores/use-config-store";
+import { replaceWorkflowChannels } from "@/services/workflow-channel-storage";
+import { STORAGE_SYNC_FAILED_EVENT, defaultUserStorageProvider, defaultUserWebDAVStorageProvider, saveUserStorageProvider, saveUserWebDAVStorageProvider } from "@/services/image-storage";
+import { defaultConfig, useConfigStore, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
+import { useChannelTranslationStore } from "@/stores/use-channel-translation-store";
 
 export function ClientRootInit({ children }: { children: ReactNode }) {
     const { message } = App.useApp();
@@ -23,7 +25,18 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const isLoginPage = pathname === "/login" || pathname === "/admin/login";
+    const isTokenDanceCallback = pathname === "/tokendance/callback";
     const adminRemoteTokenRef = useRef("");
+    const accountSessionRef = useRef({ token, userId: user?.id || "" });
+
+    useEffect(() => {
+        const onSyncFailed = (event: Event) => {
+            const detail = (event as CustomEvent<string>).detail;
+            message.warning({ key: STORAGE_SYNC_FAILED_EVENT, content: `云端同步失败，已保留原始素材${detail ? `：${detail}` : ""}` });
+        };
+        window.addEventListener(STORAGE_SYNC_FAILED_EVENT, onSyncFailed);
+        return () => window.removeEventListener(STORAGE_SYNC_FAILED_EVENT, onSyncFailed);
+    }, [message]);
 
     useEffect(() => {
         void loadPublicSettings();
@@ -33,23 +46,57 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
         if (!isLoginPage) void hydrateUser();
     }, [hydrateUser, isLoginPage]);
 
-    useEffect(() => {
-        if (!token || user?.role !== "admin" || adminRemoteTokenRef.current === token) return;
-        adminRemoteTokenRef.current = token;
-        if (channelMode !== "remote") updateConfig("channelMode", "remote");
-    }, [channelMode, token, updateConfig, user?.role]);
+	useEffect(() => {
+		if (!token || adminRemoteTokenRef.current === token) return;
+		if (isTokenDanceCallback) {
+			adminRemoteTokenRef.current = token;
+			return;
+		}
+		if (user?.role !== "admin") return;
+		adminRemoteTokenRef.current = token;
+		if (channelMode !== "remote") updateConfig("channelMode", "remote");
+	}, [channelMode, isTokenDanceCallback, token, updateConfig, user?.role]);
 
-    useEffect(() => {
-        if (!token || !user?.id) return;
-        void fetchUserConfig(token)
-            .then((payload) => {
-                const syncS3 = payload.modelConfig?.syncStorageConfig === true;
+	useLayoutEffect(() => {
+		const previous = accountSessionRef.current;
+		const userId = user?.id || "";
+		if ((previous.token && !token) || (previous.userId && userId && previous.userId !== userId)) {
+			useConfigStore.setState({ config: defaultConfig });
+		} else {
+			updateConfig("workflowSyncTouched", false);
+		}
+		accountSessionRef.current = { token, userId };
+	}, [token, updateConfig, user?.id]);
+
+	useEffect(() => {
+        if (isTokenDanceCallback || !token || !user?.id) return;
+        const accountToken = token;
+        const accountId = user.id;
+        const translationRevision = useChannelTranslationStore.getState().revisions[accountId] || 0;
+        let canceled = false;
+		void fetchUserConfig(accountToken)
+			.then(async (payload) => {
+				if (canceled || useUserStore.getState().token !== accountToken || useUserStore.getState().user?.id !== accountId) return;
+				let workflowsReady = true;
+				const syncS3 = payload.modelConfig?.syncStorageConfig === true;
                 const syncWebDAV = payload.modelConfig?.syncWebDAVStorageConfig === true;
                 if (payload.modelConfig) {
-                    Object.entries(payload.modelConfig)
-                        .forEach(([key, value]) => updateConfig(key as keyof AiConfig, value as never));
-                }
-                updateConfig("syncStorageConfig", syncS3);
+                    const { workflowChannels, channelTranslations, ...modelConfig } = payload.modelConfig;
+					await useChannelTranslationStore.getState().replace(accountId, channelTranslations || [], translationRevision);
+					if (canceled || useUserStore.getState().token !== accountToken || useUserStore.getState().user?.id !== accountId) return;
+					if (workflowChannels !== undefined) {
+						try {
+							await replaceWorkflowChannels(accountId, workflowChannels);
+						} catch {
+							workflowsReady = false;
+						}
+					}
+                    if (canceled || useUserStore.getState().token !== accountToken || useUserStore.getState().user?.id !== accountId) return;
+					Object.entries(modelConfig)
+						.forEach(([key, value]) => updateConfig(key as keyof AiConfig, value as never));
+				}
+				updateConfig("workflowSyncTouched", workflowsReady);
+				updateConfig("syncStorageConfig", syncS3);
                 updateConfig("syncWebDAVStorageConfig", syncWebDAV);
                 if (syncS3 && payload.storageProvider?.s3) {
                     saveUserStorageProvider({
@@ -67,7 +114,10 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
                 }
             })
             .catch(() => {});
-    }, [token, updateConfig, user?.id]);
+        return () => {
+            canceled = true;
+        };
+    }, [isTokenDanceCallback, token, updateConfig, user?.id]);
 
     useEffect(() => {
         if (handledConfigParams.current) return;

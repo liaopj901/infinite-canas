@@ -6,7 +6,7 @@ import { nanoid } from "nanoid";
 import { getAccountOwnerId } from "@/lib/account-scope";
 import { deleteAnonymousStorageFile, uploadAnonymousStorageFile } from "@/services/anonymous-storage";
 import { apiGet } from "@/services/api/request";
-import { canUseGlobalStorage, getProxyUrl, isProtectedImageUrl, loadUserStorageProvider, toProviderPayload, type StorageConfig, type StorageRequestContext, type UserWebDAVStorageProvider } from "@/services/image-storage";
+import { autoSyncToCloud, clearAutoSyncCache, canUseGlobalStorage, getProxyUrl, isProtectedImageUrl, loadUserStorageProvider, toProviderPayload, type StorageConfig, type StorageRequestContext, type UserWebDAVStorageProvider } from "@/services/image-storage";
 import { useUserStore } from "@/stores/use-user-store";
 
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
@@ -15,8 +15,19 @@ const store = localforage.createInstance({ name: "infinite-canvas", storeName: "
 const objectUrls = new Map<string, string>();
 let storageConfigPromise: Promise<StorageConfig> | null = null;
 
-export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
+export async function uploadMediaFile(input: string | Blob, prefix = "file", syncId?: string, tokenOverride?: string): Promise<UploadedFile> {
+    const requestToken = tokenOverride ?? useUserStore.getState().token;
+    const requestOwnerId = getAccountOwnerId();
     const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
+    const uploaded = await autoSyncToCloud(syncId || blob, async () => {
+        const metadataUrl = blob.type.startsWith("video/") ? URL.createObjectURL(blob) : undefined;
+        try {
+            return await uploadMediaBlobToServer(blob, input instanceof File ? input.name : prefix, requestToken, requestOwnerId, metadataUrl);
+        } finally {
+            if (metadataUrl) URL.revokeObjectURL(metadataUrl);
+        }
+    });
+    if (uploaded) return uploaded;
     const storageKey = `${prefix}:${nanoid()}`;
     await store.setItem(storageKey, blob);
     const url = URL.createObjectURL(blob);
@@ -67,6 +78,7 @@ async function uploadMediaBlobToServer(
     filename: string,
     requestToken = useUserStore.getState().token,
     requestOwnerId = getAccountOwnerId(),
+    metadataUrl?: string,
 ): Promise<UploadedFile> {
     const config = await loadStorageConfig().catch(() => null);
     const userProvider = config?.allowUserProvider ? loadUserStorageProvider(requestOwnerId) : null;
@@ -93,7 +105,7 @@ async function uploadMediaBlobToServer(
     const response = await fetch("/api/v1/files", { method: "POST", headers: { Authorization: `Bearer ${requestToken}` }, body: formData });
     const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string; data?: UploadedFile } | null;
     if (!response.ok || payload?.code !== 0 || !payload.data) throw new Error(payload?.msg || "媒体同步失败");
-    const meta = payload.data.mimeType?.startsWith("video/") ? await readVideoMeta(payload.data.url) : {};
+    const meta = metadataUrl || payload.data.mimeType?.startsWith("video/") ? await readVideoMeta(metadataUrl || payload.data.url) : {};
     return { ...payload.data, bytes: payload.data.bytes || blob.size, mimeType: payload.data.mimeType || blob.type || "application/octet-stream", ...meta };
 }
 
@@ -208,6 +220,7 @@ async function deleteServerMedia(storageKey: string, ownerId = getAccountOwnerId
     } else if (provider?.type === "webdav" && getAccountOwnerId() === ownerId && useUserStore.getState().token === token) {
         const direct = await import("@/services/webdav-direct-storage");
         if (await direct.deletePersistedDirectWebDAV(provider, storageKey)) {
+            clearAutoSyncCache(storageKey);
             await store.removeItem(storageKey);
             return;
         }
@@ -216,6 +229,7 @@ async function deleteServerMedia(storageKey: string, ownerId = getAccountOwnerId
     if (!token) {
         if (!provider) return;
         await deleteAnonymousStorageFile(id, toProviderPayload(provider));
+        clearAutoSyncCache(storageKey);
         await store.removeItem(storageKey);
         return;
     }
@@ -228,6 +242,7 @@ async function deleteServerMedia(storageKey: string, ownerId = getAccountOwnerId
     const payload = (await response.json().catch(() => null)) as { code?: number; msg?: string } | null;
     if (!response.ok || payload?.code !== 0) throw new Error(payload?.msg || "删除服务端视频失败");
     await store.removeItem(storageKey);
+    clearAutoSyncCache(storageKey);
 }
 
 export async function deleteStoredMedia(keys: Iterable<string>, request: StorageRequestContext = {}) {
@@ -248,6 +263,7 @@ export async function deleteStoredMedia(keys: Iterable<string>, request: Storage
             }
             clearCachedMedia(key);
             await store.removeItem(key);
+            clearAutoSyncCache(key);
         }),
     );
 }

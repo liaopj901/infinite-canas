@@ -9,5 +9,6 @@ data/
 /.playwright-mcp/
 *.log
 *.tsbuildinfo
+web/public/InfiniteCanvas-ComfyBridge*
 .DS_Store
 .idea

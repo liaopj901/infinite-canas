@@ -82,9 +82,13 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
         };
     }, []);
 
-    const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    const handleWheel = (event: React.WheelEvent<HTMLDivElement> | WheelEvent) => {
         const target = event.target instanceof Element ? event.target : null;
-        if (target?.closest("[data-canvas-no-zoom],.ant-modal,.ant-popover,.ant-dropdown,.ant-select-dropdown,.ant-picker-dropdown")) return;
+        if (event instanceof WheelEvent) {
+            if (!event.ctrlKey || !containerRef.current?.contains(target)) return;
+            event.preventDefault();
+            event.stopPropagation();
+        } else if (target?.closest("[data-canvas-no-zoom],.ant-modal,.ant-popover,.ant-dropdown,.ant-select-dropdown,.ant-picker-dropdown")) return;
 
         const delta = -event.deltaY;
         const factor = Math.pow(1.1, delta / 100);
@@ -106,16 +110,18 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
 
     const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
         const target = event.target instanceof Element ? event.target : null;
-        if (target?.closest("[data-canvas-no-zoom]")) return;
-        if (target?.closest("[data-connection-create-menu]")) return;
-        const isBackgroundClick = !target?.closest("[data-node-id],[data-connection-id]");
-        if (event.button === 0 && isBackgroundClick && document.activeElement instanceof HTMLElement && (document.activeElement.isContentEditable || document.activeElement instanceof HTMLMediaElement)) document.activeElement.blur();
         const temporaryTool = isSpacePressed;
         const activeTool = temporaryTool ? (tool === "select" ? "pan" : "select") : tool;
         const shouldPan = event.button === 1 || (event.button === 0 && activeTool === "pan");
+        if (activeTool === "pan" && (!target || !event.currentTarget.contains(target))) return;
+        if (target?.closest("[data-canvas-no-zoom]") && activeTool !== "pan") return;
+        if (target?.closest("[data-connection-create-menu]")) return;
+        const isBackgroundClick = !target?.closest("[data-node-id],[data-connection-id]");
+        if (event.button === 0 && isBackgroundClick && document.activeElement instanceof HTMLElement && (document.activeElement.isContentEditable || document.activeElement instanceof HTMLMediaElement)) document.activeElement.blur();
 
         if (shouldPan) {
             event.preventDefault();
+            if (activeTool === "pan") event.stopPropagation();
             event.currentTarget.setPointerCapture(event.pointerId);
             panState.current = {
                 isPanning: true,
@@ -203,8 +209,12 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
             event.preventDefault();
         };
         container.addEventListener("wheel", preventWheelScroll, { passive: false });
-        return () => container.removeEventListener("wheel", preventWheelScroll);
-    }, [containerRef]);
+        document.addEventListener("wheel", handleWheel, { capture: true, passive: false });
+        return () => {
+            container.removeEventListener("wheel", preventWheelScroll);
+            document.removeEventListener("wheel", handleWheel, true);
+        };
+    }, [containerRef, handleWheel]);
 
     const temporaryTool = isSpacePressed;
     const activeTool = temporaryTool ? (tool === "select" ? "pan" : "select") : tool;
@@ -213,9 +223,10 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
     return (
         <div
             ref={containerRef}
-            className="relative h-full w-full select-none overflow-hidden"
+            className={`relative h-full w-full select-none overflow-hidden ${activeTool === "pan" || isPanning ? "[&_*]:!cursor-[inherit]" : ""}`}
             style={{ background: theme.canvas.background, cursor }}
-            onPointerDown={handlePointerDown}
+            onPointerDown={activeTool === "pan" ? undefined : handlePointerDown}
+            onPointerDownCapture={activeTool === "pan" ? handlePointerDown : undefined}
             onDoubleClick={handleDoubleClick}
             onWheel={handleWheel}
             onContextMenu={onContextMenu}

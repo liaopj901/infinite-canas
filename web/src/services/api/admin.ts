@@ -1,3 +1,6 @@
+import type { ModelChannelProtocol } from "@/lib/model-channel";
+import type { ModelCapabilities } from "@/stores/use-config-store";
+import type { WorkflowEntry, WorkflowSummary } from "@/lib/workflow-channel";
 import { apiDelete, apiGet, apiPost, compactApiParams } from "@/services/api/request";
 import type { Prompt, PromptListResponse } from "@/services/api/prompts";
 import type { AgentSkill, AgentSkillFile } from "@/services/api/agent-skills";
@@ -74,7 +77,7 @@ export async function deleteAdminUser(token: string, id: string) {
     return apiDelete<boolean>(`/api/admin/users/${encodeURIComponent(id)}`, token);
 }
 
-export async function fetchAdminCreditLogs(token: string, query: AdminUserQuery = {}) {
+export async function fetchAdminCreditLogs(token: string, query: AdminUserQuery & { date?: string } = {}) {
     return apiGet<AdminCreditLogListResponse>("/api/admin/credit-logs", compactApiParams(query), token);
 }
 
@@ -180,19 +183,27 @@ export async function deleteAdminAsset(token: string, id: string) {
 
 export type AdminModelChannel = {
     id: string;
-    protocol: "openai" | "gemini" | "grok2api" | "metaso" | "apimart" | "kie" | "mimo";
+    protocol: ModelChannelProtocol;
     name: string;
     baseUrl: string;
     apiKey: string;
     models: string[];
+    modelCapabilities?: ModelCapabilities;
+    parameterTranslation?: string;
     weight: number;
     timeout: number;
     enabled: boolean;
     remark: string;
+    uploadApiKey?: string;
+    bridgeId?: string;
+    comfyUrl?: string;
+    workflowDir?: string;
+    workflows?: WorkflowEntry[];
 };
 
 export type AdminPublicModelChannelSettings = {
     availableModels: string[];
+    availableWorkflows: string[];
     modelCosts: AdminModelCost[];
     channels: AdminPublicModelChannelInfo[];
     defaultModel: string;
@@ -217,15 +228,18 @@ export type AdminModelCost = {
 };
 
 export type AdminPublicModelChannelInfo = {
+	parameterTranslationModels?: string[];
     id: string;
     protocol: AdminModelChannel["protocol"];
     name: string;
     baseUrl: string;
     models: string[];
+    modelCapabilities?: ModelCapabilities;
     weight: number;
     timeout: number;
     enabled: boolean;
     remark: string;
+    workflows?: WorkflowSummary[];
 };
 
 export type AdminPublicSettings = {
@@ -292,6 +306,7 @@ export type AdminPrivateSettings = {
         allowUserGlobalProvider: boolean;
         autoSyncGeneratedMedia: boolean;
         autoSyncLocalGeneratedMedia: boolean;
+        autoSyncAllAssets: boolean;
         providers: AdminStorageProvider[];
         roundRobinCursor: number;
         capacityCheck: {
@@ -312,6 +327,7 @@ export type AdminAICallLog = {
     channelId: string;
     channelName: string;
     status: number;
+    failed: boolean;
     durationMs: number;
     credits: number;
     requestBody: string;

@@ -125,27 +125,18 @@ func HasActiveCloudStorage(ctx context.Context) (bool, error) {
 }
 
 // PublicStorageConfig 返回公开存储配置。
-func PublicStorageConfig() (model.PublicStorageSetting, error) {
+func PublicStorageConfig() (model.PublicStorageConfig, error) {
 	settings, err := repository.GetSettings()
 	if err != nil {
-		return model.PublicStorageSetting{}, err
-	}
-	settings = normalizeSettings(settings)
-	storage := normalizePrivateStorageSetting(settings.Private.Storage)
-
-	mode := "local_indexeddb"
-	if HasAdminStorageProvider(storage) {
-		mode = "server_sqlite_s3"
-	} else if storage.AllowUserProvider {
-		mode = "hybrid"
-	}
-
-	return model.PublicStorageSetting{
-		Mode:                        mode,
-		AllowUserProvider:           storage.AllowUserProvider,
-		AllowUserGlobalProvider:     storage.AllowUserGlobalProvider,
-		AutoSyncGeneratedMedia:      storage.AutoSyncGeneratedMedia,
-		AutoSyncLocalGeneratedMedia: storage.AutoSyncLocalGeneratedMedia,
+		return model.PublicStorageConfig{
+		PublicStorageSetting: model.PublicStorageSetting{
+			Mode:                        mode,
+			AllowUserProvider:           storage.AllowUserProvider,
+			AllowUserGlobalProvider:     storage.AllowUserGlobalProvider,
+			AutoSyncGeneratedMedia:      storage.AutoSyncGeneratedMedia,
+			AutoSyncLocalGeneratedMedia: storage.AutoSyncLocalGeneratedMedia,
+		},
+		AutoSyncAllAssets: storage.AutoSyncAllAssets,
 	}, nil
 }
 
@@ -245,6 +236,9 @@ func UploadStorageObjectWithProvider(ctx context.Context, filename string, conte
 	ext := path.Ext(filename)
 	if ext == "" {
 		ext = extensionForContentType(contentType)
+	}
+	if provider.Type == model.StorageProviderTypeWebDAV && ext == ".bin" && strings.HasPrefix(strings.ToLower(contentType), "video/mp4") {
+		ext = ".mp4"
 	}
 	userID := "anonymous"
 	if user, ok := UserFromContext(ctx); ok && user.ID != "" {

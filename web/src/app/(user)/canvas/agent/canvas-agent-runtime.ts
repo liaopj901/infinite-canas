@@ -1,4 +1,5 @@
 import {
+    CANVAS_AGENT_JSON_FALLBACK_SIGNAL,
     canvasAgentSystemPrompt,
     canvasAgentTokenCalibrationKey,
     isCanvasAgentContextLimitError,
@@ -8,8 +9,10 @@ import {
 import type { AiConfig } from "@/stores/use-config-store";
 import type {
     CanvasAgentContent,
+    CanvasAgentJsonFallbackMode,
     CanvasAgentProtocolMessage,
     CanvasAgentState,
+    CanvasAgentToolMode,
     CanvasAssistantMessageStatus,
     CanvasAssistantReference,
 } from "../types";
@@ -48,13 +51,15 @@ export type RunCanvasAgentInput = {
     references: CanvasAssistantReference[];
     activeSkillContents?: Array<{ id: string; source: "system" | "user"; name: string; content: string; hasFiles?: boolean }>;
     contextCheckpoint?: string;
+    preferredJsonMode?: CanvasAgentJsonFallbackMode;
     getContext: (state: CanvasAgentState) => CanvasAgentContext;
-    executeAction: (action: CanvasAgentAction) => Promise<CanvasAgentToolResult>;
+    executeAction: (action: CanvasAgentAction, signal?: AbortSignal) => Promise<CanvasAgentToolResult>;
     onEvent?: (event: CanvasAgentRuntimeEvent) => void;
     onCheckpoint?: (checkpoint: {
         state: CanvasAgentState;
         protocolMessages: CanvasAgentProtocolMessage[];
         contextCheckpoint?: string;
+        jsonFallbackMode?: CanvasAgentJsonFallbackMode;
     }) => void;
     signal?: AbortSignal;
 };
@@ -64,6 +69,7 @@ export type RunCanvasAgentResult = {
     state: CanvasAgentState;
     protocolMessages: CanvasAgentProtocolMessage[];
     contextCheckpoint?: string;
+    jsonFallbackMode?: CanvasAgentJsonFallbackMode;
 };
 
 export function createCanvasAgentState(): CanvasAgentState {
@@ -78,8 +84,11 @@ export function createCanvasAgentState(): CanvasAgentState {
 
 export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCanvasAgentResult> {
     let state = input.initialState;
-    let allowTools = true;
+    let toolMode: CanvasAgentToolMode = input.preferredJsonMode || "native";
+    let usedJsonFallbackMode = input.preferredJsonMode;
     let hasExecutedActions = false;
+    let protocolError: string | undefined;
+    let expectedAction = false;
     let protocolMessages: CanvasAgentProtocolMessage[] = [
         ...input.protocolMessages,
         { role: "user" as const, content: buildUserContent(input.userText, input.references, input.config.textModel || input.config.model) },
@@ -93,6 +102,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         state,
         protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages),
         contextCheckpoint,
+        jsonFallbackMode: usedJsonFallbackMode,
     });
 
     const compactHistory = async () => {
@@ -118,8 +128,9 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         input.onEvent?.({ status: "thinking", label: step ? "正在根据画布结果继续" : "正在理解画布和创作目标" });
         const context = input.getContext(state);
         let systemPrompt = buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable);
-        const tools = allowTools ? agentTools : [];
-        if (estimateCanvasAgentInputTokens({ systemPrompt: canvasAgentSystemPrompt(input.config, systemPrompt), messages: protocolMessages, tools }, canvasAgentTokenCalibrationKey(input.config)) >= MAX_AGENT_INPUT_TOKENS) {
+        const nativeTools = toolMode === "native";
+        const tools = nativeTools ? agentTools : [];
+        if (estimateCanvasAgentInputTokens({ systemPrompt: canvasAgentSystemPrompt(input.config, systemPrompt, nativeTools ? [] : agentTools, nativeTools), messages: protocolMessages, tools }, canvasAgentTokenCalibrationKey(input.config)) >= MAX_AGENT_INPUT_TOKENS) {
             if (await compactHistory()) systemPrompt = buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable);
         }
 
@@ -128,7 +139,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             systemPrompt,
             messages: protocolMessages,
             tools: agentTools,
-            allowTools,
+            toolMode,
             signal: input.signal,
         });
         let turn: Awaited<ReturnType<typeof requestCanvasAgentTurn>>;
@@ -139,11 +150,57 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             systemPrompt = buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable);
             turn = await requestTurn();
         }
-        if (turn.usedJsonFallback) allowTools = false;
+        toolMode = turn.toolMode;
+        if (!protocolError && !turn.toolError && toolMode === "native" && !turn.toolCalls.length && turn.content.trim() === CANVAS_AGENT_JSON_FALLBACK_SIGNAL) {
+            expectedAction = true;
+            toolMode = "structured-json";
+            step -= 1;
+            continue;
+        }
 
-        const parsedJson = parseCanvasAgentJson(turn.content);
-        const nativeActions = turn.toolCalls.map((toolCall) => normalizeCanvasAgentAction(toolCall.name, toolCall.arguments, toolCall.id));
-        const arrangeRequested = /整理|排列|排序|对齐|布局|排版|重新摆放/.test(input.userText) && !/(不要|别|无需|不用).{0,8}(整理|排列|排序|对齐|布局|排版|重新摆放)/.test(input.userText);
+        const parsedJson = await parseCanvasAgentJson(turn.content, { allowRepair: toolMode !== "native" });
+        if (toolMode !== "native" && parsedJson.parsed) usedJsonFallbackMode = toolMode;
+        const assistantToolMessage: CanvasAgentProtocolMessage = {
+            role: "assistant",
+            content: turn.content || undefined,
+            ...(turn.reasoningContent !== undefined ? { reasoningContent: turn.reasoningContent } : {}),
+            ...(turn.responseItems?.length ? { responseItems: turn.responseItems } : {}),
+            ...(turn.toolCalls.length ? { toolCalls: turn.toolCalls } : {}),
+        };
+        let nativeActions: CanvasAgentAction[] = [];
+        let actionError = turn.toolError || (turn.toolCalls.length
+            ? turn.toolCalls.find((toolCall) => toolCall.argumentsError)?.argumentsError
+            : parsedJson.error);
+        if (!actionError) {
+            try {
+                nativeActions = turn.toolCalls.map((toolCall) => normalizeCanvasAgentAction(toolCall.name, toolCall.arguments, toolCall.id));
+            } catch (error) {
+                actionError = error instanceof Error ? error.message : "工具参数无效";
+            }
+        }
+        if (!actionError && expectedAction && !nativeActions.length && !parsedJson.actions.length) {
+            actionError = "本轮必须返回可执行的画布工具指令";
+        }
+        if (actionError) {
+            if (protocolError) throw new Error("工具指令仍无效，本批操作未执行：" + actionError);
+            protocolError = actionError;
+            const feedback = JSON.stringify({
+                ok: false,
+                code: "invalid_tool_arguments",
+                message: actionError + "。本批操作均未执行，未创建节点或提交生成。请按工具定义修正调用；JSON 模式只返回 actions 和 reply，所有工具参数放入 arguments，工具名不得含 Markdown 转义。只修正格式与参数位置，保留完整定稿、已确认总时长和来源引用，不得删减提示词或改用默认时长；不要声称已提交。",
+            });
+            protocolMessages = [
+                ...protocolMessages,
+                ...(assistantToolMessage.content || assistantToolMessage.reasoningContent || assistantToolMessage.responseItems?.length || assistantToolMessage.toolCalls?.length ? [assistantToolMessage] : []),
+                ...(turn.toolCalls.length
+                    ? turn.toolCalls.map((toolCall) => ({ role: "tool" as const, toolCallId: toolCall.id, name: toolCall.name, content: feedback }))
+                    : [{ role: "user" as const, content: "工具执行结果（只可依据这些真实结果继续）：\n" + feedback }]),
+            ];
+            emitCheckpoint();
+            step -= 1;
+            continue;
+        }
+        const arrangeRequested = canvasAgentAllowsArrangement(input.userText);
         const requestedActions = nativeActions.length ? nativeActions : parsedJson.actions;
         const actions = requestedActions.filter((action) => action.name !== "arrange_nodes" || arrangeRequested);
         const rejectedToolMessages: CanvasAgentProtocolMessage[] = nativeActions.filter((action) => action.name === "arrange_nodes" && !arrangeRequested).map((action) => ({
@@ -152,6 +209,10 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             name: action.name,
             content: JSON.stringify({ ok: false, code: "action_not_requested", message: "用户没有要求整理画布，未执行节点排列" }),
         }));
+
+        if (!actions.length && protocolError) {
+            throw new Error("修正后仍未返回可执行的工具指令，本批操作未执行：" + protocolError);
+        }
 
         if (!actions.length && rejectedToolMessages.length) {
             protocolMessages = [
@@ -166,25 +227,24 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         if (!actions.length) {
             const reply = (parsedJson.parsed ? parsedJson.reply : turn.content).trim();
             if (!hasExecutedActions && !reply && userLikelyRequestedCanvasAction(input.userText)) {
-                const unsupported = "当前接口没有返回可执行的画布工具指令。请点击输入框右下角的大脑图标，尝试切换 Chat / Responses，或更换支持 Tool Calling 或稳定 JSON 输出的文本模型。";
+                const unsupported = "当前接口没有返回可执行的画布工具指令。请在 Agent 设置中尝试切换 Chat / Responses，或更换支持 Tool Calling 或稳定 JSON 输出的文本模型。";
                 protocolMessages = [...protocolMessages, { role: "assistant" as const, content: unsupported }];
-                return { reply: unsupported, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint };
+                return { reply: unsupported, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint, jsonFallbackMode: usedJsonFallbackMode };
             }
             const finalReply = reply || "我已经读取当前画布。请告诉我下一步要继续完善哪一部分。";
             protocolMessages = [...protocolMessages, { role: "assistant" as const, content: finalReply, ...(turn.responseItems?.length ? { responseItems: turn.responseItems } : {}) }];
-            return { reply: finalReply, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint };
+            return { reply: finalReply, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint, jsonFallbackMode: usedJsonFallbackMode };
         }
 
+        expectedAction = false;
+        protocolError = undefined;
         input.onEvent?.({ status: "running", label: actions.length === 1 ? canvasAgentActionLabel(actions[0]) : "正在执行 " + actions.length + " 个画布操作" });
-        const assistantToolMessage: CanvasAgentProtocolMessage = nativeActions.length
-            ? { role: "assistant", content: turn.content || undefined, ...(turn.reasoningContent !== undefined ? { reasoningContent: turn.reasoningContent } : {}), ...(turn.responseItems?.length ? { responseItems: turn.responseItems } : {}), toolCalls: nativeActions.map((action) => ({ id: action.id, name: action.name, arguments: action.arguments })) }
-            : { role: "assistant", content: turn.content };
 
         const results = await executeActions(actions, state, input.executeAction, input.signal, input.onEvent);
         hasExecutedActions = true;
         state = results.state;
 
-        if (nativeActions.length && allowTools) {
+        if (nativeActions.length && toolMode === "native") {
             protocolMessages = [
                 ...protocolMessages,
                 assistantToolMessage,
@@ -211,10 +271,14 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
 
     const reply = "本轮已达到安全操作步数上限，当前已完成的节点和任务都已保存。你可以让我继续下一步。";
     protocolMessages = [...protocolMessages, { role: "assistant" as const, content: reply }];
-    return { reply, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint };
+    return { reply, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint, jsonFallbackMode: usedJsonFallbackMode };
 }
 
-async function executeActions(
+export function canvasAgentAllowsArrangement(userText: string) {
+    return /整理|排列|排序|对齐|布局|排版|重新摆放/.test(userText) && !/(不要|别|无需|不用).{0,8}(整理|排列|排序|对齐|布局|排版|重新摆放)/.test(userText);
+}
+
+export async function executeActions(
     actions: CanvasAgentAction[],
     initialState: CanvasAgentState,
     executeAction: (action: CanvasAgentAction) => Promise<CanvasAgentToolResult>,

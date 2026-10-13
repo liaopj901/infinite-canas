@@ -7,6 +7,7 @@ import { usePathname } from "next/navigation";
 import { navigationTools, type NavigationToolSlug } from "@/constant/navigation-tools";
 import { BRAND_NAME, NEW_API_DASHBOARD_URL } from "@/constant/brand";
 import { AppConfigModal } from "@/components/layout/app-config-modal";
+import { AnnouncementBanner } from "@/components/layout/announcement-banner";
 import { MobileNavDrawer } from "@/components/layout/mobile-nav-drawer";
 import { UserStatusActions } from "@/components/layout/user-status-actions";
 import { cn } from "@/lib/utils";
@@ -21,6 +22,7 @@ export function AppTopNav() {
 
     return (
         <>
+            {!hideHeader && <AnnouncementBanner />}
             {!hideHeader ? (
                 <header className="sticky top-0 z-20 h-16 shrink-0 border-b border-stone-200 bg-background/90 backdrop-blur-xl dark:border-stone-800">
                     <div className="mx-auto flex h-full max-w-7xl items-stretch justify-between gap-5 px-6">

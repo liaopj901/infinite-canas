@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 import { ArrowUp, Brain, FolderOpen, ImageIcon, Menu, Square, Upload, Video } from "lucide-react";
 import { Button, Dropdown } from "antd";
 
@@ -17,6 +17,7 @@ import { CanvasVideoSettingsPopover } from "./canvas-video-settings-popover";
 export type CanvasAssistantComposerProps = {
     prompt: string;
     isRunning: boolean;
+    codexControls?: ReactNode;
     references: CanvasAssistantReference[];
     availableReferences?: CanvasResourceReference[];
     pendingReferences?: CanvasResourceReference[];
@@ -37,6 +38,7 @@ export type CanvasAssistantComposerProps = {
 export function CanvasAssistantComposer({
     prompt,
     isRunning,
+    codexControls,
     references,
     availableReferences,
     pendingReferences,
@@ -55,8 +57,9 @@ export function CanvasAssistantComposer({
 }: CanvasAssistantComposerProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const effectiveConfig = useEffectiveConfig();
+    const reasoningEnabled = agentConfig.textReasoningEnabled === true;
     const imageConfig = useMemo(() => ({ ...effectiveConfig, quality: agentConfig.imageQuality, size: agentConfig.imageSize }), [agentConfig.imageQuality, agentConfig.imageSize, effectiveConfig]);
-    const videoConfig = useMemo(() => ({ ...effectiveConfig, vquality: agentConfig.videoQuality, size: agentConfig.videoSize }), [agentConfig.videoQuality, agentConfig.videoSize, effectiveConfig]);
+    const videoConfig = useMemo(() => ({ ...effectiveConfig, activeChannelId: effectiveConfig.videoChannelId || effectiveConfig.activeChannelId, vquality: agentConfig.videoQuality, size: agentConfig.videoSize }), [agentConfig.videoQuality, agentConfig.videoSize, effectiveConfig]);
     const promptReferences = useMemo(() => {
         const seen = new Set<string>();
         return [...(availableReferences || []), ...references.map(assistantToPromptReference)].filter((reference) => {
@@ -85,7 +88,7 @@ export function CanvasAssistantComposer({
                     placeholder="描述创作目标，或让我继续操作画布"
                     placeholderClassName="!left-1 !top-0"
                 />
-                <div className="mt-2 flex items-center justify-between gap-2">
+                <div className="@container mt-2 flex items-center justify-between gap-2">
                     <div className="flex min-w-0 flex-1 items-center gap-1">
                         <Dropdown
                             trigger={["click"]}
@@ -100,6 +103,7 @@ export function CanvasAssistantComposer({
                             <Button type="text" shape="circle" className="!h-8 !w-8 !min-w-8" style={{ color: theme.node.text }} icon={<Menu className="size-4" />} aria-label="添加素材" />
                         </Dropdown>
                         {onSkillSelect && onSkillRemove ? <CanvasAgentSkillPopover selectedSkills={selectedSkills} onSelect={onSkillSelect} onDeleteSelected={onSkillRemove} /> : null}
+                        {codexControls}
                         <CanvasImageSettingsPopover
                             config={imageConfig}
                             placement="topLeft"
@@ -124,21 +128,19 @@ export function CanvasAssistantComposer({
                         />
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
-                        <Dropdown
-                            trigger={["click"]}
-                            placement="topRight"
-                            menu={{
-                                selectable: true,
-                                selectedKeys: [agentConfig.textApiMode],
-                                items: [
-                                    { key: "chat", label: "Chat" },
-                                    { key: "responses", label: "Responses" },
-                                ],
-                                onClick: ({ key }) => onAgentConfigChange({ textApiMode: key as CanvasAgentConfig["textApiMode"] }),
-                            }}
-                        >
-                            <Button type="text" shape="circle" className="!h-8 !w-8 !min-w-8" style={{ color: theme.node.text }} icon={<Brain className="size-4" />} aria-label={`文本接口：${agentConfig.textApiMode === "responses" ? "Responses" : "Chat"}`} />
-                        </Dropdown>
+                        {!codexControls ? (
+                        <Button
+                            type="text"
+                            shape="circle"
+                            className="!h-8 !w-8 !min-w-8"
+                            style={{ color: theme.node.text, background: reasoningEnabled ? theme.toolbar.activeBg : undefined }}
+                            icon={<Brain className="size-4" />}
+                            title={reasoningEnabled ? "推理已开启" : "推理已关闭"}
+                            aria-label={reasoningEnabled ? "关闭推理" : "开启推理"}
+                            aria-pressed={reasoningEnabled}
+                            onClick={() => onAgentConfigChange({ textReasoningEnabled: !reasoningEnabled })}
+                        />
+                        ) : null}
                         <Button
                             type="primary"
                             shape="circle"

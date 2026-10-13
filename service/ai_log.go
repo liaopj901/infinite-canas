@@ -51,15 +51,21 @@ type AICallLogInput struct {
 	ChannelName     string `json:"channelName"`
 	Status          int    `json:"status"`
 	DurationMs      int64  `json:"durationMs"`
-	Credits         int    `json:"credits"`
+	Credits         float64 `json:"credits"`
 	RequestBody     string `json:"requestBody"`
 	ResponseBody    string `json:"responseBody"`
 	Error           string `json:"error"`
+	OutcomeKnown    bool   `json:"-"`
 }
 
 func SaveAICallLog(input AICallLogInput) {
 	responseBody := normalizeAICallResponseLog(input.ResponseBody, input.Error)
-	errorText := normalizeAICallErrorLog(input.Error, input.ResponseBody)
+	failed := strings.TrimSpace(input.Error) != ""
+	failure := &failed
+	if input.OutcomeKnown {
+		failure = nil
+	}
+	errorText := normalizeAICallErrorLog(input.Error, input.ResponseBody, failure)
 	item := model.AICallLog{
 		ID:              uuid.NewString(),
 		UserID:          strings.TrimSpace(input.UserID),
@@ -70,8 +76,9 @@ func SaveAICallLog(input AICallLogInput) {
 		ChannelID:       strings.TrimSpace(input.ChannelID),
 		ChannelName:     strings.TrimSpace(input.ChannelName),
 		Status:          input.Status,
+		Failed:          failed,
 		DurationMs:      input.DurationMs,
-		Credits:         input.Credits,
+		Credits:         normalizeCredits(input.Credits),
 		RequestBody:     truncateLogText(input.RequestBody, aiLogRequestTextLimit),
 		ResponseBody:    responseBody,
 		Error:           truncateLogText(errorText, aiLogErrorTextLimit),
@@ -264,7 +271,7 @@ func readAICallLogFile(filePath string) ([]model.AICallLog, error) {
 			continue
 		}
 		item.ResponseBody = normalizeAICallResponseLog(item.ResponseBody, item.Error)
-		item.Error = normalizeAICallErrorLog(item.Error, item.ResponseBody)
+		item.Error = normalizeAICallErrorLog(item.Error, item.ResponseBody, nil)
 		items = append(items, item)
 	}
 	return items, scanner.Err()
@@ -311,9 +318,9 @@ func normalizeAICallResponseLog(responseBody string, errorMessage string) string
 		return ""
 	}
 	formatted := formatAICallLogPayload(responseBody)
-	reason := extractAICallFailureReason(errorMessage)
+	reason := extractAICallFailureReason(errorMessage, nil)
 	if reason == "" {
-		reason = extractAICallFailureReason(responseBody)
+		reason = extractAICallFailureReason(responseBody, nil)
 	}
 	if reason == "" {
 		return formatted
@@ -324,11 +331,11 @@ func normalizeAICallResponseLog(responseBody string, errorMessage string) string
 	return "失败原因: " + reason + "\n\n原始返回:\n" + formatted
 }
 
-func normalizeAICallErrorLog(errorMessage string, responseBody string) string {
-	if reason := extractAICallFailureReason(errorMessage); reason != "" {
+func normalizeAICallErrorLog(errorMessage string, responseBody string, failed *bool) string {
+	if reason := extractAICallFailureReason(errorMessage, nil); reason != "" {
 		return reason
 	}
-	if reason := extractAICallFailureReason(responseBody); reason != "" {
+	if reason := extractAICallFailureReason(responseBody, failed); reason != "" {
 		return reason
 	}
 	return cleanPlainLogText(errorMessage)
@@ -382,7 +389,7 @@ func formatEventStreamLog(raw string) string {
 	return strings.TrimSpace(strings.Join(formatted, "\n"))
 }
 
-func extractAICallFailureReason(raw string) string {
+func extractAICallFailureReason(raw string, failed *bool) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
@@ -390,7 +397,7 @@ func extractAICallFailureReason(raw string) string {
 	var payload any
 	if err := json.Unmarshal([]byte(raw), &payload); err == nil {
 		reasons := []string{}
-		collectAICallFailureReasons(payload, &reasons)
+		collectAICallFailureReasons(payload, &reasons, failed)
 		return strings.Join(dedupeStrings(reasons), "；")
 	}
 	cleaned := cleanPlainLogText(raw)
@@ -400,7 +407,7 @@ func extractAICallFailureReason(raw string) string {
 	return cleaned
 }
 
-func collectAICallFailureReasons(value any, reasons *[]string) {
+func collectAICallFailureReasons(value any, reasons *[]string, failed *bool) {
 	switch typed := value.(type) {
 	case map[string]any:
 		if message := stringField(typed, "message"); message != "" {
@@ -416,15 +423,22 @@ func collectAICallFailureReasons(value any, reasons *[]string) {
 			*reasons = append(*reasons, reason)
 		}
 		if errValue, ok := typed["error"]; ok && errValue != nil {
+			before := len(*reasons)
 			if message, ok := errValue.(string); ok && strings.TrimSpace(message) != "" {
 				*reasons = append(*reasons, strings.TrimSpace(message))
 			} else {
-				collectAICallFailureReasons(errValue, reasons)
+				collectAICallFailureReasons(errValue, reasons, failed)
+			}
+			if failed != nil && len(*reasons) > before {
+				*failed = true
 			}
 		}
 		status := strings.ToLower(stringField(typed, "status"))
 		typeName := stringField(typed, "type")
 		if status == "failed" || status == "incomplete" || status == "cancelled" || status == "canceled" {
+			if failed != nil {
+				*failed = true
+			}
 			if typeName == "image_generation_call" {
 				*reasons = append(*reasons, "Responses 图像生成调用失败：image_generation_call 状态为 "+status+"，接口未返回具体错误原因")
 			} else if typeName != "" {
@@ -437,11 +451,11 @@ func collectAICallFailureReasons(value any, reasons *[]string) {
 			if key == "instructions" || key == "prompt" || key == "requestBody" || key == "responseBody" {
 				continue
 			}
-			collectAICallFailureReasons(item, reasons)
+			collectAICallFailureReasons(item, reasons, failed)
 		}
 	case []any:
 		for _, item := range typed {
-			collectAICallFailureReasons(item, reasons)
+			collectAICallFailureReasons(item, reasons, failed)
 		}
 	}
 }

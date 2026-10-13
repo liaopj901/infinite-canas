@@ -5,6 +5,7 @@ const MaxPageSize = 500
 // Query 列表筛选和分页参数。
 type Query struct {
 	Keyword  string
+	Date     string
 	Tags     []string
 	Category string
 	Type     string

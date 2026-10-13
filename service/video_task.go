@@ -1,19 +1,22 @@
 package service
 
 import (
+	"context"
+	"encoding/json"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/repository"
-	"github.com/google/uuid"
 )
 
 const videoTaskPollInterval = 5 * time.Second
 const videoTaskFinishedRetention = 10 * time.Minute
 const videoTaskCleanupInterval = 10 * time.Minute
+const runningHubWorkflowPageSize = 200
 
 var (
 	videoTaskPollerOnce  sync.Once
@@ -26,41 +29,47 @@ var (
 )
 
 type VideoTaskCreateInput struct {
-	UserID          string
-	UserDisplayName string
-	Model           string
-	ChannelID       string
-	UserChannelID   string
-	ChannelName     string
-	Source          string
-	SourceID        string
-	ClientTaskID    string
-	UpstreamTaskID  string
-	UpstreamVideoID string
-	Status          string
-	Progress        int
-	Seconds         string
-	Size            string
-	VideoURL        string
-	Error           string
-	ErrorDetail     string
-	RequestBody     string
-	ResponseBody    string
-	Credits         int
+	ParameterTranslationSnapshot string
+	UserID                       string
+	UserDisplayName              string
+	Model                        string
+	ChannelID                    string
+	UserChannelID                string
+	ChannelName                  string
+	WorkflowRef                  string
+	Source                       string
+	SourceID                     string
+	ClientTaskID                 string
+	UpstreamTaskID               string
+	UpstreamVideoID              string
+	Status                       string
+	Progress                     int
+	Seconds                      string
+	Size                         string
+	VideoURL                     string
+	Error                        string
+	ErrorDetail                  string
+	RequestBody                  string
+	ResponseBody                 string
+	Credits                      float64
+	BillingName                  string
+	BillingPath                  string
 }
 
 type VideoTaskPollUpdate struct {
-	Status       string
-	Progress     int
-	Seconds      string
-	Size         string
-	VideoURL     string
-	Error        string
-	ErrorDetail  string
-	ResponseBody string
+	ParameterTranslationSnapshot string
+	Status                       string
+	Progress                     int
+	Seconds                      string
+	Size                         string
+	VideoURL                     string
+	Error                        string
+	ErrorDetail                  string
+	ResponseBody                 string
+	StatusCode                   int
 }
 
-type VideoTaskPollFunc func(model.VideoTask) (VideoTaskPollUpdate, error)
+type VideoTaskPollFunc func(context.Context, model.VideoTask) (VideoTaskPollUpdate, error)
 
 func CreateVideoTask(input VideoTaskCreateInput) (model.VideoTask, error) {
 	current := now()
@@ -69,30 +78,32 @@ func CreateVideoTask(input VideoTaskCreateInput) (model.VideoTask, error) {
 		status = "queued"
 	}
 	task := model.VideoTask{
-		ID:              firstVideoTaskValue(input.ClientTaskID, input.UpstreamTaskID, input.UpstreamVideoID, "video-task-"+uuid.NewString()),
-		UserID:          strings.TrimSpace(input.UserID),
-		UserDisplayName: strings.TrimSpace(input.UserDisplayName),
-		Model:           strings.TrimSpace(input.Model),
-		ChannelID:       strings.TrimSpace(input.ChannelID),
-		UserChannelID:   strings.TrimSpace(input.UserChannelID),
-		ChannelName:     strings.TrimSpace(input.ChannelName),
-		Source:          normalizeVideoTaskSource(input.Source),
-		SourceID:        strings.TrimSpace(input.SourceID),
-		UpstreamTaskID:  strings.TrimSpace(input.UpstreamTaskID),
-		UpstreamVideoID: strings.TrimSpace(input.UpstreamVideoID),
-		Status:          status,
-		Progress:        clampProgress(input.Progress),
-		Seconds:         strings.TrimSpace(input.Seconds),
-		Size:            strings.TrimSpace(input.Size),
-		VideoURL:        strings.TrimSpace(input.VideoURL),
-		Error:           strings.TrimSpace(input.Error),
-		ErrorDetail:     strings.TrimSpace(input.ErrorDetail),
-		RequestBody:     input.RequestBody,
-		ResponseBody:    input.ResponseBody,
-		LastResponse:    input.ResponseBody,
-		Credits:         input.Credits,
-		CreatedAt:       current,
-		UpdatedAt:       current,
+		ID:                           firstVideoTaskValue(input.ClientTaskID, input.UpstreamTaskID, input.UpstreamVideoID, "video-task-"+uuid.NewString()),
+		UserID:                       strings.TrimSpace(input.UserID),
+		UserDisplayName:              strings.TrimSpace(input.UserDisplayName),
+		Model:                        strings.TrimSpace(input.Model),
+		ChannelID:                    strings.TrimSpace(input.ChannelID),
+		UserChannelID:                strings.TrimSpace(input.UserChannelID),
+		ChannelName:                  strings.TrimSpace(input.ChannelName),
+		WorkflowRef:                  input.WorkflowRef,
+		Source:                       normalizeVideoTaskSource(input.Source),
+		SourceID:                     strings.TrimSpace(input.SourceID),
+		UpstreamTaskID:               strings.TrimSpace(input.UpstreamTaskID),
+		UpstreamVideoID:              strings.TrimSpace(input.UpstreamVideoID),
+		Status:                       status,
+		Progress:                     clampProgress(input.Progress),
+		Seconds:                      strings.TrimSpace(input.Seconds),
+		Size:                         strings.TrimSpace(input.Size),
+		VideoURL:                     strings.TrimSpace(input.VideoURL),
+		Error:                        strings.TrimSpace(input.Error),
+		ErrorDetail:                  strings.TrimSpace(input.ErrorDetail),
+		RequestBody:                  input.RequestBody,
+		ParameterTranslationSnapshot: input.ParameterTranslationSnapshot,
+		ResponseBody:                 input.ResponseBody,
+		LastResponse:                 input.ResponseBody,
+		Credits:                      normalizeCredits(input.Credits),
+		CreatedAt:                    current,
+		UpdatedAt:                    current,
 	}
 	if IsCompletedVideoTaskStatus(task.Status) || task.VideoURL != "" {
 		task.Status = "completed"
@@ -102,8 +113,15 @@ func CreateVideoTask(input VideoTaskCreateInput) (model.VideoTask, error) {
 		task.Status = "failed"
 		task.CompletedAt = current
 	}
-	saved, err := repository.SaveVideoTask(task)
-	if err == nil && !IsCompletedVideoTaskStatus(saved.Status) && !IsFailedVideoTaskStatus(saved.Status) {
+	var saved model.VideoTask
+	var err error
+	if input.WorkflowRef != "" {
+		saved = task
+		err = ConsumeUserCredits(saved.UserID, input.BillingName, saved.Credits, input.BillingPath, &saved)
+	} else {
+		saved, err = repository.SaveVideoTask(task)
+	}
+	if err == nil && input.WorkflowRef == "" && !IsCompletedVideoTaskStatus(saved.Status) && !IsFailedVideoTaskStatus(saved.Status) {
 		WakeVideoTaskPoller()
 	}
 	return saved, err
@@ -131,32 +149,38 @@ func DeleteUserVideoTask(userID string, id string) error {
 
 func VideoTaskResponse(task model.VideoTask) map[string]any {
 	result := map[string]any{
-		"id":           task.ID,
-		"object":       "video",
-		"model":        task.Model,
-		"channelId":    task.ChannelID,
+		"id":            task.ID,
+		"object":        "video",
+		"model":         task.Model,
+		"channelId":     task.ChannelID,
 		"userChannelId": task.UserChannelID,
-		"channelName":  task.ChannelName,
-		"source":       task.Source,
-		"source_id":    task.SourceID,
-		"status":       task.Status,
-		"progress":     task.Progress,
-		"task_id":      firstVideoTaskValue(task.UpstreamTaskID, task.ID),
-		"video_id":     task.UpstreamVideoID,
-		"seconds":      task.Seconds,
-		"size":         task.Size,
-		"created_at":   task.CreatedAt,
-		"updated_at":   task.UpdatedAt,
-		"started_at":   task.StartedAt,
-		"completed_at": task.CompletedAt,
-		"createdAt":    task.CreatedAt,
-		"updatedAt":    task.UpdatedAt,
-		"request_body": task.RequestBody,
+		"channelName":   task.ChannelName,
+		"source":        task.Source,
+		"source_id":     task.SourceID,
+		"status":        task.Status,
+		"progress":      task.Progress,
+		"task_id":       firstVideoTaskValue(task.UpstreamTaskID, task.ID),
+		"video_id":      task.UpstreamVideoID,
+		"seconds":       task.Seconds,
+		"size":          task.Size,
+		"created_at":    task.CreatedAt,
+		"updated_at":    task.UpdatedAt,
+		"started_at":    task.StartedAt,
+		"completed_at":  task.CompletedAt,
+		"createdAt":     task.CreatedAt,
+		"updatedAt":     task.UpdatedAt,
+		"request_body":  task.RequestBody,
 	}
 	if task.VideoURL != "" {
 		result["url"] = task.VideoURL
 		result["video_url"] = task.VideoURL
 		result["data"] = []map[string]any{{"url": task.VideoURL}}
+	}
+	if task.WorkflowRef != "" {
+		result["workflowRef"] = task.WorkflowRef
+	}
+	if task.ParameterTranslationSnapshot != "" {
+		result["parameter_translation"] = true
 	}
 	if IsFailedVideoTaskStatus(task.Status) && (task.Error != "" || task.ErrorDetail != "") {
 		result["error"] = map[string]any{"message": firstVideoTaskValue(task.Error, task.ErrorDetail)}
@@ -200,16 +224,56 @@ func WakeVideoTaskPoller() {
 func runVideoTaskPoller() {
 	inFlight := sync.Map{}
 	lastCleanupAt := time.Time{}
+	lastImageCleanupAt := time.Time{}
+	lastAudioCleanupAt := time.Time{}
+	workflowCursorCreatedAt, workflowCursorID := "", ""
 	for range videoTaskPollWake {
 		for {
 			current := time.Now()
+			hasComfyTasks, comfyErr := expireComfyBridgeRequests("")
+			if comfyErr != nil {
+				log.Printf("expire Comfy Bridge requests failed err=%v", comfyErr)
+			}
+			hasComfyCleanup, cleanupErr := repository.CleanupComfyBridgeRequests(
+				current.Add(-videoTaskFinishedRetention),
+				current.Add(-comfyBridgeInspectTimeout),
+			)
+			if cleanupErr != nil {
+				log.Printf("cleanup Comfy Bridge requests failed err=%v", cleanupErr)
+			}
 			tasks, err := repository.ListDueVideoTasks(200)
 			if err != nil {
 				log.Printf("list due video tasks failed err=%v", err)
 				waitForNextVideoTaskPoll()
 				continue
 			}
-			if len(tasks) == 0 {
+			workflowTasks, workflowErr := repository.ListDueRunningHubWorkflowTasks(workflowCursorCreatedAt, workflowCursorID, runningHubWorkflowPageSize)
+			if workflowErr == nil && len(workflowTasks) == 0 && workflowCursorCreatedAt != "" {
+				workflowCursorCreatedAt, workflowCursorID = "", ""
+				workflowTasks, workflowErr = repository.ListDueRunningHubWorkflowTasks("", "", runningHubWorkflowPageSize)
+			}
+			if workflowErr != nil {
+				log.Printf("list due RunningHub workflow tasks failed err=%v", workflowErr)
+				workflowTasks = nil
+			} else if len(workflowTasks) == runningHubWorkflowPageSize {
+				last := workflowTasks[len(workflowTasks)-1]
+				workflowCursorCreatedAt, workflowCursorID = last.CreatedAt, last.ID
+			} else {
+				workflowCursorCreatedAt, workflowCursorID = "", ""
+			}
+			hasImageTasks, imageErr := repository.HasActiveCanvasImageTasks()
+			if imageErr != nil {
+				log.Printf("check active canvas image tasks failed err=%v", imageErr)
+			}
+			hasAudioTasks, audioErr := repository.HasActiveCanvasAudioTasks()
+			if audioErr != nil {
+				log.Printf("check active canvas audio tasks failed err=%v", audioErr)
+			}
+			if len(tasks) == 0 && len(workflowTasks) == 0 && !hasComfyTasks && !hasComfyCleanup && !hasImageTasks && !hasAudioTasks {
+				if workflowErr != nil || comfyErr != nil || cleanupErr != nil || imageErr != nil || audioErr != nil {
+					waitForNextVideoTaskPoll()
+					continue
+				}
 				videoTaskRunningMu.Lock()
 				if videoTaskWakePending {
 					videoTaskWakePending = false
@@ -220,11 +284,23 @@ func runVideoTaskPoller() {
 				videoTaskRunningMu.Unlock()
 				break
 			}
-			if lastCleanupAt.IsZero() || current.Sub(lastCleanupAt) >= videoTaskCleanupInterval {
+			if (len(tasks) > 0 || len(workflowTasks) > 0) && (lastCleanupAt.IsZero() || current.Sub(lastCleanupAt) >= videoTaskCleanupInterval) {
 				if err := repository.DeleteFinishedVideoTasksBefore(videoTaskTime(current.Add(-videoTaskFinishedRetention))); err != nil {
 					log.Printf("cleanup finished video tasks failed err=%v", err)
 				}
 				lastCleanupAt = current
+			}
+			if hasImageTasks && (lastImageCleanupAt.IsZero() || current.Sub(lastImageCleanupAt) >= videoTaskCleanupInterval) {
+				if err := repository.DeleteFinishedCanvasImageTasksBefore(videoTaskTime(current.Add(-videoTaskFinishedRetention))); err != nil {
+					log.Printf("cleanup finished canvas image tasks failed err=%v", err)
+				}
+				lastImageCleanupAt = current
+			}
+			if hasAudioTasks && (lastAudioCleanupAt.IsZero() || current.Sub(lastAudioCleanupAt) >= videoTaskCleanupInterval) {
+				if err := repository.DeleteFinishedCanvasAudioTasksBefore(videoTaskTime(current.Add(-videoTaskFinishedRetention))); err != nil {
+					log.Printf("cleanup finished canvas audio tasks failed err=%v", err)
+				}
+				lastAudioCleanupAt = current
 			}
 			for _, task := range tasks {
 				if _, loaded := inFlight.LoadOrStore(task.ID, true); loaded {
@@ -236,12 +312,38 @@ func runVideoTaskPoller() {
 					if poll == nil {
 						return
 					}
-					update, err := poll(task)
+					ctx, cleanup, err := CanvasTaskContext(context.Background(), "video", task.UserID, task.ID)
+					if err != nil {
+						return
+					}
+					defer cleanup()
+					update, err := poll(ctx, task)
+					if ctx.Err() != nil {
+						return
+					}
 					if err != nil {
 						update = VideoTaskPollUpdate{Status: task.Status, ErrorDetail: err.Error()}
 					}
 					if err := UpdateVideoTaskFromPoll(task, update); err != nil {
 						log.Printf("update video task failed id=%s err=%v", task.ID, err)
+					}
+				}(task)
+			}
+			for _, task := range workflowTasks {
+				key := "workflow:" + task.ID
+				if _, loaded := inFlight.LoadOrStore(key, true); loaded {
+					continue
+				}
+				go func(task repository.RunningHubWorkflowTask) {
+					defer inFlight.Delete("workflow:" + task.ID)
+					kind := strings.SplitN(task.ID, "-", 3)[1]
+					ctx, cleanup, err := CanvasTaskContext(context.Background(), kind, task.UserID, task.ID)
+					if err != nil {
+						return
+					}
+					defer cleanup()
+					if err := pollRunningHubWorkflowTask(ctx, task); err != nil && ctx.Err() == nil {
+						log.Printf("poll RunningHub workflow task failed id=%s err=%v", task.ID, err)
 					}
 				}(task)
 			}
@@ -261,6 +363,9 @@ func waitForNextVideoTaskPoll() {
 }
 
 func UpdateVideoTaskFromPoll(task model.VideoTask, update VideoTaskPollUpdate) error {
+	if update.ParameterTranslationSnapshot != "" {
+		task.ParameterTranslationSnapshot = update.ParameterTranslationSnapshot
+	}
 	current := now()
 	task.Status = NormalizeVideoTaskStatus(firstVideoTaskValue(update.Status, task.Status))
 	if task.Status == "" {
@@ -298,6 +403,13 @@ func UpdateVideoTaskFromPoll(task model.VideoTask, update VideoTaskPollUpdate) e
 	} else if task.Error != "" || IsFailedVideoTaskStatus(task.Status) {
 		task.Status = "failed"
 		task.CompletedAt = current
+	}
+	if task.ParameterTranslationSnapshot != "" && task.Status == "failed" {
+		extra, _ := json.Marshal(map[string]string{"model": task.Model, "path": "/videos"})
+		return repository.SaveFailedTranslatedVideoTask(task, model.CreditLog{ID: newID("credit"), UserID: task.UserID, Type: model.CreditLogTypeAIRefund, Amount: task.Credits, Remark: "模型调用失败返还 " + task.Model, Extra: string(extra), CreatedAt: current})
+	}
+	if task.Source == "canvas" || task.Source == "video-workbench" {
+		return repository.UpdateVideoTask(task)
 	}
 	_, err := repository.SaveVideoTask(task)
 	return err
@@ -341,6 +453,8 @@ func firstVideoTaskValue(values ...string) string {
 
 func normalizeVideoTaskSource(source string) string {
 	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "workflow":
+		return "workflow"
 	case "canvas":
 		return "canvas"
 	case "video-workbench", "":

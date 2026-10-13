@@ -24,8 +24,8 @@ type AssetBase<T extends AssetKind> = {
     title: string;
     coverUrl: string;
     tags: string[];
+    category?: string;
     source?: string;
-    note?: string;
     createdAt: string;
     updatedAt: string;
     metadata?: Record<string, unknown>;
@@ -39,7 +39,7 @@ type AssetStore = {
     hydrateAccountAssets: (token: string, syncEnabled?: boolean) => Promise<void>;
     syncAccountAssets: (token: string) => Promise<void>;
     stopAccountAssetSync: () => void;
-    cleanupImages: (extra?: unknown) => void;
+    cleanupImages: (extra?: unknown, storageKeys?: ReadonlyMap<string, string>, ownerToken?: string) => void;
 };
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";

@@ -47,7 +47,7 @@ description: settings 表中 public 和 private 配置结构说明
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `availableModels` | string[] | 系统可用模型；保存设置时会自动合并所有已启用私有渠道的模型 |
-| `modelCosts` | object[] | 模型算力点配置，后端模型接口调用前按模型预扣，上游失败时返还；未配置默认不扣除 |
+| `modelCosts` | object[] | 模型算力点配置，图片按张、视频按秒、文本和音频按次预扣，上游失败时返还；视频智能时长 `-1` 按 15 秒计算，未配置默认不扣除 |
 | `defaultModel` | string | 默认模型，从 `availableModels` 中选择；为空或失效时优先选择文本模型 |
 | `defaultImageModel` | string | 默认图片模型，从 `availableModels` 中选择；为空或失效时优先选择 `seedream`、`image`、`gpt-image` 模型 |
 | `defaultVideoModel` | string | 默认视频模型，从 `availableModels` 中选择；为空或失效时优先选择 `seedance`、`video` 模型 |
@@ -60,7 +60,7 @@ description: settings 表中 public 和 private 配置结构说明
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `model` | string | 模型名称 |
-| `credits` | number | 每次后端模型接口调用前预扣的算力点 |
+| `credits` | number | 图片每张、视频每秒、文本和音频每次调用预扣的算力点，最多保留两位小数 |
 
 用户侧请求模式：
 
@@ -113,11 +113,14 @@ description: settings 表中 public 和 private 配置结构说明
 | `baseUrl` | string | 渠道接口地址 |
 | `apiKey` | string | 渠道密钥 |
 | `models` | string[] | 该渠道可用模型 |
+| `parameterTranslation` | string | 渠道自定传参转译原文，按 `models` 中的真实模型名称配置；空值沿用默认调用 |
 | `weight` | number | 渠道权重；同一模型有多个可用渠道时按权重随机 |
 | `enabled` | boolean | 是否启用 |
 | `remark` | string | 备注 |
 
 后端调用模型时，会从已启用、已配置 `baseUrl` 和 `apiKey`、且 `models` 包含目标模型的渠道中选择一个。
+
+公开渠道信息增加 `parameterTranslationModels: string[]`，只列出已配置生成请求且允许使用的模型名，供前端选择调用入口；不公开转译原文和密钥。个人渠道原文随用户 `modelConfig.channelTranslations` 保存，每项为 `{ channelId, parameterTranslation }`，与外部 `localChannels` 的 URL、密钥和模型配置分开。
 
 `promptSync` 字段：
 

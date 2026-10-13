@@ -47,5 +47,3 @@ Docker 部署时建议把 `.env` 中的 SQLite 路径设置为：
 ```text
 DATABASE_DSN=/app/data/infinite-canvas.db
 ```
-
-如果需要让火山方舟拉取本地上传的 Seedance 参考素材，还需要把 `PUBLIC_BASE_URL` 设置为公网可访问的站点地址。

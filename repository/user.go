@@ -79,7 +79,7 @@ func SaveUser(user model.User) (model.User, error) {
 	return user, db.Save(&user).Error
 }
 
-func ConsumeUserCredits(id string, credits int, now string) (model.User, bool, error) {
+func ConsumeUserCredits(id string, credits float64, now string, log model.CreditLog, task any) (model.User, bool, error) {
 	db, err := DB()
 	if err != nil {
 		return model.User{}, false, err
@@ -88,34 +88,56 @@ func ConsumeUserCredits(id string, credits int, now string) (model.User, bool, e
 		user, ok, err := GetUserByID(id)
 		return user, ok, err
 	}
-	tx := db.Model(&model.User{}).Where("id = ? AND credits >= ?", id, credits).Updates(map[string]any{
-		"credits":    gorm.Expr("credits - ?", credits),
-		"updated_at": now,
+	var user model.User
+	consumed := false
+	err = db.Transaction(func(tx *gorm.DB) error {
+		update := tx.Model(&model.User{}).Where("id = ? AND credits >= CAST(? AS DECIMAL(20,2))", id, credits).Updates(map[string]any{
+			"credits":    gorm.Expr("ROUND(credits - CAST(? AS DECIMAL(20,2)), 2)", credits),
+			"updated_at": now,
+		})
+		if update.Error != nil || update.RowsAffected == 0 {
+			return update.Error
+		}
+		current, found, err := findUser(tx, "id = ?", id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return gorm.ErrRecordNotFound
+		}
+		user, consumed = current, true
+		log.Balance = user.Credits
+		if err := tx.Save(&log).Error; err != nil {
+			return err
+		}
+		if task != nil {
+			return tx.Create(task).Error
+		}
+		return nil
 	})
-	if tx.Error != nil {
-		return model.User{}, false, tx.Error
-	}
-	user, ok, err := GetUserByID(id)
-	return user, ok && tx.RowsAffected > 0, err
+	return user, consumed, err
 }
 
-func RefundUserCredits(id string, credits int, now string) (model.User, bool, error) {
+func RefundUserCredits(id string, credits float64, now string) (model.User, bool, error) {
 	db, err := DB()
 	if err != nil {
 		return model.User{}, false, err
 	}
+	return refundUserCredits(db, id, credits, now)
+}
+
+func refundUserCredits(db *gorm.DB, id string, credits float64, now string) (model.User, bool, error) {
 	if credits <= 0 {
-		user, ok, err := GetUserByID(id)
-		return user, ok, err
+		return findUser(db, "id = ?", id)
 	}
 	tx := db.Model(&model.User{}).Where("id = ?", id).Updates(map[string]any{
-		"credits":    gorm.Expr("credits + ?", credits),
+		"credits":    gorm.Expr("ROUND(credits + CAST(? AS DECIMAL(20,2)), 2)", credits),
 		"updated_at": now,
 	})
 	if tx.Error != nil {
 		return model.User{}, false, tx.Error
 	}
-	user, ok, err := GetUserByID(id)
+	user, ok, err := findUser(db, "id = ?", id)
 	return user, ok && tx.RowsAffected > 0, err
 }
 
@@ -134,17 +156,20 @@ func ListCreditLogs(q model.Query) ([]model.CreditLog, int64, error) {
 		return nil, 0, err
 	}
 	q.Normalize()
-	tx := db.Model(&model.CreditLog{})
+	tx := db.Model(&model.CreditLog{}).Joins("LEFT JOIN users ON users.id = credit_logs.user_id")
 	if keyword := strings.TrimSpace(q.Keyword); keyword != "" {
 		like := "%" + keyword + "%"
-		tx = tx.Where("user_id LIKE ? OR type LIKE ? OR remark LIKE ? OR related_id LIKE ?", like, like, like, like)
+		tx = tx.Where("user_id LIKE ? OR type LIKE ? OR remark LIKE ? OR related_id LIKE ? OR users.username LIKE ? OR users.display_name LIKE ?", like, like, like, like, like, like)
+	}
+	if q.Date != "" {
+		tx = tx.Where("SUBSTR(credit_logs.created_at, 1, 10) = ?", q.Date)
 	}
 	var total int64
 	if err := tx.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var logs []model.CreditLog
-	err = tx.Order("created_at desc").Offset(q.Offset()).Limit(q.PageSize).Find(&logs).Error
+	err = tx.Select("credit_logs.*, COALESCE(NULLIF(users.display_name, ''), users.username) AS user_display_name").Order("credit_logs.created_at desc").Offset(q.Offset()).Limit(q.PageSize).Find(&logs).Error
 	return logs, total, err
 }
 
