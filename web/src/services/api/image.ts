@@ -1740,6 +1740,8 @@ export async function listCanvasImageTasks(config: AiConfig, sources: Array<"ima
 }
 
 export async function batchCanvasImageTaskStatus(config: AiConfig, ids: string[]) {
+    // 固定请求所属会话，避免返回时使用已切换账号的身份同步图片。
+    const token = useUserStore.getState().token;
     const taskIds = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)));
     if (!usesAccountProxy(config) || !taskIds.length) return [];
     const response = await fetch("/api/v1/canvas/image-tasks/status", {

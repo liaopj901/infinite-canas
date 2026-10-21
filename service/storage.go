@@ -128,7 +128,20 @@ func HasActiveCloudStorage(ctx context.Context) (bool, error) {
 func PublicStorageConfig() (model.PublicStorageConfig, error) {
 	settings, err := repository.GetSettings()
 	if err != nil {
-		return model.PublicStorageConfig{
+		return model.PublicStorageConfig{}, err
+	}
+	settings = normalizeSettings(settings)
+	storage := normalizePrivateStorageSetting(settings.Private.Storage)
+
+	mode := "local_indexeddb"
+	if HasAdminStorageProvider(storage) {
+		mode = "server_sqlite_s3"
+	} else if storage.AllowUserProvider {
+		mode = "hybrid"
+	}
+
+	// 同时公开标准版统一同步与二开的分渠道开关，供前端选择自动同步策略。
+	return model.PublicStorageConfig{
 		PublicStorageSetting: model.PublicStorageSetting{
 			Mode:                        mode,
 			AllowUserProvider:           storage.AllowUserProvider,
