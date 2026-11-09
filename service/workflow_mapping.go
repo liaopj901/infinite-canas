@@ -111,7 +111,7 @@ func ResolveWorkflowFields(entry model.WorkflowEntry, input WorkflowRunInput) ([
 			if err != nil {
 				return nil, err
 			}
-			if err := validateWorkflowMedia(raw, mediaID); err != nil {
+			if err := validateWorkflowMedia(raw, mediaID, entry.Provider == "comfyui" && strings.HasPrefix(mediaID, "video:")); err != nil {
 				return nil, err
 			}
 			mappedMedia[mediaID] = true
@@ -135,7 +135,19 @@ func ResolveWorkflowFields(entry model.WorkflowEntry, input WorkflowRunInput) ([
 	return result, nil
 }
 
-func validateWorkflowMedia(raw, mediaID string) error {
+func validateWorkflowMedia(raw, mediaID string, comfyVideo bool) error {
+	if comfyVideo {
+		if strings.HasPrefix(raw, "comfy:") {
+			filename := strings.TrimPrefix(raw, "comfy:")
+			if filename == "" || filename == "." || filename == ".." || strings.ContainsAny(filename, "/\\") {
+				return fmt.Errorf("%s 文件名无效", mediaID)
+			}
+			return nil
+		}
+		if strings.HasPrefix(raw, "data:") {
+			return fmt.Errorf("%s 请通过本机 Bridge 上传视频文件", mediaID)
+		}
+	}
 	if strings.HasPrefix(raw, "data:") {
 		kind := strings.Split(mediaID, ":")[0]
 		if mediaID == "mask" {

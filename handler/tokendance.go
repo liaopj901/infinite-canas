@@ -24,7 +24,11 @@ func prepareTokenDanceRequest(input aiProtocolRequest) (aiProtocolRequest, bool,
 	if !service.IsTokenDanceChannel(input.channel) {
 		return input, false, nil
 	}
-	if input.endpoint != "/images/generations" && input.endpoint != "/images/edits" && input.endpoint != "/videos" {
+	tokenDanceModel := strings.ToLower(strings.TrimSpace(input.modelName))
+	if input.endpoint == "/audio/speech" && (!strings.HasPrefix(tokenDanceModel, "minimax-") || !service.IsMiniMaxTTSModelName(strings.TrimPrefix(tokenDanceModel, "minimax-"))) {
+		return input, false, nil
+	}
+	if input.endpoint != "/images/generations" && input.endpoint != "/images/edits" && input.endpoint != "/videos" && input.endpoint != "/audio/speech" {
 		return input, false, nil
 	}
 
@@ -42,6 +46,8 @@ func prepareTokenDanceRequest(input aiProtocolRequest) (aiProtocolRequest, bool,
 	input.path = tokenDanceCreatePath(protocol, input.endpoint)
 
 	switch protocol {
+	case "minimax:t2a_v2":
+		return input, false, nil
 	case "openai:image-generations":
 		if input.mode == aiProtocolDirectRequest && input.endpoint == "/images/edits" {
 			input.formData = true
@@ -87,13 +93,15 @@ func tokenDanceRequestProtocol(modelName string, endpoint string, payload map[st
 		candidates = []string{"ark:image-generations", "openai:image-generations"}
 	case "/videos":
 		candidates = tokenDanceVideoProtocolCandidates(payload)
+	case "/audio/speech":
+		candidates = []string{"minimax:t2a_v2"}
 	}
 	for _, protocol := range candidates {
 		if supported[protocol] {
 			return protocol, nil
 		}
 	}
-	return "", fmt.Errorf("模型 %s 不支持当前图片或视频输入方式，可用协议：%s", modelName, strings.Join(protocols, ", "))
+	return "", fmt.Errorf("模型 %s 不支持当前输入方式，可用协议：%s", modelName, strings.Join(protocols, ", "))
 }
 
 func tokenDanceVideoProtocolCandidates(payload map[string]any) []string {
@@ -123,6 +131,8 @@ func tokenDanceVideoProtocolCandidates(payload map[string]any) []string {
 
 func tokenDanceCreatePath(protocol string, endpoint string) string {
 	switch protocol {
+	case "minimax:t2a_v2":
+		return "/minimax/v1/t2a_v2"
 	case "openai:image-generations":
 		return endpoint
 	case "ark:image-generations":

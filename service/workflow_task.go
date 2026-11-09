@@ -479,7 +479,9 @@ func comfyWorkflowPayload(entry model.WorkflowEntry, input WorkflowRunInput, ove
 		items := make([]map[string]any, 0, len(values))
 		for index, value := range values {
 			item := map[string]any{"id": fmt.Sprintf("%s:%d", prefix, index)}
-			if strings.HasPrefix(value, "data:") {
+			if prefix == "video" && strings.HasPrefix(value, "comfy:") {
+				item["filename"] = strings.TrimPrefix(value, "comfy:")
+			} else if strings.HasPrefix(value, "data:") {
 				item["dataUrl"] = value
 			} else {
 				item["url"] = value

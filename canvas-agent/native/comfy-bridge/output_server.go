@@ -61,9 +61,11 @@ func startOutputServer(options bridgeOptions, store *recoveryStore) error {
 		return err
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/outputs/", func(w http.ResponseWriter, r *http.Request) {
+	serve := func(w http.ResponseWriter, r *http.Request) {
 		serveLocalOutput(w, r, options, store)
-	})
+	}
+	mux.HandleFunc("/outputs/", serve)
+	mux.HandleFunc("/upload", serve)
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -91,8 +93,8 @@ func serveLocalOutput(
 		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Add("Vary", "Origin")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "If-Range, Range")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, If-Range, Range")
 		w.Header().Set(
 			"Access-Control-Expose-Headers",
 			"Accept-Ranges, Content-Disposition, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
@@ -106,6 +108,25 @@ func serveLocalOutput(
 	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/upload" {
+		if origin == "" {
+			http.Error(w, "不允许的来源", http.StatusForbidden)
+			return
+		}
+		data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxReferenceBytes+1))
+		if err != nil || len(data) == 0 || int64(len(data)) > maxReferenceBytes {
+			http.Error(w, "参考视频为空、读取失败或超过 64MB", http.StatusBadRequest)
+			return
+		}
+		contentType := r.Header.Get("Content-Type")
+		filename, err := uploadComfyMedia(options.Comfy, randomID()+extensionForMime(contentType), contentType, data)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		_, _ = fmt.Fprint(w, "comfy:"+filename)
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {

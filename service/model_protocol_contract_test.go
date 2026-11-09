@@ -46,7 +46,7 @@ func TestModelProtocolStaticDiscoveryPrecedence(t *testing.T) {
 		name, protocol, baseURL string
 		want                    []string
 	}{
-		{"minimax before URL inference", "minimax", "https://xiaomimimo.com/kie.ai", []string{"MiniMax-H3"}},
+		{"minimax before URL inference", "minimax", "https://xiaomimimo.com/kie.ai", []string{"MiniMax-H3", "speech-2.8-hd", "speech-2.8-turbo", "speech-2.6-hd", "speech-2.6-turbo", "speech-02-hd", "speech-02-turbo", "speech-01-hd", "speech-01-turbo"}},
 		{"mimo URL before explicit kie", "kie", "https://xiaomimimo.com", mimo},
 		{"mimo before kie URL", "mimo", "https://api.kie.ai", mimo},
 		{"kie URL inference", "openai", "https://api.kie.ai", kie},
@@ -94,6 +94,7 @@ func TestModelProtocolConfigTestsDoNotGenerate(t *testing.T) {
 	})
 	tests := []struct{ protocol, baseURL, model, want string }{
 		{"minimax", "https://api.example/api/plan/v3", "seedance", "MiniMax-H3 是异步视频模型，请在视频创作台测试生成。"},
+		{"minimax", "https://api.example/api/plan/v3", "speech-2.8-hd", "MiniMax TTS 模型配置格式已通过。后台不会执行付费语音生成，请在画布中验证实际生成。"},
 		{"ark", "https://api.example/api/plan/v3", "deployment", "Agent Plan / Seedance 视频模型配置格式已通过。后台测试不会调用视频生成接口，因此未验证 API Key、套餐额度或模型权限；请在画布中使用视频生成验证。"},
 		{"gemini", "https://api.example", "veo-3", "模型列表与渠道配置有效；图片、视频和语音模型未执行付费生成测试。"},
 		{"gemini", "https://api.example", "gemini-image", "模型列表与渠道配置有效；图片、视频和语音模型未执行付费生成测试。"},

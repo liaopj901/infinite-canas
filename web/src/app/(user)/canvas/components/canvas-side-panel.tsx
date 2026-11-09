@@ -1,6 +1,7 @@
 "use client";
 
-import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from "react";
+import { useParams } from "next/navigation";
 import { Empty, Input, Pagination, Select, Spin } from "antd";
 import { useQuery } from "@tanstack/react-query";
 import { BookOpen, ChevronRight, Clapperboard, Eye, FileText, Group, Image as ImageIcon, Music2, Plus, Search, Settings2, Type, Video } from "lucide-react";
@@ -13,6 +14,7 @@ import { canvasThemes, type CanvasTheme } from "@/lib/canvas-theme";
 import { cn } from "@/lib/utils";
 import { fetchAssetLibrary, type AssetLibraryItem } from "@/services/api/assets";
 import { fetchPrompts, type Prompt } from "@/services/api/prompts";
+import { getImagePreviewRevision, previewUrlFor, subscribeImagePreviews } from "@/services/image-storage";
 import { useAssetStore, type Asset } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 
@@ -175,10 +177,12 @@ function PanelTabButton({ label, active, theme, onClick }: { label: string; acti
 }
 
 function CanvasNodesTab({ nodes, selectedNodeIds, onFocusNode, theme }: { nodes: CanvasNodeData[]; selectedNodeIds: Set<string>; onFocusNode: (nodeId: string) => void; theme: CanvasTheme }) {
+    const projectId = useParams<{ id: string }>().id;
     const [keyword, setKeyword] = useState("");
     const [typeFilter, setTypeFilter] = useState<string>("all");
     const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
     const rowRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+    useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision, getImagePreviewRevision);
 
     const filtered = useMemo(() => {
         const query = keyword.trim().toLowerCase();
@@ -243,7 +247,20 @@ function CanvasNodesTab({ nodes, selectedNodeIds, onFocusNode, theme }: { nodes:
                                         className={cn("flex min-w-0 flex-1 items-center gap-3 py-2 pr-2 text-left", node.type === CanvasNodeType.Group && hasChildren ? "pl-0" : "pl-2")}
                                     >
                                         <span className="grid size-10 shrink-0 place-items-center overflow-hidden rounded-md">
-                                            {hasImage ? <img src={node.metadata?.content} alt={node.title} className="size-full object-cover" /> : <Icon className="size-5 opacity-60" />}
+                                            {hasImage ? (
+                                                <img
+                                                    src={
+                                                        previewUrlFor(
+                                                            `canvas-node:${projectId}:${node.id}`,
+                                                            `${node.metadata?.primaryImageId || ""}:${node.metadata?.imageTaskResultId || ""}:${node.metadata?.storageKey || node.metadata?.content}`,
+                                                        ) || node.metadata?.content
+                                                    }
+                                                    alt={node.title}
+                                                    className="size-full object-cover"
+                                                />
+                                            ) : (
+                                                <Icon className="size-5 opacity-60" />
+                                            )}
                                         </span>
                                         <span className="min-w-0 flex-1 space-y-0.5">
                                             <span className="block truncate text-sm font-medium leading-snug">{node.title || NODE_TYPE_LABEL[node.type] || "未命名节点"}</span>

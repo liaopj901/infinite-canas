@@ -4,18 +4,21 @@ import { Select } from "antd";
 import { type ReactNode } from "react";
 
 import { GrokTtsVoiceSelect } from "@/components/grok-tts-voice-select";
+import { MiniMaxTtsVoiceSelect } from "@/components/minimax-tts-voice-select";
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
 import { audioFormatOptions, audioSpeedLabel, audioVoiceOptions, glmTtsFormatOptions, glmTtsVoiceOptions, isGlmTtsModel, normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue, normalizeGlmTtsFormat, normalizeGlmTtsSpeed, normalizeGlmTtsVoice } from "@/lib/audio-generation";
 import { grokTtsFormatOptions, grokTtsLanguageOptions, isGrok2APITtsConfig, normalizeGrokTtsFormat, normalizeGrokTtsLanguage, normalizeGrokTtsSpeed } from "@/lib/grok-tts";
 import { isMimoPresetTtsModel, isMimoTtsModel, isMimoVoiceCloneModel, isMimoVoiceDesignModel, mimoTtsFormatOptions, mimoTtsVoiceOptions, normalizeMimoTtsFormat, normalizeMimoTtsVoice } from "@/lib/mimo-tts";
 import { isGeminiConfig, isGeminiTtsModel } from "@/lib/gemini";
 import { geminiTtsVoiceOptions, normalizeGeminiTtsVoice } from "@/lib/gemini-tts";
+import { isMiniMaxTtsConfig, miniMaxTtsFormatOptions, normalizeMiniMaxTtsFormat, normalizeMiniMaxTtsSpeed, normalizeMiniMaxTtsVoice } from "@/lib/minimax-tts";
+import { miniMaxTtsVoiceOptions } from "@/lib/minimax-tts-voices";
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import type { AiConfig } from "@/stores/use-config-store";
+import { channelProtocolForConfig, type AiConfig } from "@/stores/use-config-store";
 
 const speedOptions = ["0.75", "1", "1.25", "1.5"];
 
-export type AudioSettingKey = "audioVoice" | "audioFormat" | "audioSpeed" | "audioInstructions" | "grokTtsVoice" | "grokTtsLanguage" | "grokTtsFormat" | "grokTtsSpeed" | "glmTtsVoice" | "glmTtsFormat" | "glmTtsSpeed" | "mimoTtsVoice" | "mimoTtsFormat" | "mimoVoiceDesignPrompt" | "geminiTtsVoice";
+export type AudioSettingKey = "audioVoice" | "audioFormat" | "audioSpeed" | "audioInstructions" | "grokTtsVoice" | "grokTtsLanguage" | "grokTtsFormat" | "grokTtsSpeed" | "glmTtsVoice" | "glmTtsFormat" | "glmTtsSpeed" | "mimoTtsVoice" | "mimoTtsFormat" | "mimoVoiceDesignPrompt" | "geminiTtsVoice" | "miniMaxTtsVoice" | "miniMaxTtsFormat" | "miniMaxTtsSpeed";
 
 type AudioSettingsPanelProps = {
     config: AiConfig;
@@ -29,12 +32,13 @@ export function AudioSettingsPanel({ config, onConfigChange, theme, showTitle = 
     const model = config.model || config.audioModel || "";
     const grok = isGrok2APITtsConfig(config, model);
     const gemini = isGeminiTtsModel(model) && isGeminiConfig(config, model);
+    const miniMax = isMiniMaxTtsConfig(config, model);
 
     return (
         <ImageSettingsTheme theme={theme}>
             <div className={className} style={{ color: theme.node.text }} onMouseDown={(event) => event.stopPropagation()}>
                 {showTitle ? <div className="text-lg font-semibold">音频设置</div> : null}
-                {gemini ? <GeminiAudioSettings config={config} onConfigChange={onConfigChange} theme={theme} /> : isMimoTtsModel(model) ? <MiMoAudioSettings config={config} model={model} onConfigChange={onConfigChange} theme={theme} /> : <AudioSpeechSettings config={config} model={model} glm={isGlmTtsModel(model)} grok={grok} onConfigChange={onConfigChange} theme={theme} />}
+                {gemini ? <GeminiAudioSettings config={config} onConfigChange={onConfigChange} theme={theme} /> : isMimoTtsModel(model) ? <MiMoAudioSettings config={config} model={model} onConfigChange={onConfigChange} theme={theme} /> : <AudioSpeechSettings config={config} model={model} glm={isGlmTtsModel(model)} grok={grok} miniMax={miniMax} onConfigChange={onConfigChange} theme={theme} />}
             </div>
         </ImageSettingsTheme>
     );
@@ -101,20 +105,27 @@ function MiMoAudioSettings({ config, model, onConfigChange, theme }: { config: A
     );
 }
 
-function AudioSpeechSettings({ config, model, glm, grok, onConfigChange, theme }: { config: AiConfig; model: string; glm: boolean; grok: boolean; onConfigChange: AudioSettingsPanelProps["onConfigChange"]; theme: CanvasTheme }) {
-    const voice = glm ? normalizeGlmTtsVoice(config.glmTtsVoice) : grok ? config.grokTtsVoice || "eve" : normalizeAudioVoiceValue(config.audioVoice);
-    const format = glm ? normalizeGlmTtsFormat(config.glmTtsFormat) : grok ? normalizeGrokTtsFormat(config.grokTtsFormat) : normalizeAudioFormatValue(config.audioFormat);
-    const speed = glm ? normalizeGlmTtsSpeed(config.glmTtsSpeed) : grok ? normalizeGrokTtsSpeed(config.grokTtsSpeed) : normalizeAudioSpeedValue(config.audioSpeed);
+function AudioSpeechSettings({ config, model, glm, grok, miniMax, onConfigChange, theme }: { config: AiConfig; model: string; glm: boolean; grok: boolean; miniMax: boolean; onConfigChange: AudioSettingsPanelProps["onConfigChange"]; theme: CanvasTheme }) {
+    const officialMiniMax = miniMax && channelProtocolForConfig({ ...config, model, audioModel: model }) === "minimax";
+    const voice = glm ? normalizeGlmTtsVoice(config.glmTtsVoice) : miniMax ? normalizeMiniMaxTtsVoice(config.miniMaxTtsVoice) : grok ? config.grokTtsVoice || "eve" : normalizeAudioVoiceValue(config.audioVoice);
+    const format = glm ? normalizeGlmTtsFormat(config.glmTtsFormat) : miniMax ? normalizeMiniMaxTtsFormat(config.miniMaxTtsFormat) : grok ? normalizeGrokTtsFormat(config.grokTtsFormat) : normalizeAudioFormatValue(config.audioFormat);
+    const speed = glm ? normalizeGlmTtsSpeed(config.glmTtsSpeed) : miniMax ? normalizeMiniMaxTtsSpeed(config.miniMaxTtsSpeed) : grok ? normalizeGrokTtsSpeed(config.grokTtsSpeed) : normalizeAudioSpeedValue(config.audioSpeed);
     const voiceOptions = glm ? glmTtsVoiceOptions : audioVoiceOptions;
-    const formatOptions = glm ? glmTtsFormatOptions : grok ? grokTtsFormatOptions : audioFormatOptions;
+    const formatOptions = glm ? glmTtsFormatOptions : miniMax ? miniMaxTtsFormatOptions : grok ? grokTtsFormatOptions : audioFormatOptions;
     const voiceKey: AudioSettingKey = glm ? "glmTtsVoice" : "audioVoice";
-    const formatKey: AudioSettingKey = glm ? "glmTtsFormat" : grok ? "grokTtsFormat" : "audioFormat";
-    const speedKey: AudioSettingKey = glm ? "glmTtsSpeed" : grok ? "grokTtsSpeed" : "audioSpeed";
+    const formatKey: AudioSettingKey = glm ? "glmTtsFormat" : miniMax ? "miniMaxTtsFormat" : grok ? "grokTtsFormat" : "audioFormat";
+    const speedKey: AudioSettingKey = glm ? "glmTtsSpeed" : miniMax ? "miniMaxTtsSpeed" : grok ? "grokTtsSpeed" : "audioSpeed";
 
     return (
         <>
             <SettingGroup title="声音" color={theme.node.muted}>
-                {grok ? <GrokTtsVoiceSelect config={config} model={model} value={voice} onChange={(value) => onConfigChange("grokTtsVoice", value)} /> : (
+                {grok ? <GrokTtsVoiceSelect config={config} model={model} value={voice} onChange={(value) => onConfigChange("grokTtsVoice", value)} /> : miniMax ? (
+                    officialMiniMax ? (
+                        <MiniMaxTtsVoiceSelect config={config} model={model} value={voice} onChange={(value) => onConfigChange("miniMaxTtsVoice", value)} />
+                    ) : (
+                        <Select className="w-full" value={voice} options={miniMaxTtsVoiceOptions} showSearch optionFilterProp="label" styles={{ popup: { root: { zIndex: 1300 } } }} getPopupContainer={(trigger) => trigger.closest<HTMLElement>(".canvas-image-settings-popover") || document.body} onChange={(value) => onConfigChange("miniMaxTtsVoice", value)} />
+                    )
+                ) : (
                     <div className="grid grid-cols-3 gap-2.5">
                         {voiceOptions.map((item) => (
                             <OptionPill key={item.value} selected={voice === item.value} theme={theme} onClick={() => onConfigChange(voiceKey, item.value)}>
@@ -148,18 +159,18 @@ function AudioSpeechSettings({ config, model, glm, grok, onConfigChange, theme }
                 </div>
                 <input
                     type="number"
-                    min={glm ? 0.5 : grok ? 0.7 : 0.25}
-                    max={glm ? 2 : grok ? 1.5 : 4}
+                    min={glm || miniMax ? 0.5 : grok ? 0.7 : 0.25}
+                    max={glm || miniMax ? 2 : grok ? 1.5 : 4}
                     step={0.05}
                     className="h-9 w-full rounded-full border bg-transparent px-3 text-center text-sm outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                     style={{ borderColor: theme.node.stroke, color: theme.node.text, WebkitTextFillColor: theme.node.text }}
-                    value={(glm ? config.glmTtsSpeed : grok ? config.grokTtsSpeed : config.audioSpeed) || "1"}
+                    value={(glm ? config.glmTtsSpeed : miniMax ? config.miniMaxTtsSpeed : grok ? config.grokTtsSpeed : config.audioSpeed) || "1"}
                     onChange={(event) => onConfigChange(speedKey, event.target.value)}
-                    onBlur={(event) => onConfigChange(speedKey, glm ? normalizeGlmTtsSpeed(event.target.value) : grok ? normalizeGrokTtsSpeed(event.target.value) : normalizeAudioSpeedValue(event.target.value))}
+                    onBlur={(event) => onConfigChange(speedKey, glm ? normalizeGlmTtsSpeed(event.target.value) : miniMax ? normalizeMiniMaxTtsSpeed(event.target.value) : grok ? normalizeGrokTtsSpeed(event.target.value) : normalizeAudioSpeedValue(event.target.value))}
                     onMouseDown={(event) => event.stopPropagation()}
                 />
             </SettingGroup>
-            {!glm && !grok ? (
+            {!glm && !grok && !miniMax ? (
                 <SettingGroup title="声音指令" color={theme.node.muted}>
                     <textarea
                         value={config.audioInstructions || ""}

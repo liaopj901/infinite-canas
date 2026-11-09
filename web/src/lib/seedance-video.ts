@@ -3,7 +3,7 @@ import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
 export const SEEDANCE_REFERENCE_LIMITS = {
-    images: 9,
+    images: 10,
     videos: 3,
     audios: 3,
     imageMaxBytes: 30 * 1024 * 1024,

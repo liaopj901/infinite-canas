@@ -4,10 +4,12 @@ import localforage from "localforage";
 
 import { nanoid } from "nanoid";
 import { getAccountOwnerId, getAccountStorageKey } from "@/lib/account-scope";
+import { createImageThumbnail } from "@/lib/image-thumbnail";
 import { readImageMeta } from "@/lib/image-utils";
 import { deleteAnonymousStorageFile, uploadAnonymousStorageFile } from "@/services/anonymous-storage";
 import { apiGet } from "@/services/api/request";
 import type { AiConfig } from "@/stores/use-config-store";
+import { comfyOutputStorageKey } from "@/services/api/workflow-generation";
 import { useUserStore } from "@/stores/use-user-store";
 
 export type UploadedImage = {
@@ -31,6 +33,7 @@ export type UserS3StorageProvider = UserStorageProviderBase & {
     type: "s3";
     region: string;
     bucket: string;
+    bucketInHost: boolean;
     accessKeyId: string;
     secretAccessKey: string;
     publicBaseUrl: string;
@@ -66,7 +69,14 @@ export type StorageConfig = {
 };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
+const previewStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_previews" });
 const objectUrls = new Map<string, string>();
+const previewUrls = new Map<string, { source: string; url: string }>();
+const previewSources = new Map<string, string>();
+const previewRequests = new Map<string, { source: string; promise: Promise<string | undefined> }>();
+const previewDeletes = new Map<string, Promise<void>>();
+const previewEpochs = new Map<string, number>();
+const previewListeners = new Set<() => void>();
 const serverUrls = new Map<string, string>();
 
 function serverUrlCacheKey(ownerId: string, id: string) {
@@ -90,12 +100,192 @@ function protectedImagePath(value?: string) {
 export function isProtectedImageUrl(value?: string) {
     return Boolean(protectedImagePath(value));
 }
+const previewQueue: Array<() => void> = [];
+const IMAGE_PREVIEW_VERSION = 1;
+const IMAGE_PREVIEW_CONCURRENCY = 2;
+let previewRevision = 0;
+let previewActive = 0;
 export const USER_STORAGE_PROVIDER_KEY = "infinite-canvas:user_storage_provider";
 export const USER_WEBDAV_STORAGE_PROVIDER_KEY = "infinite-canvas:user_webdav_storage_provider";
 let storageConfigPromise: Promise<StorageConfig> | null = null;
 export const STORAGE_SYNC_FAILED_EVENT = "infinite-canvas:storage-sync-failed";
 const autoSyncRequests = new Map<string | Blob, Promise<{ storageKey: string } | null>>();
 let autoSyncOwner = "";
+
+type StoredImagePreview = {
+    version: number;
+    source: string;
+    blob?: Blob;
+};
+
+export function previewUrlFor(key: string, source?: string) {
+    const cached = previewUrls.get(key);
+    return cached && (!source || cached.source === source) ? cached.url : undefined;
+}
+
+export function subscribeImagePreviews(listener: () => void) {
+    previewListeners.add(listener);
+    return () => {
+        previewListeners.delete(listener);
+    };
+}
+
+export function getImagePreviewRevision() {
+    return previewRevision;
+}
+
+export async function ensureImagePreview(key: string, url?: string, storageKey?: string, source = storageKey || url || "", cachedOnly = false): Promise<string | undefined> {
+    if (!key || !source) return undefined;
+    if (isLocalImageSource(url) || isComfyImageSource(storageKey) || isComfyImageSource(url)) {
+        await deleteImagePreviews([key]);
+        return undefined;
+    }
+
+    if (previewSources.get(key) !== source) {
+        previewEpochs.set(key, (previewEpochs.get(key) || 0) + 1);
+        previewRequests.delete(key);
+    }
+    previewSources.set(key, source);
+    const cached = previewUrls.get(key);
+    if (cached?.source === source) return cached.url;
+    if (cached) removeCachedPreview(key);
+
+    const running = previewRequests.get(key);
+    if (running?.source === source) return running.promise;
+
+    const epoch = previewEpochs.get(key) || 0;
+    const promise = loadImagePreview(key, source, epoch, url, storageKey, cachedOnly).catch(() => undefined);
+    previewRequests.set(key, { source, promise });
+    try {
+        return await promise;
+    } finally {
+        if (previewRequests.get(key)?.promise === promise) previewRequests.delete(key);
+    }
+}
+
+export async function deleteImagePreviews(keys: Iterable<string>) {
+    const uniqueKeys = Array.from(new Set(keys));
+    let changed = false;
+    uniqueKeys.forEach((key) => {
+        previewEpochs.set(key, (previewEpochs.get(key) || 0) + 1);
+        previewRequests.delete(key);
+        previewSources.delete(key);
+        changed = removeCachedPreview(key, false) || changed;
+    });
+    await Promise.all(
+        uniqueKeys.map((key) => {
+            const removal = (previewDeletes.get(key) || Promise.resolve())
+                .then(() => previewStore.removeItem(key))
+                .catch(() => undefined);
+            previewDeletes.set(key, removal);
+            return removal.finally(() => {
+                if (previewDeletes.get(key) === removal) previewDeletes.delete(key);
+            });
+        }),
+    );
+    if (changed) notifyPreviewChange();
+}
+
+export async function deleteUnusedImagePreviews(prefix: string, usedKeys: ReadonlySet<string>) {
+    const keys = await previewStore.keys().catch(() => []);
+    await deleteImagePreviews(keys.filter((key) => key.startsWith(prefix) && !usedKeys.has(key)));
+}
+
+async function loadImagePreview(key: string, source: string, epoch: number, url?: string, storageKey?: string, cachedOnly = false) {
+    const isCurrent = () => previewSources.get(key) === source && previewEpochs.get(key) === epoch;
+    await previewDeletes.get(key);
+    if (!isCurrent()) return undefined;
+
+    const stored = await previewStore.getItem<StoredImagePreview>(key).catch(() => null);
+    if (!isCurrent()) return undefined;
+
+    if (stored?.version === IMAGE_PREVIEW_VERSION && stored.source === source) {
+        return stored.blob ? cacheImagePreview(key, source, stored.blob) : undefined;
+    }
+    if (stored) await previewStore.removeItem(key).catch(() => undefined);
+    if (cachedOnly) return undefined;
+
+    return queueImagePreview(async () => {
+        if (!isCurrent()) return undefined;
+
+        const resolvedUrl = url || (storageKey ? await resolveImageUrl(storageKey, "") : "");
+        if (!resolvedUrl || isLocalImageSource(resolvedUrl) || isComfyImageSource(resolvedUrl) || !isCurrent()) return undefined;
+
+        const response = await fetch(getProxyUrl(resolvedUrl));
+        if (!response.ok || !isCurrent()) return undefined;
+        const blob = await response.blob();
+        const preview = await createImageThumbnail(blob);
+        if (!isCurrent()) return undefined;
+
+        await previewStore.setItem<StoredImagePreview>(key, {
+            version: IMAGE_PREVIEW_VERSION,
+            source,
+            blob: preview,
+        });
+        if (!isCurrent()) return undefined;
+        return preview ? cacheImagePreview(key, source, preview) : undefined;
+    });
+}
+
+function queueImagePreview<T>(task: () => Promise<T>) {
+    return new Promise<T>((resolve, reject) => {
+        const run = () => {
+            previewActive += 1;
+            void task()
+                .then(resolve, reject)
+                .finally(() => {
+                    previewActive -= 1;
+                    previewQueue.shift()?.();
+                });
+        };
+        if (previewActive < IMAGE_PREVIEW_CONCURRENCY) run();
+        else previewQueue.push(run);
+    });
+}
+
+function isLocalImageSource(source?: string) {
+    const value = source?.trim();
+    if (!value) return false;
+    const lower = value.toLowerCase();
+    return lower.startsWith("data:") || lower.startsWith("blob:") || lower.startsWith("image:") || (value.length > 256 && /^[a-z\d+/=\s]+$/i.test(value));
+}
+
+function isComfyImageSource(source?: string) {
+    if (!source) return false;
+    if (source.startsWith("comfy:")) return true;
+    try {
+        const parsed = new URL(source, "http://127.0.0.1:8189");
+        if (parsed.protocol === "https:") parsed.protocol = "http:";
+        return Boolean(comfyOutputStorageKey(parsed.href));
+    } catch {
+        return false;
+    }
+}
+
+function cacheImagePreview(key: string, source: string, blob: Blob) {
+    if (previewSources.get(key) !== source) return undefined;
+    const cached = previewUrls.get(key);
+    if (cached?.source === source) return cached.url;
+    if (cached) URL.revokeObjectURL(cached.url);
+    const url = URL.createObjectURL(blob);
+    previewUrls.set(key, { source, url });
+    notifyPreviewChange();
+    return url;
+}
+
+function removeCachedPreview(key: string, notify = true) {
+    const cached = previewUrls.get(key);
+    if (!cached) return false;
+    URL.revokeObjectURL(cached.url);
+    previewUrls.delete(key);
+    if (notify) notifyPreviewChange();
+    return true;
+}
+
+function notifyPreviewChange() {
+    previewRevision += 1;
+    previewListeners.forEach((listener) => listener());
+}
 
 export async function autoSyncToCloud<T extends { storageKey: string }>(source: string | Blob, upload: () => Promise<T | null>): Promise<T | null> {
     const requestOwnerId = getAccountOwnerId();
@@ -583,6 +773,7 @@ export function defaultUserStorageProvider(): UserS3StorageProvider {
         endpoint: "",
         region: "auto",
         bucket: "",
+        bucketInHost: false,
         accessKeyId: "",
         secretAccessKey: "",
         publicBaseUrl: "",
@@ -666,6 +857,7 @@ export function toProviderPayload(provider: UserStorageProvider) {
         endpoint: provider.endpoint,
         region: provider.region || "auto",
         bucket: provider.bucket,
+        bucketInHost: provider.bucketInHost,
         accessKeyId: provider.accessKeyId,
         secretAccessKey: provider.secretAccessKey,
         publicBaseUrl: provider.publicBaseUrl,

@@ -4,6 +4,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 import { nanoid } from "nanoid";
 import { getAccountOwnerId, getAccountStorageKey, GUEST_ACCOUNT_OWNER } from "@/lib/account-scope";
 import { localForageStorage } from "@/lib/localforage-storage";
+import { deleteImagePreviews } from "@/services/image-storage";
 import { listCanvasProjects, saveCanvasProject, syncCanvasProjects } from "@/services/api/canvas-tasks";
 import { fetchUserConfig } from "@/services/api/user-config";
 import { useUserStore } from "@/stores/use-user-store";
@@ -60,6 +61,8 @@ let accountCanvasSyncEnabled = false;
 let suppressCanvasPersistence = false;
 let canvasRehydratePromise: Promise<void> | null = null;
 const projectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const pendingProjectSaves = new Map<string, { token: string; ownerId: string; project: CanvasProject }>();
+const savingProjects = new Set<string>();
 
 function waitForUserStoreHydration() {
     if (useUserStore.persist.hasHydrated() && useUserStore.getState().isReady) return Promise.resolve();
@@ -79,33 +82,41 @@ function waitForUserStoreHydration() {
     });
 }
 
+async function flushProjectSave(id: string) {
+    if (savingProjects.has(id) || projectSaveTimers.has(id)) return;
+    const pending = pendingProjectSaves.get(id);
+    pendingProjectSaves.delete(id);
+    if (!pending || !accountCanvasSyncEnabled || useUserStore.getState().token !== pending.token || getAccountOwnerId() !== pending.ownerId) return;
+
+    savingProjects.add(id);
+    await saveCanvasProject(pending.token, pending.project).catch(() => undefined);
+    savingProjects.delete(id);
+    void flushProjectSave(id);
+}
+
 function queueProjectSave(project: CanvasProject) {
     const token = useUserStore.getState().token;
     const ownerId = getAccountOwnerId();
-    const syncEnabled = accountCanvasSyncEnabled;
     const previous = projectSaveTimers.get(project.id);
     if (previous) clearTimeout(previous);
-
+    projectSaveTimers.delete(project.id);
+    if (!token || !accountCanvasSyncEnabled) {
+        pendingProjectSaves.delete(project.id);
+        return;
+    }
+    pendingProjectSaves.set(project.id, { token, ownerId, project });
     projectSaveTimers.set(
         project.id,
         setTimeout(() => {
             projectSaveTimers.delete(project.id);
-            if (
-                !token ||
-                !syncEnabled ||
-                !accountCanvasSyncEnabled ||
-                useUserStore.getState().token !== token ||
-                getAccountOwnerId() !== ownerId
-            ) {
-                return;
-            }
-            void saveCanvasProject(token, project).catch(() => undefined);
+            void flushProjectSave(project.id);
         }, 400),
     );
 }
 
 function cancelProjectSaves(ids: string[]) {
     ids.forEach((id) => {
+        pendingProjectSaves.delete(id);
         const timer = projectSaveTimers.get(id);
         if (!timer) return;
         clearTimeout(timer);
@@ -303,6 +314,11 @@ export const useCanvasStore = create<CanvasStore>()(
             },
             deleteProjects: (ids) => {
                 cancelProjectSaves(ids);
+                void deleteImagePreviews(
+                    get().projects
+                        .filter((project) => ids.includes(project.id))
+                        .flatMap((project) => project.nodes.map((node) => `canvas-node:${project.id}:${node.id}`)),
+                );
                 set((state) => ({
                     projects: state.projects.filter(
                         (project) => !ids.includes(project.id),
@@ -399,7 +415,6 @@ export function mergeCanvasProjects(
             Date.parse(a.updatedAt || ""),
     );
 }
-
 export function rehydrateCanvasForCurrentAccount() {
     if (useCanvasStore.getState().hydrated) return Promise.resolve();
     if (!canvasRehydratePromise) {

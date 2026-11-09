@@ -40,6 +40,10 @@ func uploadReferences(comfy string, payload jsonMap) (map[string]string, error) 
 			if !ok {
 				continue
 			}
+			if filename := stringValue(media["filename"]); filename != "" {
+				files[stringValue(media["id"])] = filename
+				continue
+			}
 			data, mimeType, err := mediaBytes(media)
 			if err != nil {
 				return nil, err

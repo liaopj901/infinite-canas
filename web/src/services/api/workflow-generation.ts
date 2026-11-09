@@ -1,5 +1,6 @@
 import { readFileAsDataUrl } from "@/lib/image-utils";
 import type { WorkflowCapability, WorkflowRef } from "@/lib/workflow-channel";
+import { useConfigStore } from "@/stores/use-config-store";
 
 export type WorkflowRunInput = {
     ref: WorkflowRef;
@@ -123,11 +124,20 @@ export async function runWorkflowTask(token: string, input: WorkflowRunInput, si
     return task;
 }
 
-export async function workflowMediaSource(url: string): Promise<string> {
-    if (/^https:\/\//i.test(url) || url.startsWith("data:")) return url;
+export async function workflowMediaSource(url: string, ref?: WorkflowRef, provider?: "runninghub" | "comfyui"): Promise<string> {
+    const { config } = useConfigStore.getState();
+    const protocol = provider || (ref?.scope === "system" ? config.publicChannels : config.localChannels).find((channel) => channel.id === ref?.channelId)?.protocol;
+    const comfyVideo = Boolean(ref && protocol === "comfyui");
+    if (/^https:\/\//i.test(url) || !comfyVideo && url.startsWith("data:")) return url;
     if (!url) throw new Error("工作流素材地址为空");
     const response = await fetch(url);
     if (!response.ok) throw new Error(`读取工作流素材失败：${response.status}`);
     const blob = await response.blob();
+    if (comfyVideo) {
+        const uploaded = await fetch("http://127.0.0.1:8189/upload", { method: "POST", headers: { "Content-Type": blob.type || "video/mp4" }, body: blob });
+        const filename = await uploaded.text();
+        if (!uploaded.ok) throw new Error(filename || "ComfyUI 参考视频上传失败");
+        return filename;
+    }
     return readFileAsDataUrl(new File([blob], "workflow-media", { type: blob.type }), "读取素材失败：workflow-media");
 }

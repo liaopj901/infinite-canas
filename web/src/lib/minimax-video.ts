@@ -1,8 +1,9 @@
+import { miniMaxTtsModels } from "@/lib/minimax-tts";
 import { normalizeSeedanceRatio } from "@/lib/seedance-video";
 import { channelProtocolForConfig, type AiConfig } from "@/stores/use-config-store";
 
 export const MINIMAX_CHANNEL_PROTOCOL = "minimax" as const;
-export const miniMaxModels = ["MiniMax-H3"] as const;
+export const miniMaxModels = ["MiniMax-H3", ...miniMaxTtsModels] as const;
 
 export function isMiniMaxChannel(channel?: { protocol?: string }) {
     return channel?.protocol === MINIMAX_CHANNEL_PROTOCOL;

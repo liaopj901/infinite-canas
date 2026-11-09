@@ -1361,17 +1361,17 @@ async function createCanvasImageTaskRequest(config: AiConfig & { seedIndex?: num
     };
 }
 
-export async function requestImageQuestion(config: AiConfig, messages: ChatCompletionMessage[], onDelta: (text: string) => void) {
-    if (isGeminiConfig(config)) return requestGeminiText(config, messages, onDelta);
+export async function requestImageQuestion(config: AiConfig, messages: ChatCompletionMessage[], onDelta: (text: string) => void, signal?: AbortSignal) {
+    if (isGeminiConfig(config)) return requestGeminiText(config, messages, onDelta, signal);
     let answer = "";
 
     try {
-        await withTimeout(IMAGE_REQUEST_TIMEOUT_SECONDS, async (signal) => {
+        await withTimeout(IMAGE_REQUEST_TIMEOUT_SECONDS, async (requestSignal) => {
             const response = await fetch(aiApiUrl(config, "/chat/completions"), {
                 method: "POST",
-                headers: aiHeaders(config, "application/json"),
+                headers: { ...aiHeaders(config, "application/json"), ...(signal && usesAccountProxy(config) ? { "X-Canvas-Node-Request": "true" } : {}) },
                 body: JSON.stringify({ model: config.model, messages: withSystemMessage(config, messages), stream: true }),
-                signal,
+                signal: requestSignal,
             });
             if (!response.ok) {
                 const error = await fetchErrorDetail(response, "请求失败");
@@ -1404,7 +1404,7 @@ export async function requestImageQuestion(config: AiConfig, messages: ChatCompl
                 answer = content;
                 onDelta(answer);
             }
-        });
+        }, signal);
     } catch (error) {
         throw new Error(readAxiosError(error, "请求失败"));
     }
@@ -1499,7 +1499,7 @@ async function createGeminiImageBody(config: AiConfig, prompt: string, reference
         model: config.model,
         ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
         contents: [{ role: "user", parts }],
-        generationConfig: { responseModalities: ["TEXT", "IMAGE"], responseFormat: { image } },
+        generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: image },
     };
 }
 
@@ -1536,6 +1536,7 @@ function parseGeminiImages(payload: Record<string, unknown>) {
         const content = candidate.content && typeof candidate.content === "object" ? candidate.content as Record<string, unknown> : {};
         const parts = Array.isArray(content.parts) ? content.parts as Array<Record<string, unknown>> : [];
         return parts.flatMap((part) => {
+            if (part.thought === true) return [];
             const inlineData = part.inlineData && typeof part.inlineData === "object" ? part.inlineData as Record<string, unknown> : {};
             const data = typeof inlineData.data === "string" ? inlineData.data : "";
             if (!data) return [];
@@ -1547,14 +1548,15 @@ function parseGeminiImages(payload: Record<string, unknown>) {
     return images;
 }
 
-async function requestGeminiText(config: AiConfig, messages: ChatCompletionMessage[], onDelta: (text: string) => void) {
+async function requestGeminiText(config: AiConfig, messages: ChatCompletionMessage[], onDelta: (text: string) => void, signal?: AbortSignal) {
     const body = await createGeminiTextBody(config, withSystemMessage(config, messages));
     const proxy = usesAccountProxy(config);
     const channel = localChannelForActiveModel(config);
     const response = await fetch(proxy ? "/api/v1/chat/completions" : geminiActionUrl(channel?.baseUrl || config.baseUrl, config.model, "streamGenerateContent"), {
         method: "POST",
-        headers: proxy ? aiHeaders(config, "application/json") : geminiDirectHeaders(config),
+        headers: proxy ? { ...aiHeaders(config, "application/json"), ...(signal ? { "X-Canvas-Node-Request": "true" } : {}) } : geminiDirectHeaders(config),
         body: JSON.stringify(proxy ? body : withoutModel(body)),
+        signal,
     });
     if (!response.ok) {
         const error = await fetchErrorDetail(response, "请求失败");
@@ -1625,7 +1627,8 @@ function isAgnesImageModel(model: string) {
 }
 
 function isAgnesImage21Model(model: string) {
-    return model.toLowerCase().replace(/[\s_]+/g, "-") === "agnes-image-2.1-flash";
+    const m = model.toLowerCase().replace(/[\s_]+/g, "-");
+    return m.startsWith("agnes-image-2.1") || m.startsWith("agnes-image-2.5");
 }
 
 function normalizeAgnesImage21Ratio(value: string) {

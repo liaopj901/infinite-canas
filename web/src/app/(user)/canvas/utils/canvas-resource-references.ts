@@ -12,6 +12,7 @@ export type CanvasResourceReference = {
     label: string;
     title: string;
     previewUrl?: string;
+    previewSource?: string;
     text?: string;
     active: boolean;
 };
@@ -88,6 +89,7 @@ function labelResourceNodes(nodes: CanvasNodeData[], active: boolean) {
                 label,
                 title: node.title || label,
                 previewUrl: node.metadata?.content,
+                previewSource: `${node.metadata?.primaryImageId || ""}:${node.metadata?.imageTaskResultId || ""}:${node.metadata?.storageKey || node.metadata?.content || ""}`,
                 text: node.type === CanvasNodeType.Text ? node.metadata?.content || node.metadata?.prompt : undefined,
                 active,
             },

@@ -13,6 +13,8 @@ import { isGrok2APITtsConfig, normalizeGrokTtsFormat, normalizeGrokTtsLanguage, 
 import { isMimoPresetTtsModel, isMimoTtsModel, isMimoVoiceCloneModel, isMimoVoiceDesignModel, mimoTtsVoiceLabel, normalizeMimoTtsFormat } from "@/lib/mimo-tts";
 import { isGeminiConfig, isGeminiTtsModel } from "@/lib/gemini";
 import { normalizeGeminiTtsVoice } from "@/lib/gemini-tts";
+import { isMiniMaxTtsConfig, normalizeMiniMaxTtsFormat, normalizeMiniMaxTtsSpeed, normalizeMiniMaxTtsVoice } from "@/lib/minimax-tts";
+import { miniMaxTtsVoiceOptions } from "@/lib/minimax-tts-voices";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { AiConfig } from "@/stores/use-config-store";
 import { ResourceSinglePicker, type CanvasVideoResourceOption } from "./canvas-video-settings-popover";
@@ -127,6 +129,10 @@ function validCloneAudioNodeId(value: string | undefined, options: CanvasVideoRe
 function audioSettingsSummary(config: AiConfig, cloneAudioNodeId: string, audioOptions: CanvasVideoResourceOption[]) {
     const model = config.model || config.audioModel || "";
     if (isGeminiTtsModel(model) && isGeminiConfig(config, model)) return normalizeGeminiTtsVoice(config.geminiTtsVoice);
+    if (isMiniMaxTtsConfig(config, model)) {
+        const voice = normalizeMiniMaxTtsVoice(config.miniMaxTtsVoice);
+        return `${miniMaxTtsVoiceOptions.find((item) => item.value === voice)?.label || voice} · ${normalizeMiniMaxTtsFormat(config.miniMaxTtsFormat).toUpperCase()} · ${normalizeMiniMaxTtsSpeed(config.miniMaxTtsSpeed)}x`;
+    }
     if (isGlmTtsModel(model)) return `${glmTtsVoiceLabel(config.glmTtsVoice)} · ${normalizeGlmTtsFormat(config.glmTtsFormat).toUpperCase()} · ${normalizeGlmTtsSpeed(config.glmTtsSpeed)}x`;
     if (isGrok2APITtsConfig(config, model)) return `${config.grokTtsVoice || "eve"} · ${normalizeGrokTtsLanguage(config.grokTtsLanguage)} · ${normalizeGrokTtsFormat(config.grokTtsFormat).toUpperCase()} · ${normalizeGrokTtsSpeed(config.grokTtsSpeed)}x`;
     if (!isMimoTtsModel(model)) return `${audioVoiceLabel(config.audioVoice)} · ${audioFormatLabel(config.audioFormat)} · ${audioSpeedLabel(config.audioSpeed)}`;

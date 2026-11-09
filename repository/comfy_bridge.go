@@ -122,7 +122,7 @@ func DeleteComfyBridge(id, scope, ownerID string) ([]string, error) {
 		switch scope {
 		case "system":
 			var setting model.Setting
-			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&setting, "key = ?", model.SettingKeyPrivate).Error
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(map[string]any{"key": model.SettingKeyPrivate}).First(&setting).Error
 			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				return err
 			}
@@ -483,36 +483,19 @@ func MarkComfyBridgeRequestCleanupReadyByTaskID(
 	return update.RowsAffected > 0, update.Error
 }
 
-func CleanupComfyBridgeRequests(before, inspectBefore time.Time) (bool, error) {
+func CleanupComfyBridgeRequests(before, inspectBefore time.Time) error {
 	db, err := DB()
 	if err != nil {
-		return false, err
+		return err
 	}
-	hasPending := false
-	err = db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where(
-			"status IN ? AND cleanup_ready_at IS NOT NULL AND ((kind = ? AND cleanup_ready_at <= ?) OR (kind <> ? AND cleanup_ready_at <= ?))",
-			[]string{"succeeded", "failed"},
-			"inspect_workflow",
-			inspectBefore,
-			"inspect_workflow",
-			before,
-		).Delete(&model.ComfyBridgeRequest{}).Error; err != nil {
-			return err
-		}
-		var count int64
-		if err := tx.Model(&model.ComfyBridgeRequest{}).
-			Where(
-				"status IN ? AND cleanup_ready_at IS NOT NULL",
-				[]string{"succeeded", "failed"},
-			).
-			Count(&count).Error; err != nil {
-			return err
-		}
-		hasPending = count > 0
-		return nil
-	})
-	return hasPending, err
+	return db.Where(
+		"status IN ? AND cleanup_ready_at IS NOT NULL AND ((kind = ? AND cleanup_ready_at <= ?) OR (kind <> ? AND cleanup_ready_at <= ?))",
+		[]string{"succeeded", "failed"},
+		"inspect_workflow",
+		inspectBefore,
+		"inspect_workflow",
+		before,
+	).Delete(&model.ComfyBridgeRequest{}).Error
 }
 
 func ExpireComfyBridgeRequests(bridgeID string) ([]string, bool, error) {

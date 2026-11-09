@@ -168,6 +168,9 @@ var builtinAIProtocols = []aiProtocolAdapter{
 	{
 		id: service.ModelChannelProtocolMiniMax,
 		path: func(channel model.ModelChannel, modelName string, path string) (string, bool) {
+			if service.IsMiniMaxChannel(channel) && service.IsMiniMaxTTSModelName(modelName) && path == "/audio/speech" {
+				return "/v1/t2a_v2", true
+			}
 			if !isMiniMaxH3Channel(channel, modelName) {
 				return path, false
 			}
@@ -182,6 +185,8 @@ var builtinAIProtocols = []aiProtocolAdapter{
 			}
 			return path, true
 		},
+		prepare:      prepareMiniMaxTTSRequest,
+		copyResponse: copyMiniMaxTTSResponse,
 		videoResponse: func(payload []byte, request *http.Request, channel model.ModelChannel, modelName string, status bool) ([]byte, bool) {
 			if status && isMiniMaxH3Channel(channel, modelName) && strings.Contains(request.URL.Path, "/v2/query/video_generation/") {
 				return transformMiniMaxVideoTaskResponse(payload)

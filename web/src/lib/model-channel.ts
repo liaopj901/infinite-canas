@@ -4,6 +4,7 @@ export const modelChannelProtocols = [
     { value: "grok2api", label: "Grok2API", baseUrl: "" },
     { value: "minimax", label: "MiniMax & METASO", baseUrl: "https://metaso.cn/api/minimax", apiKeyUrl: "https://metaso.cn/minimax-h3/?s=tt" },
     { value: "apimart", label: "APIMart", baseUrl: "https://api.apimart.ai/v1", apiKeyUrl: "https://apimart.ai/register?aff=fWMrEv", directRequestPlan: true },
+    { value: "88api", label: "88API", baseUrl: "https://88api.ai/v1", apiKeyUrl: "https://88api.ai/sign-up?aff=25ty" },
     { value: "tokendance", label: "TokenDance", baseUrl: "https://tokendance.space/gateway/v1", directRequestPlan: true },
     { value: "runninghub", label: "RunningHub", baseUrl: "https://www.runninghub.cn" },
     { value: "comfyui", label: "ComfyUI", baseUrl: "" },

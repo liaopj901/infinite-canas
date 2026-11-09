@@ -57,6 +57,9 @@ export type AiConfig = {
     mimoTtsFormat: string;
     mimoVoiceDesignPrompt: string;
     geminiTtsVoice: string;
+    miniMaxTtsVoice: string;
+    miniMaxTtsFormat: string;
+    miniMaxTtsSpeed: string;
     videoSeconds: string;
     videoMode: string;
     videoNegativePrompt: string;
@@ -79,6 +82,7 @@ export type AiConfig = {
     videoSize: string;
     count: string;
     canvasImageCount: string;
+    nodeRegenerateBehavior: "new-node" | "overwrite";
     timeout: string;
     apiMode: string;
     streamImages: string;
@@ -131,6 +135,9 @@ export const defaultConfig: AiConfig = {
     mimoTtsFormat: "wav",
     mimoVoiceDesignPrompt: "",
     geminiTtsVoice: "Kore",
+    miniMaxTtsVoice: "female-yujie",
+    miniMaxTtsFormat: "mp3",
+    miniMaxTtsSpeed: "1",
     videoSeconds: "6",
     videoMode: "std",
     videoNegativePrompt: "",
@@ -153,6 +160,7 @@ export const defaultConfig: AiConfig = {
     videoSize: "1280x720",
     count: "1",
     canvasImageCount: "1",
+    nodeRegenerateBehavior: "new-node",
     timeout: "600",
     apiMode: "images",
     streamImages: "",
@@ -228,7 +236,8 @@ function resolveEffectiveConfig(config: AiConfig, modelChannel: AdminPublicSetti
         videoModel: videoModels.includes(config.videoModel) ? config.videoModel : fallbackVideoModel,
         textModel: textModels.includes(config.textModel) ? config.textModel : fallbackTextModel || fallbackModel,
         audioModel: audioModels.includes(config.audioModel) ? config.audioModel : fallbackAudioModel,
-        systemPrompt: modelChannel.systemPrompt,
+        systemPrompt: "",
+        systemPrompts: { ...defaultConfig.systemPrompts, ...(modelChannel.systemPrompts || {}) },
         publicChannels: modelChannel.channels || [],
     };
 }
@@ -456,7 +465,7 @@ export const useConfigStore = create<ConfigStore>()(
                         glmTtsFormat: config.glmTtsFormat || defaultConfig.glmTtsFormat,
                         glmTtsSpeed: config.glmTtsSpeed || defaultConfig.glmTtsSpeed,
                         geminiTtsVoice: config.geminiTtsVoice || defaultConfig.geminiTtsVoice,
-                        systemPrompts: config.systemPrompts?.image ? config.systemPrompts : defaultConfig.systemPrompts,
+                        systemPrompts: { ...defaultConfig.systemPrompts, ...(config.systemPrompts || {}) },
                         audioInstructions: config.audioInstructions || "",
                         videoSeconds: config.videoSeconds || "6",
                         videoMode: config.videoMode || "std",

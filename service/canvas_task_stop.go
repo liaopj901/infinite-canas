@@ -76,12 +76,15 @@ func StopCanvasTask(userID, kind, id string, workflow bool, source string) (bool
 		stamp := current.Format(time.RFC3339Nano)
 		task = &model.VideoTask{ID: id, UserID: userID, Source: source, Status: "cancelled", CreatedAt: stamp, UpdatedAt: stamp, CompletedAt: stamp}
 	}
-	stopped, err := repository.StopCanvasTask(userID, id, source, task, current)
+	stopped, comfyCleanup, err := repository.StopCanvasTask(userID, id, source, task, current)
 	if err != nil {
 		return false, err
 	}
 	if stopped {
 		CancelCanvasTaskRun(kind, userID, id)
+		if comfyCleanup {
+			WakeComfyBridgePoller()
+		}
 	}
 	return stopped, nil
 }

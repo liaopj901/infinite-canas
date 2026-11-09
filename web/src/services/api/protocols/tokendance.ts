@@ -15,7 +15,7 @@ function splitTaskID(value: string) {
         : { protocol: value.slice(0, index), taskId: value.slice(index + TASK_SEPARATOR.length) };
 }
 
-function gatewayURL(baseUrl: string, path: string) {
+export function tokenDanceGatewayURL(baseUrl: string, path: string) {
     let base = baseUrl.trim().replace(/\/+$/, "");
     if (/\/v1$/i.test(base)) base = base.slice(0, -3).replace(/\/+$/, "");
     return `${base}${path}`;
@@ -121,7 +121,7 @@ export const tokenDanceDirectProtocol: DirectProtocolAdapter = {
         return pollPath(protocol, id);
     },
     pollURL(baseUrl, pollId) {
-        return gatewayURL(baseUrl, this.pollPath(pollId));
+        return tokenDanceGatewayURL(baseUrl, this.pollPath(pollId));
     },
     readTaskId: taskId,
     readCreatedImageURLs: imageURLs,

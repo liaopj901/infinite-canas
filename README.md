@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/tigerowo/infinite-canvas"><img src="https://img.shields.io/github/stars/tigerowo/infinite-canvas?style=flat-square&logo=github" alt="GitHub stars"></a>
-  <a href="VERSION"><img src="https://img.shields.io/badge/version-v0.8.1-2563eb?style=flat-square" alt="Version"></a>
+  <a href="VERSION"><img src="https://img.shields.io/badge/version-v0.8.4-2563eb?style=flat-square" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-f97316?style=flat-square" alt="License"></a>
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-ready-2496ed?style=flat-square&logo=docker&logoColor=white" alt="Docker ready"></a>
   <a href="https://nextjs.org/"><img src="https://img.shields.io/badge/Next.js-16.2-000000?style=flat-square&logo=nextdotjs" alt="Next.js"></a>
@@ -42,6 +42,14 @@
     </td>
     <td>
       <strong>观猹 × TokenDance｜从产品诞生到持续增长</strong> 观猹是面向 AI 产品与 AI Builder 的产品社区和创新生态，帮助好产品找到真正懂它的用户。同时，<a href="https://tokendance.space/" target="_blank" rel="noopener noreferrer">TokenDance</a> 为开发者提供统一、低成本的多模型调用入口，并通过“百亿 Token 补贴”“开发者计划”等福利降低早期产品的模型调用成本。观猹与 TokenDance 希望让每一个想法都能更轻松地从 Demo 走向真实世界。
+    </td>
+  </tr>
+  <tr>
+    <td width="190" align="center">
+      <a href="https://88api.ai/sign-up?aff=25ty" target="_blank" rel="noopener"><img src="assets/88.webp" width="128" alt="88API"></a>
+    </td>
+    <td>
+      <strong>88API｜无限画布</strong> 让各大主流模型能力结合得更紧密。 🎨 支持 <strong>GPT-Image、Gemini、Grok</strong> 等图片模型；🎬 支持 <strong>Seedance、Wan、H3、Kling、Grok</strong> 等视频模型；🎙️ 支持 <strong>Whisper、TTS</strong> 等语音能力。从文案、出图、改图，到视频生成与配音，一张画布串联完整创作链路。不只是模型聚合，更让不同模型在同一工作流中真正协同。 🎁 通过 <a href="https://88api.ai/sign-up?aff=25ty">无限画布专属链接注册</a>，即可领取赠送额度及专属优惠。
     </td>
   </tr>
   <tr>

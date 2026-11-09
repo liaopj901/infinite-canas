@@ -5,6 +5,7 @@ import { translationPrograms, translationVariableNames, type TranslationVariable
 import { channelIdForActiveModel, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 import { useChannelTranslationStore } from "@/stores/use-channel-translation-store";
 import { useUserStore } from "@/stores/use-user-store";
+import { uploadMediaFile } from "@/services/file-storage";
 import { WorkflowRequestError } from "./workflow-generation";
 
 export type TranslationInput = { kind: "image" | "video" | "audio"; variables: TranslationVariables };
@@ -215,8 +216,12 @@ export class BrowserParameterTranslation {
             if (binary) {
                 blob ||= await response.blob();
                 if (!blob.size) throw new Error("接口返回了空媒体文件");
-                urls = [await readFileAsDataUrl(new File([blob], "media", { type: resultMime }))];
+                if (this.input.kind !== "video") urls = [await readFileAsDataUrl(new File([blob], "media", { type: resultMime }))];
             } else urls = translationMediaURLs(result.value, this.input.kind, resultMime);
+        }
+        if (this.input.kind === "video" && result.status === "completed" && (binary || urls[0]?.startsWith("data:video/"))) {
+            const media = await uploadMediaFile(binary ? new Blob([blob!], { type: resultMime }) : urls[0], "generated-video");
+            return { status: result.status, progress: result.progress, urls: [media.url], storageKey: media.storageKey };
         }
         if (this.input.kind === "video" && result.status === "completed" && !binary) {
             const source = new URL(url);

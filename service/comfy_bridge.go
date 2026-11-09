@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,8 +21,51 @@ import (
 
 const comfyBridgeLeaseDuration = 90 * time.Second
 const comfyBridgeInspectTimeout = 30 * time.Second
+const comfyBridgePollInterval = 5 * time.Second
+const comfyBridgeFinishedRetention = 10 * time.Minute
 
 var ErrComfyBridgeLeaseLost = repository.ErrComfyBridgeLeaseLost
+
+var comfyBridgePollerOnce sync.Once
+var comfyBridgePollWake = make(chan struct{}, 1)
+
+func WakeComfyBridgePoller() {
+	comfyBridgePollerOnce.Do(func() {
+		go runComfyBridgePoller()
+	})
+	select {
+	case comfyBridgePollWake <- struct{}{}:
+	default:
+	}
+}
+
+func runComfyBridgePoller() {
+	for range comfyBridgePollWake {
+		ticker := time.NewTicker(comfyBridgePollInterval)
+		for {
+			current := time.Now()
+			hasComfyTasks, comfyErr := expireComfyBridgeRequests("")
+			if comfyErr != nil {
+				log.Printf("expire Comfy Bridge requests failed err=%v", comfyErr)
+			}
+			cleanupErr := repository.CleanupComfyBridgeRequests(
+				current.Add(-comfyBridgeFinishedRetention),
+				current.Add(-comfyBridgeInspectTimeout),
+			)
+			if cleanupErr != nil {
+				log.Printf("cleanup Comfy Bridge requests failed err=%v", cleanupErr)
+			}
+			if !hasComfyTasks && comfyErr == nil && cleanupErr == nil {
+				break
+			}
+			select {
+			case <-comfyBridgePollWake:
+			case <-ticker.C:
+			}
+		}
+		ticker.Stop()
+	}
+}
 
 type ComfyBridgeSummary struct {
 	ID           string         `json:"id"`
@@ -109,7 +153,7 @@ func DeleteComfyBridge(scope, ownerID, id string) error {
 			log.Printf("mark deleted Comfy Bridge request cleanup failed bridge=%s task=%s err=%v", id, taskID, err)
 		}
 	}
-	WakeVideoTaskPoller()
+	WakeComfyBridgePoller()
 	return nil
 }
 
@@ -195,7 +239,7 @@ func expireComfyBridgeRequests(bridgeID string) (bool, error) {
 		}
 	}
 	if len(taskIDs) > 0 {
-		WakeVideoTaskPoller()
+		WakeComfyBridgePoller()
 	}
 	return hasActive, nil
 }
@@ -295,7 +339,7 @@ func ConfirmComfyBridgeResultCleanup(
 		leaseToken,
 	)
 	if err == nil && confirmed {
-		WakeVideoTaskPoller()
+		WakeComfyBridgePoller()
 	}
 	return confirmed, err
 }
@@ -373,9 +417,7 @@ func QueueComfyBridge(scope, ownerID, bridgeID, taskID, kind string, payload map
 	if err := repository.SaveComfyBridgeRequest(request); err != nil {
 		return model.ComfyBridgeRequest{}, err
 	}
-	if taskID != "" {
-		WakeVideoTaskPoller()
-	}
+	WakeComfyBridgePoller()
 	return request, nil
 }
 

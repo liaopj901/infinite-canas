@@ -3,6 +3,7 @@
 import {
     AlertCircle,
     BookOpen,
+    Brush,
     CheckSquare,
     ChevronDown,
     ChevronUp,
@@ -25,7 +26,7 @@ import {
     Upload,
     WandSparkles,
 } from "lucide-react";
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Image, Input, Modal, Segmented, Tag, Typography } from "antd";
 import localforage from "localforage";
 import { saveAs } from "file-saver";
@@ -34,7 +35,9 @@ import { ImageSettingsPanel, imageFormatLabel, imageQualityLabel, imageSizeLabel
 import { ModelPicker } from "@/components/model-picker";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/app/(user)/canvas/components/asset-picker-modal";
+import { CanvasNodeMaskEditDialog, type CanvasImageMaskEditPayload } from "@/app/(user)/canvas/components/canvas-node-mask-edit-dialog";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { IMAGE_MASK_EDIT_PROMPT_PREFIX } from "@/lib/image-reference-prompt";
 import {
     CreativeWorkflowWorkspace,
     type WorkflowExternalTaskFailure,
@@ -49,7 +52,8 @@ import { ImageRequestError, batchCanvasImageTaskStatus, createCanvasImageTask, d
 import { comfyOutputStorageKey, getWorkflowTask, isRetryableWorkflowError, submitWorkflowTask } from "@/services/api/workflow-generation";
 import { parseWorkflowRef, type WorkflowRef } from "@/lib/workflow-channel";
 import { deleteImageGenerationLogs, fetchImageGenerationLogs, saveImageGenerationLogs } from "@/services/api/generation-logs";
-import { deleteStoredImages, imageToDataUrl, loadStorageConfig, resolveImageUrl, saveGeneratedImage, shouldAutoSyncGeneratedMedia, uploadGeneratedImageToCloud, uploadImage, uploadRemoteImageToServer } from "@/services/image-storage";
+import { deleteImagePreviews, deleteStoredImages, deleteUnusedImagePreviews, ensureImagePreview, getImagePreviewRevision, imageToDataUrl, previewUrlFor, resolveImageUrl, subscribeImagePreviews, uploadImage, uploadRemoteImageToServer } from "@/services/image-storage";
+import { loadStorageConfig, saveGeneratedImage, shouldAutoSyncGeneratedMedia, uploadGeneratedImageToCloud } from "@/services/image-storage";
 import { getAccountRecordStorageKey, getAccountStorageKey, getAccountOwnerId } from "@/lib/account-scope";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useUserStore } from "@/stores/use-user-store";
@@ -170,6 +174,7 @@ export default function ImagePage() {
     const [workbenchLayout, setWorkbenchLayoutState] = useState<WorkbenchLayout>("side");
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
+    const [maskEditTarget, setMaskEditTarget] = useState<{ image: GeneratedImage; model: string; channelId: string; quality: string; size: string; open: boolean } | null>(null);
     const [workflowDrawerOpen, setWorkflowDrawerOpen] = useState(false);
     const [selectedLogIds, setSelectedLogIds] = useState<string[]>([]);
     const [previewLog, setPreviewLog] = useState<GenerationLog | null>(null);
@@ -183,6 +188,7 @@ export default function ImagePage() {
     const pollingLogIdsRef = useRef(new Set<string>());
     const generationAbortControllersRef = useRef(new Map<string, AbortController>());
     const cancelledGenerationIdsRef = useRef(new Set<string>());
+    const pollContextRef = useRef<WorkflowPollContext | null>(null);
     const logsRef = useRef<GenerationLog[]>([]);
     const effectiveConfigRef = useRef(effectiveConfig);
 
@@ -241,6 +247,12 @@ export default function ImagePage() {
     }, [effectiveConfig]);
 
     useEffect(() => {
+        const controller = new AbortController();
+        pollContextRef.current = { token: token || "", signal: controller.signal };
+        return () => controller.abort();
+    }, [token, userId]);
+
+    useEffect(() => {
         restorePendingLogResults(logs);
     }, [logs]);
 
@@ -288,15 +300,11 @@ export default function ImagePage() {
     }, [pendingCount, pendingLogCount]);
 
     useEffect(() => {
-        if (!pendingLogCount) return;
-        const controller = new AbortController();
-        const context = { token: token || "", signal: controller.signal };
+        const context = pollContextRef.current;
+        if (!pendingLogCount || !context) return;
         pollPendingLogsOnce(logsRef.current, context);
         const timer = window.setInterval(() => pollPendingLogsOnce(logsRef.current, context), IMAGE_TASK_POLL_INTERVAL_MS);
-        return () => {
-            controller.abort();
-            window.clearInterval(timer);
-        };
+        return () => window.clearInterval(timer);
     }, [pendingLogCount, token, userId]);
 
     const setWorkbenchLayout = (layout: WorkbenchLayout) => {
@@ -486,6 +494,43 @@ export default function ImagePage() {
         })();
         saveLogChainRef.current = discard.then(() => undefined);
         return discard;
+    };
+
+    const openMaskEdit = (log: GenerationLog, image: GeneratedImage) => {
+        const nextModel = log.config.imageModel || log.model || model;
+        setMaskEditTarget({
+            image,
+            model: nextModel,
+            channelId: resolveImageChannelId(effectiveConfig, nextModel, imageTaskChannelId(log.task), log.config.imageChannelId, log.config.activeChannelId),
+            quality: log.config.quality || "auto",
+            size: log.config.size || "auto",
+            open: true,
+        });
+    };
+
+    const submitMaskEdit = async (payload: CanvasImageMaskEditPayload) => {
+        const target = maskEditTarget;
+        if (!target) return;
+        try {
+            const snapshot = buildRequestSnapshot({
+                promptText: `${IMAGE_MASK_EDIT_PROMPT_PREFIX}${payload.prompt.trim()}`,
+                taskCount: 1,
+                configOverride: {
+                    imageModel: payload.model || target.model,
+                    imageChannelId: payload.channelId || target.channelId,
+                    quality: target.quality,
+                    size: target.size,
+                },
+                workflowRef: null,
+            });
+            if (!snapshot) return;
+            setMaskEditTarget((value) => value ? { ...value, open: false } : value);
+            const stored = await uploadImage(payload.markedDataUrl);
+            const markedReference = { id: nanoid(), name: "mask-edit.png", type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey, temporary: true };
+            await submitGenerationBatch({ ...snapshot, references: [markedReference] });
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "局部重绘失败");
+        }
     };
 
     const submitPersistentGenerationBatch = async (snapshot: RequestSnapshot) => {
@@ -895,13 +940,17 @@ export default function ImagePage() {
         const deletedLogs = logs.filter((log) => selectedLogIds.includes(log.id));
         const nextLogs = logs.filter((log) => !selectedLogIds.includes(log.id));
         const imageKeys = disposableLogStorageKeys(deletedLogs, nextLogs);
-        await Promise.all([deleteBackendImageTasks(deletedLogs, ownerId, taskToken), deleteAccountImageLogs(deletedLogs, ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), ...deletedLogs.map((log) => logStore.removeItem(imageLogStorageKey(log.id, ownerId)))]);
+        const previewKeys = deletedLogs.flatMap((log) => log.images.map((image) => `image-result:${image.id}`));
+        await Promise.all([deleteBackendImageTasks(deletedLogs, ownerId, taskToken), deleteAccountImageLogs(deletedLogs, ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), deleteImagePreviews(previewKeys), ...deletedLogs.map((log) => logStore.removeItem(imageLogStorageKey(log.id, ownerId)))]);
         if (!isCurrentAccount()) return;
-        // 删除已经落地后立即关闭弹窗并清空选择，避免刷新失败时用户重复提交同一批删除。
         setDeleteConfirmOpen(false);
         setSelectedLogIds([]);
         setLogs(nextLogs);
         setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
+        if (previewLog && selectedLogIds.includes(previewLog.id)) {
+            setPreviewLog(null);
+            setResults((value) => value.filter((item) => item.status === "pending"));
+        }
         await persistImageHistory(nextLogs, categories, ownerId, taskToken);
         if (!isCurrentAccount()) return;
         await refreshLogs(ownerId, taskToken);
@@ -921,7 +970,8 @@ export default function ImagePage() {
                 if (!isCurrentAccount()) return;
                 const nextLogs = logs.filter((item) => item.id !== log.id);
                 const imageKeys = disposableLogStorageKeys([log], nextLogs);
-                await Promise.all([deleteBackendImageTasks([log], ownerId, taskToken), deleteAccountImageLogs([log], ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), logStore.removeItem(imageLogStorageKey(log.id, ownerId))]);
+                const previewKeys = log.images.map((image) => `image-result:${image.id}`);
+                await Promise.all([deleteBackendImageTasks([log], ownerId, taskToken), deleteAccountImageLogs([log], ownerId, taskToken), deleteStoredImages(imageKeys, { ownerId, token: taskToken }), deleteImagePreviews(previewKeys), logStore.removeItem(imageLogStorageKey(log.id, ownerId))]);
                 if (!isCurrentAccount()) return;
                 setLogs(nextLogs);
                 setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
@@ -1463,6 +1513,7 @@ export default function ImagePage() {
                             onRetryLog={(log) => void retryLog(log)}
                             onCopyPrompt={copyPrompt}
                             onEdit={addResultToReferences}
+                            onMaskEdit={openMaskEdit}
                             onDownload={downloadImage}
                             onSaveAsset={saveResultToAssets}
                             syncingImageIds={syncingImageIds}
@@ -1500,6 +1551,7 @@ export default function ImagePage() {
                             onRetryLog={(log) => void retryLog(log)}
                             onCopyPrompt={copyPrompt}
                             onEdit={addResultToReferences}
+                            onMaskEdit={openMaskEdit}
                             onDownload={downloadImage}
                             onSaveAsset={saveResultToAssets}
                             syncingImageIds={syncingImageIds}
@@ -1593,6 +1645,19 @@ export default function ImagePage() {
             />
             <PromptSelectDialog open={promptDialogOpen} onOpenChange={setPromptDialogOpen} onSelect={setPrompt} />
             <AssetPickerModal open={assetPickerOpen} defaultTab="my-assets" onInsert={(payload) => void insertPickedAsset(payload)} onClose={() => setAssetPickerOpen(false)} />
+            {maskEditTarget ? (
+                <CanvasNodeMaskEditDialog
+                    dataUrl={maskEditTarget.image.dataUrl}
+                    open={maskEditTarget.open}
+                    config={effectiveConfig}
+                    model={maskEditTarget.model}
+                    channelId={maskEditTarget.channelId}
+                    onModelChange={(nextModel, channelId) => setMaskEditTarget((value) => value ? { ...value, model: nextModel, channelId: channelId || "" } : value)}
+                    onMissingConfig={() => openConfigDialog(true)}
+                    onClose={() => setMaskEditTarget((value) => value ? { ...value, open: false } : value)}
+                    onConfirm={(payload) => void submitMaskEdit(payload)}
+                />
+            ) : null}
             <Modal title="删除生成记录" open={deleteConfirmOpen} onCancel={() => setDeleteConfirmOpen(false)} onOk={deleteSelectedLogs} okText="删除" okButtonProps={{ danger: true }} cancelText="取消">
                 确定删除选中的 {selectedLogIds.length} 条生成记录吗？
             </Modal>
@@ -1602,9 +1667,9 @@ export default function ImagePage() {
 
 const quickQualityOptions = [
     { value: "auto", label: "自动" },
-    { value: "high", label: "高" },
-    { value: "medium", label: "中" },
-    { value: "low", label: "低" },
+    { value: "high", label: "高 · 4K" },
+    { value: "medium", label: "中 · 2K" },
+    { value: "low", label: "低 · 1K" },
 ];
 
 function WorkbenchPanel({
@@ -1917,6 +1982,7 @@ function ResultsPanel({
     onRetryLog,
     onCopyPrompt,
     onEdit,
+    onMaskEdit,
     onDownload,
     onSaveAsset,
     syncingImageIds,
@@ -1950,6 +2016,7 @@ function ResultsPanel({
     onRetryLog: (log: GenerationLog) => void;
     onCopyPrompt: (text: string) => void | Promise<void>;
     onEdit: (image: GeneratedImage, index: number) => void;
+    onMaskEdit: (log: GenerationLog, image: GeneratedImage) => void;
     onDownload: (image: GeneratedImage, index: number) => void;
     onSaveAsset: (image: GeneratedImage, index: number) => void;
     syncingImageIds: string[];
@@ -1961,6 +2028,7 @@ function ResultsPanel({
     const { message } = App.useApp();
     const [creatingCategory, setCreatingCategory] = useState(false);
     const [categoryName, setCategoryName] = useState("");
+    useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision, getImagePreviewRevision);
     const liveImageIds = new Set(results.map((result) => result.image?.id).filter((id): id is string => Boolean(id)));
     const liveLogIds = new Set(results.flatMap(imageResultIdentityKeys));
     const baseVisibleLogs = logs.filter((log) => !imageLogIdentityKeys(log).some((key) => liveLogIds.has(key)) && !log.images.some((image) => liveImageIds.has(image.id)));
@@ -1970,6 +2038,7 @@ function ResultsPanel({
     const totalCount = results.length + (resultViewMode === "category" ? (activeCategoryId ? visibleLogs.length : categories.length + visibleLogs.length) : visibleLogs.length);
     const shouldShowGrid = totalCount > 0;
     const allVisibleLogsSelected = Boolean(visibleLogs.length) && visibleLogs.every((log) => selectedLogIds.includes(log.id));
+    const selectedImages = visibleLogs.flatMap((log) => selectedLogIds.includes(log.id) ? log.images.filter((image) => Boolean(image.dataUrl)) : []);
     const toggleVisibleLogs = () => onSelectedLogIdsChange(allVisibleLogsSelected ? selectedLogIds.filter((id) => !visibleLogs.some((log) => log.id === id)) : Array.from(new Set([...selectedLogIds, ...visibleLogs.map((log) => log.id)])));
     const createCategory = async () => {
         const name = categoryName.trim();
@@ -1986,6 +2055,11 @@ function ResultsPanel({
     useEffect(() => {
         if (activeCategoryId && !categories.some((category) => category.id === activeCategoryId)) onActiveCategoryChange(null);
     }, [activeCategoryId, categories, onActiveCategoryChange]);
+
+    useEffect(() => {
+        [...results.flatMap((result) => result.image ? [result.image] : []), ...logs.flatMap((log) => log.images)]
+            .forEach((image) => void ensureImagePreview(`image-result:${image.id}`, image.dataUrl, image.storageKey));
+    }, [logs, results]);
 
     return (
         <div className={`thin-scrollbar rounded-lg border border-stone-200 bg-card p-4 shadow-sm dark:border-stone-800 lg:min-h-0 lg:overflow-y-auto lg:p-5 ${className}`}>
@@ -2022,6 +2096,9 @@ function ResultsPanel({
                     </Button>
                     <Button size="small" icon={<CheckSquare className="size-3.5" />} disabled={!visibleLogs.length} onClick={toggleVisibleLogs}>
                         {allVisibleLogsSelected ? "取消" : "全选"}
+                    </Button>
+                    <Button size="small" icon={<Download className="size-3.5" />} disabled={!selectedImages.length} onClick={() => selectedImages.forEach(onDownload)}>
+                        下载
                     </Button>
                     <Button size="small" danger icon={<Trash2 className="size-3.5" />} disabled={!selectedLogIds.length} onClick={onDeleteSelected}>
                         删除
@@ -2071,6 +2148,7 @@ function ResultsPanel({
                             onRetry={() => onRetryLog(log)}
                             onCopyPrompt={onCopyPrompt}
                             onEdit={onEdit}
+                            onMaskEdit={(image) => onMaskEdit(log, image)}
                             onDownload={onDownload}
                             onSaveAsset={onSaveAsset}
                             syncing={syncingImageIds.includes(log.images.find((image) => Boolean(image.dataUrl))?.id || "")}
@@ -2128,7 +2206,7 @@ function CategoryCard({
                         {images.map((image, index) => (
                             <img
                                 key={`${image.id}-${index}`}
-                                src={image.dataUrl}
+                                src={previewUrlFor(`image-result:${image.id}`, image.storageKey || image.dataUrl) || image.dataUrl}
                                 alt=""
                                 className={`${images.length === 1 ? "inset-0 size-full rounded-none border-0" : "h-[92%] w-[86%] rounded-lg border border-white/80 dark:border-stone-900"} absolute object-cover shadow-xl transition-transform duration-200 group-hover:scale-[1.02]`}
                                 style={{
@@ -2229,7 +2307,7 @@ function ResultImageCard({
                         <span>{image.storageMessage || "图片已被清理"}</span>
                     </div>
                 ) : (
-                    <Image src={image.dataUrl} alt={`生成结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                    <Image src={previewUrlFor(`image-result:${image.id}`, image.storageKey || image.dataUrl) || image.dataUrl} preview={{ src: image.dataUrl }} alt={`生成结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
                 )}
             </div>
             <TaskInfo result={result} onCopyPrompt={onCopyPrompt} />
@@ -2358,6 +2436,7 @@ function HistoryLogCard({
     onRetry,
     onCopyPrompt,
     onEdit,
+    onMaskEdit,
     onDownload,
     onSaveAsset,
     syncing,
@@ -2377,6 +2456,7 @@ function HistoryLogCard({
     onRetry: () => void;
     onCopyPrompt: (text: string) => void | Promise<void>;
     onEdit: (image: GeneratedImage, index: number) => void;
+    onMaskEdit: (image: GeneratedImage) => void;
     onDownload: (image: GeneratedImage, index: number) => void;
     onSaveAsset: (image: GeneratedImage, index: number) => void;
     syncing: boolean;
@@ -2435,7 +2515,7 @@ function HistoryLogCard({
                             <span>{firstImage.storageMessage || "图片已被清理"}</span>
                         </div>
                     ) : firstImage.dataUrl ? (
-                        <Image src={firstImage.dataUrl} alt={`历史结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                        <Image src={previewUrlFor(`image-result:${firstImage.id}`, firstImage.storageKey || firstImage.dataUrl) || firstImage.dataUrl} preview={{ src: firstImage.dataUrl }} alt={`历史结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
                     ) : (
                         <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-red-500">
                             <AlertCircle className="size-7" />
@@ -2451,7 +2531,7 @@ function HistoryLogCard({
                 {displayImages.length > 1 ? (
                     <div className="absolute bottom-1.5 left-1.5 right-1.5 flex gap-1 overflow-hidden">
                         {displayImages.slice(0, 4).map((image) => (
-                            <img key={image.id} src={image.dataUrl} alt="" className="size-8 shrink-0 rounded border border-white/80 object-cover shadow-sm dark:border-stone-900/80" />
+                            <img key={image.id} src={previewUrlFor(`image-result:${image.id}`, image.storageKey || image.dataUrl) || image.dataUrl} alt="" className="size-8 shrink-0 rounded border border-white/80 object-cover shadow-sm dark:border-stone-900/80" />
                         ))}
                     </div>
                 ) : null}
@@ -2500,13 +2580,18 @@ function HistoryLogCard({
                 ) : null}
             </div>
             <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-2 border-t border-stone-200 px-2.5 py-2 dark:border-stone-800">
-                <div ref={categoryMenuRef} className="relative flex flex-wrap gap-1">
+                <div ref={categoryMenuRef} className="relative flex flex-wrap gap-1 2xl:w-full 2xl:flex-nowrap 2xl:[&>.ant-btn]:!gap-1 2xl:[&>.ant-btn]:!px-1">
                     <Button size="small" onClick={() => closeThen(onPreview)}>
                         载入
                     </Button>
                     <Button size="small" icon={<RotateCcw className="size-3.5" />} onClick={() => closeThen(onRetry)}>
                         重试
                     </Button>
+                    {firstImage ? (
+                        <Button size="small" icon={<Brush className="size-3.5" />} onClick={() => closeThen(() => onMaskEdit(firstImage))}>
+                            局部重绘
+                        </Button>
+                    ) : null}
                     <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => setCategoryOpen((value) => !value)}>
                         分类
                     </Button>
@@ -2936,6 +3021,10 @@ async function replaceStoredImageHistory(logs: GenerationLog[], categories: Gene
     await Promise.all(ownedKeys.map((key) => logStore.removeItem(key)));
     await Promise.all(logs.map((log) => logStore.setItem(imageLogStorageKey(log.id, ownerId), serializeLog(log))));
     await categoryStore.setItem(imageCategoryStorageKey(ownerId), categories);
+    await deleteUnusedImagePreviews(
+        "image-result:",
+        new Set(logs.flatMap((log) => log.images.map((image) => `image-result:${image.id}`))),
+    );
 }
 
 function withWorkflowLogCategories(logs: GenerationLog[], categories: GenerationCategory[]) {
@@ -3050,6 +3139,11 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
             });
         }
     }
+    await Promise.all(
+        visibleImages.map((image) =>
+            ensureImagePreview(`image-result:${image.id}`, image.dataUrl, image.storageKey, image.storageKey || image.dataUrl, true),
+        ),
+    );
     const config = normalizeLogConfig(log);
     return {
         id: log.id || nanoid(),

@@ -180,13 +180,13 @@ func normalizePublicSettingWithChannels(setting model.PublicSetting, channels []
 		setting.ModelChannel.Channels = []model.PublicModelChannelInfo{}
 	}
 	if strings.TrimSpace(setting.ModelChannel.SystemPrompts.Image) == "" {
-		setting.ModelChannel.SystemPrompts.Image = firstNonEmpty(setting.ModelChannel.SystemPrompt, DefaultSystemPrompts().Image)
+		setting.ModelChannel.SystemPrompts.Image = DefaultSystemPrompts().Image
 	}
 	if strings.TrimSpace(setting.ModelChannel.SystemPrompts.Video) == "" {
 		setting.ModelChannel.SystemPrompts.Video = DefaultSystemPrompts().Video
 	}
 	if strings.TrimSpace(setting.ModelChannel.SystemPrompts.Text) == "" {
-		setting.ModelChannel.SystemPrompts.Text = firstNonEmpty(setting.ModelChannel.SystemPrompt, DefaultSystemPrompts().Text)
+		setting.ModelChannel.SystemPrompts.Text = DefaultSystemPrompts().Text
 	}
 	if strings.TrimSpace(setting.ModelChannel.SystemPrompts.Workflow) == "" {
 		setting.ModelChannel.SystemPrompts.Workflow = DefaultSystemPrompts().Workflow
@@ -196,6 +196,7 @@ func normalizePublicSettingWithChannels(setting model.PublicSetting, channels []
 	}
 	for i := range setting.ModelChannel.ModelCosts {
 		setting.ModelChannel.ModelCosts[i].Model = strings.TrimSpace(setting.ModelChannel.ModelCosts[i].Model)
+		setting.ModelChannel.ModelCosts[i].Resolution = strings.TrimSpace(setting.ModelChannel.ModelCosts[i].Resolution)
 		if setting.ModelChannel.ModelCosts[i].Credits < 0 {
 			setting.ModelChannel.ModelCosts[i].Credits = 0
 		}
@@ -233,18 +234,30 @@ func normalizePublicSettingWithChannels(setting model.PublicSetting, channels []
 	return setting
 }
 
-func ModelCost(modelName string) (float64, error) {
+func ModelCost(modelName string, resolutions ...string) (float64, error) {
 	settings, err := repository.GetSettings()
 	if err != nil {
 		return 0, err
 	}
 	modelName = strings.TrimSpace(modelName)
+	resolution := ""
+	if len(resolutions) > 0 {
+		resolution = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(resolutions[0])), "p")
+	}
+	defaultCredits := 0.0
 	for _, item := range normalizePublicSetting(settings.Public).ModelChannel.ModelCosts {
-		if item.Model == modelName {
+		if item.Model != modelName {
+			continue
+		}
+		if item.Resolution == "" {
+			defaultCredits = item.Credits
+			continue
+		}
+		if strings.TrimSuffix(strings.ToLower(item.Resolution), "p") == resolution {
 			return item.Credits, nil
 		}
 	}
-	return 0, nil
+	return defaultCredits, nil
 }
 
 func normalizePrivateSetting(setting model.PrivateSetting) model.PrivateSetting {
@@ -325,7 +338,7 @@ func findSavedChannel(channel model.ModelChannel, saved []model.ModelChannel, in
 			return item, true
 		}
 	}
-	if index < len(saved) {
+	if index >= 0 && index < len(saved) {
 		return saved[index], true
 	}
 	return model.ModelChannel{}, false

@@ -9,11 +9,13 @@ import { isMimoPresetTtsModel, isMimoTtsModel, isMimoVoiceCloneModel, isMimoVoic
 import { modelChannelAttributionHeaders } from "@/lib/model-channel";
 import { geminiActionUrl, geminiDirectHeaders, geminiErrorMessage, isGeminiConfig, isGeminiTtsModel } from "@/lib/gemini";
 import { geminiPcmBase64ToWav, normalizeGeminiTtsVoice } from "@/lib/gemini-tts";
+import { isMiniMaxTtsConfig, normalizeMiniMaxTtsFormat, normalizeMiniMaxTtsSpeed, normalizeMiniMaxTtsVoice, type MiniMaxTtsVoice } from "@/lib/minimax-tts";
 import { resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer, type UploadedFile } from "@/services/file-storage";
 import { autoSyncToCloud } from "@/services/image-storage";
 import { buildApiUrl, channelIdForActiveModel, channelProtocolForConfig, localChannelForActiveModel, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceAudio } from "@/types/media";
+import { tokenDanceGatewayURL } from "./protocols/tokendance";
 
 export type CanvasAudioTask = {
     id: string;
@@ -36,7 +38,10 @@ export type CanvasAudioTaskOptions = { nodeId?: string; sourceId?: string; clien
 
 type MiMoAudioResponse = { choices?: Array<{ message?: { audio?: { data?: string } } }> };
 type GeminiAudioResponse = { candidates?: Array<{ content?: { parts?: Array<{ inlineData?: { data?: string; mimeType?: string } }> } }>; error?: { message?: string }; promptFeedback?: { blockReason?: string } };
+type MiniMaxAudioResponse = { data?: { audio?: string }; base_resp?: { status_code?: number; status_msg?: string } };
+type MiniMaxVoicesResponse = { code?: number; msg?: string; system_voice?: MiniMaxTtsVoice[]; base_resp?: { status_code?: number; status_msg?: string } };
 const grokTtsVoiceRequests = new Map<string, Promise<GrokTtsVoice[]>>();
+const miniMaxTtsVoiceRequests = new Map<string, Promise<MiniMaxTtsVoice[]>>();
 
 function usesAccountProxy(config: AiConfig) {
     const token = useUserStore.getState().token;
@@ -90,6 +95,28 @@ export function fetchGrokTtsVoices(config: AiConfig, model: string) {
     return request;
 }
 
+export function fetchMiniMaxTtsVoices(config: AiConfig, model: string) {
+    const requestConfig = { ...config, model, audioModel: model };
+    const proxy = usesAccountProxy(requestConfig);
+    const channel = localChannelForActiveModel(requestConfig);
+    const url = proxy ? "/api/v1/tts/voices" : buildApiUrl(channel?.baseUrl || config.baseUrl, "/get_voice");
+    const requestKey = `${url}|${channelIdForActiveModel(requestConfig)}|${model}`;
+    const existing = miniMaxTtsVoiceRequests.get(requestKey);
+    if (existing) return existing;
+
+    const request = (proxy
+        ? axios.get<MiniMaxVoicesResponse>(url, { headers: aiHeaders(requestConfig), params: { model } })
+        : axios.post<MiniMaxVoicesResponse>(url, { voice_type: "system" }, { headers: aiHeaders(requestConfig) }))
+        .then((response) => {
+            if (response.data.code) throw new Error(response.data.msg || "MiniMax 音色读取失败");
+            if (response.data.base_resp?.status_code) throw new Error(response.data.base_resp.status_msg || "MiniMax 音色读取失败");
+            return Array.isArray(response.data.system_voice) ? response.data.system_voice.filter((voice) => Boolean(voice.voice_id?.trim())) : [];
+        })
+        .catch((error) => { miniMaxTtsVoiceRequests.delete(requestKey); throw error; });
+    miniMaxTtsVoiceRequests.set(requestKey, request);
+    return request;
+}
+
 export async function requestAudioGeneration(config: AiConfig, prompt: string, referenceAudio?: ReferenceAudio, signal?: AbortSignal): Promise<Blob> {
     const model = (config.model || config.audioModel).trim();
 	const translation = await findParameterTranslation({...config,model});
@@ -115,6 +142,38 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, r
             );
             refreshRemoteUser(config);
             return decodeGeminiAudio(response.data);
+        }
+        if (!usesAccountProxy(config) && isMiniMaxTtsConfig(config, model)) {
+            if (referenceAudio) throw new Error("MiniMax TTS 不支持参考音频");
+            const requestConfig = { ...config, model, audioModel: model };
+            const channel = localChannelForActiveModel(requestConfig);
+            const baseUrl = channel?.baseUrl || config.baseUrl;
+            const url = channelProtocolForConfig(requestConfig) === "tokendance"
+                ? tokenDanceGatewayURL(baseUrl, "/minimax/v1/t2a_v2")
+                : buildApiUrl(baseUrl, "/t2a_v2");
+            const response = await axios.post<MiniMaxAudioResponse>(
+                url,
+                {
+                    model,
+                    text: prompt,
+                    stream: false,
+                    output_format: "hex",
+                    voice_setting: {
+                        voice_id: normalizeMiniMaxTtsVoice(requestConfig.miniMaxTtsVoice),
+                        speed: Number(normalizeMiniMaxTtsSpeed(requestConfig.miniMaxTtsSpeed)),
+                        vol: 1,
+                        pitch: 0,
+                    },
+                    audio_setting: {
+                        sample_rate: 32000,
+                        bitrate: 128000,
+                        format: normalizeMiniMaxTtsFormat(requestConfig.miniMaxTtsFormat),
+                        channel: 1,
+                    },
+                },
+                { headers: aiHeaders(requestConfig), signal },
+            );
+            return decodeMiniMaxAudio(response.data, normalizeMiniMaxTtsFormat(requestConfig.miniMaxTtsFormat));
         }
         if (isMimoTtsModel(model) && !usesAccountProxy(config)) {
             const format = normalizeMimoTtsFormat(config.mimoTtsFormat);
@@ -197,17 +256,20 @@ export async function createCanvasAudioTask(config: AiConfig, prompt: string, op
 }
 
 async function audioTranslationInput(config: AiConfig, model: string, prompt: string, referenceAudio?: ReferenceAudio): Promise<TranslationInput> {
+    const miniMax = isMiniMaxTtsConfig(config, model);
     const voice =
         isGeminiTtsModel(model) && isGeminiConfig(config, model)
             ? config.geminiTtsVoice
             : isGlmTtsModel(model)
               ? config.glmTtsVoice
-              : isMimoTtsModel(model)
-                ? config.mimoTtsVoice
-                : isGrok2APITtsConfig(config, model)
-                  ? config.grokTtsVoice
-                  : config.audioVoice;
-    const speed = isGlmTtsModel(model) ? config.glmTtsSpeed : isGrok2APITtsConfig(config, model) ? config.grokTtsSpeed : config.audioSpeed;
+              : miniMax
+                ? config.miniMaxTtsVoice
+                : isMimoTtsModel(model)
+                  ? config.mimoTtsVoice
+                  : isGrok2APITtsConfig(config, model)
+                    ? config.grokTtsVoice
+                    : config.audioVoice;
+    const speed = isGlmTtsModel(model) ? config.glmTtsSpeed : miniMax ? config.miniMaxTtsSpeed : isGrok2APITtsConfig(config, model) ? config.grokTtsSpeed : config.audioSpeed;
     return {
         kind: "audio",
         variables: {
@@ -251,6 +313,16 @@ async function buildAudioSpeechRequest(config: AiConfig, model: string, prompt: 
     if (isGeminiTtsModel(model) && isGeminiConfig(config, model)) {
         if (referenceAudio) throw new Error("Gemini TTS 不支持参考音频");
         return { model, ...buildGeminiTtsRequest(config, prompt) };
+    }
+    if (isMiniMaxTtsConfig(config, model)) {
+        if (referenceAudio) throw new Error("MiniMax TTS 不支持参考音频");
+        return {
+            model,
+            input: prompt,
+            voice: normalizeMiniMaxTtsVoice(config.miniMaxTtsVoice),
+            response_format: normalizeMiniMaxTtsFormat(config.miniMaxTtsFormat),
+            speed: Number(normalizeMiniMaxTtsSpeed(config.miniMaxTtsSpeed)),
+        };
     }
     if (isGlmTtsModel(model)) {
         if (prompt.length > 1024) throw new Error("GLM-TTS 文本不能超过 1024 个字符");
@@ -298,6 +370,7 @@ async function buildAudioSpeechRequest(config: AiConfig, model: string, prompt: 
 
 function audioResponseFormat(config: AiConfig, model: string) {
     if (isGeminiTtsModel(model) && isGeminiConfig(config, model)) return "wav";
+    if (isMiniMaxTtsConfig(config, model)) return normalizeMiniMaxTtsFormat(config.miniMaxTtsFormat);
     if (isGlmTtsModel(model)) return normalizeGlmTtsFormat(config.glmTtsFormat);
     if (isMimoTtsModel(model)) return normalizeMimoTtsFormat(config.mimoTtsFormat);
     if (isGrok2APITtsConfig(config, model)) return normalizeGrokTtsFormat(config.grokTtsFormat);
@@ -318,6 +391,17 @@ function decodeGeminiAudio(payload: GeminiAudioResponse) {
     const inlineData = payload.candidates?.flatMap((candidate) => candidate.content?.parts || []).find((part) => Boolean(part.inlineData?.data))?.inlineData;
     if (!inlineData?.data) throw new Error(geminiErrorMessage(payload, "Gemini TTS 没有返回音频数据"));
     return geminiPcmBase64ToWav(inlineData.data);
+}
+
+function decodeMiniMaxAudio(payload: MiniMaxAudioResponse, format: string) {
+    if (payload.base_resp?.status_code) throw new Error(payload.base_resp.status_msg || "MiniMax TTS 生成失败");
+    const audio = payload.data?.audio?.trim() || "";
+    if (!audio || audio.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(audio)) throw new Error("MiniMax TTS 没有返回有效音频");
+    const bytes = new Uint8Array(audio.length / 2);
+    for (let index = 0; index < bytes.length; index += 1) {
+        bytes[index] = Number.parseInt(audio.slice(index * 2, index * 2 + 2), 16);
+    }
+    return new Blob([bytes], { type: audioMimeType(format) });
 }
 
 async function buildMiMoNativeRequest(config: AiConfig, model: string, prompt: string, referenceAudio?: ReferenceAudio) {

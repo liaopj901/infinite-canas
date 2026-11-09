@@ -39,6 +39,7 @@ async function proxy(request: NextRequest, context: RouteContext) {
             body: hasBody ? request.body : undefined,
             duplex: hasBody ? "half" : undefined,
             redirect: "manual",
+            signal: request.headers.get("X-Canvas-Node-Request") === "true" ? request.signal : undefined,
         } as RequestInit & { duplex?: "half" });
 
         return new Response(response.body, {

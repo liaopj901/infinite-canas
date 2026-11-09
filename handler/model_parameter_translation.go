@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -157,8 +156,6 @@ func serveParameterTranslationVideo(w http.ResponseWriter, r *http.Request, body
 	videoURL := ""
 	if len(result.URLs) > 0 {
 		videoURL = result.URLs[0]
-	} else if len(result.Body) > 0 {
-		videoURL = "data:" + strings.Split(result.ContentType, ";")[0] + ";base64," + base64.StdEncoding.EncodeToString(result.Body)
 	}
 	userChannelID := r.Header.Get(userModelChannelHeader)
 	seconds, size := "", ""
@@ -182,6 +179,11 @@ func serveParameterTranslationVideo(w http.ResponseWriter, r *http.Request, body
 		return true
 	}
 	saveAIProxyLog(logContext, result.StatusCode, result.ResponseBody, "")
+	if len(result.Body) > 0 {
+		w.Header().Set("Content-Type", result.ContentType)
+		_, _ = w.Write(result.Body)
+		return true
+	}
 	OK(w, service.VideoTaskResponse(task))
 	return true
 }

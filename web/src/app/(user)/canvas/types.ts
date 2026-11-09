@@ -72,6 +72,9 @@ export type CanvasNodeMetadata = {
     mimoTtsFormat?: string;
     mimoVoiceDesignPrompt?: string;
     geminiTtsVoice?: string;
+    miniMaxTtsVoice?: string;
+    miniMaxTtsFormat?: string;
+    miniMaxTtsSpeed?: string;
     mimoVoiceCloneAudioNodeId?: string;
     referenceAudioNodeId?: string;
     references?: string[];

@@ -11,6 +11,8 @@ description: 当前后端主要数据表与字段说明
 
 后端使用 GORM 管理数据库连接和表结构迁移。
 
+模型中的短字符串字段通过 `gorm:"size:N"` 明确最大长度，在 MySQL、PostgreSQL 中使用对应的 `varchar`；SQLite 仍使用 `text`。正文、JSON、URL 等长内容继续使用文本类型。
+
 支持的存储驱动：
 
 - `sqlite`
@@ -47,16 +49,13 @@ description: 当前后端主要数据表与字段说明
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `id` | string | 主键 |
-| `username` | string | 用户名，唯一索引 |
+| `username` | string | 用户名，最长 64 个字符，唯一索引 |
 | `password` | string | 密码哈希 |
 | `email` | string | 邮箱 |
 | `display_name` | string | 昵称 |
 | `avatar_url` | string | 头像地址 |
 | `role` | string | 角色：`user`、`admin` |
 | `credits` | decimal(20,2) | 算力点余额 |
-| `aff_code` | string | 用户自己的邀请码，唯一索引 |
-| `aff_count` | number | 已邀请用户数量，冗余统计字段 |
-| `inviter_id` | string | 邀请人用户 ID |
 | `github_id` | string | GitHub 用户 ID |
 | `linux_do_id` | string | Linux.do 用户 ID |
 | `wechat_id` | string | 微信用户 ID |
@@ -91,7 +90,7 @@ S3/R2 与 WebDAV 共用的媒体文件索引表，不保存画布、素材列表
 | `id` | string | 文件 ID，前端存储 key 使用 `server:<id>` |
 | `provider_id` | string | 创建文件时使用的 S3/R2 或 WebDAV Provider ID |
 | `bucket` | string | S3/R2 Bucket；WebDAV 为空 |
-| `object_key` | string | Provider 内相对对象路径，唯一索引 |
+| `object_key` | string | Provider 内相对对象路径 |
 | `public_url` | string | S3/R2 可选公开地址；WebDAV 为空并通过 `/api/files/:id/content` 读取 |
 | `mime_type` | string | 媒体 MIME 类型 |
 | `bytes` | number | 文件字节数 |
@@ -463,6 +462,7 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `model` | string | 模型名称 |
+| `resolution` | string | 可选，视频分辨率覆盖价；未匹配时使用同模型未设置分辨率的默认单价 |
 | `credits` | number | 图片每张、视频每秒、文本和音频每次调用预扣的算力点，最多保留两位小数；视频智能时长 `-1` 按 15 秒计算，未配置默认不扣除 |
 
 `auth.linuxDo` 当前字段：

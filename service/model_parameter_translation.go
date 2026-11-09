@@ -331,22 +331,72 @@ type parameterTranslationSnapshot struct {
 }
 
 func (translation *ParameterTranslation) Snapshot(input ParameterTranslationInput, result ParameterTranslationResult) string {
-	encoded, _ := json.Marshal(parameterTranslationSnapshot{Source: translation.channel.ParameterTranslation, BaseURL: translation.channel.BaseURL, Protocol: translation.channel.Protocol, Timeout: translation.channel.Timeout, Variables: input.Variables, TaskIDs: result.TaskIDs, Completed: map[string]ParameterTranslationResult{}})
+	snapshot := parameterTranslationSnapshot{Source: translation.channel.ParameterTranslation, BaseURL: translation.channel.BaseURL, Protocol: translation.channel.Protocol, Timeout: translation.channel.Timeout, Variables: input.Variables, TaskIDs: result.TaskIDs, Completed: map[string]ParameterTranslationResult{}}
+	if result.ContentURL != "" {
+		snapshot.Completed[""] = ParameterTranslationResult{Status: result.Status, Progress: result.Progress, ContentURL: result.ContentURL}
+	}
+	encoded, _ := json.Marshal(snapshot)
 	return string(encoded)
 }
 
-func PollParameterTranslationVideo(ctx context.Context, task model.VideoTask, channel model.ModelChannel) (VideoTaskPollUpdate, error) {
+func videoTaskParameterTranslation(task model.VideoTask, channel model.ModelChannel) (*ParameterTranslation, parameterTranslationSnapshot, error) {
 	var snapshot parameterTranslationSnapshot
-	if json.Unmarshal([]byte(task.ParameterTranslationSnapshot), &snapshot) != nil || len(snapshot.TaskIDs) == 0 {
-		return VideoTaskPollUpdate{}, errors.New("视频任务自定义查询快照无效")
+	if json.Unmarshal([]byte(task.ParameterTranslationSnapshot), &snapshot) != nil {
+		return nil, snapshot, errors.New("视频任务自定义查询快照无效")
 	}
 	channel.ParameterTranslation, channel.BaseURL, channel.Protocol, channel.Timeout = snapshot.Source, snapshot.BaseURL, snapshot.Protocol, snapshot.Timeout
 	translation, err := NewParameterTranslation(channel, task.Model, snapshot.Variables)
 	if err != nil {
-		return VideoTaskPollUpdate{}, err
+		return nil, snapshot, err
 	}
 	if translation == nil {
-		return VideoTaskPollUpdate{}, errors.New("视频任务快照缺少模型配置")
+		return nil, snapshot, errors.New("视频任务快照缺少模型配置")
+	}
+	return translation, snapshot, nil
+}
+
+func ParameterTranslationVideoContent(ctx context.Context, task model.VideoTask, channel model.ModelChannel) (*http.Response, error) {
+	translation, snapshot, err := videoTaskParameterTranslation(task, channel)
+	if err != nil {
+		return nil, err
+	}
+	taskID := ""
+	if len(snapshot.TaskIDs) > 0 {
+		taskID = snapshot.TaskIDs[0]
+	}
+	if taskID != "" && snapshot.Completed[taskID].ContentURL == "" {
+		result, err := translation.Send(ctx, "video", true, taskID)
+		if err != nil {
+			return nil, err
+		}
+		if len(result.Body) == 0 {
+			return nil, errors.New("视频查询接口没有返回视频文件")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{result.ContentType}}, Body: io.NopCloser(bytes.NewReader(result.Body))}, nil
+	}
+	request, _, err := translation.request(ctx, taskID != "", taskID)
+	if err != nil {
+		return nil, err
+	}
+	content, err := url.Parse(snapshot.Completed[taskID].ContentURL)
+	if err != nil || content.User != nil || content.Scheme != request.URL.Scheme || content.Host != request.URL.Host {
+		return nil, errors.New("视频内容地址无效")
+	}
+	params := request.URL.Query()
+	maps.Copy(params, content.Query())
+	content.RawQuery = params.Encode()
+	request.URL, request.Method = content, http.MethodGet
+	request.Body, request.GetBody, request.ContentLength = nil, nil, 0
+	return translation.Client.Do(request)
+}
+
+func PollParameterTranslationVideo(ctx context.Context, task model.VideoTask, channel model.ModelChannel) (VideoTaskPollUpdate, error) {
+	translation, snapshot, err := videoTaskParameterTranslation(task, channel)
+	if err != nil {
+		return VideoTaskPollUpdate{}, err
+	}
+	if len(snapshot.TaskIDs) == 0 {
+		return VideoTaskPollUpdate{}, errors.New("视频任务自定义查询快照无效")
 	}
 	if snapshot.Completed == nil {
 		snapshot.Completed = map[string]ParameterTranslationResult{}
@@ -364,7 +414,7 @@ func PollParameterTranslationVideo(ctx context.Context, task model.VideoTask, ch
 				update.ErrorDetail = err.Error()
 			}
 			if result.Status == "completed" {
-				snapshot.Completed[id] = result
+				snapshot.Completed[id] = ParameterTranslationResult{Status: result.Status, Progress: result.Progress, URLs: result.URLs[:min(1, len(result.URLs))], ContentURL: result.ContentURL, StatusCode: result.StatusCode}
 			}
 		}
 		progress += result.Progress
@@ -376,8 +426,6 @@ func PollParameterTranslationVideo(ctx context.Context, task model.VideoTask, ch
 		update.Status, update.Progress = "completed", 100
 		if len(result.URLs) > 0 {
 			update.VideoURL = result.URLs[0]
-		} else if len(result.Body) > 0 {
-			update.VideoURL = "data:" + strings.Split(result.ContentType, ";")[0] + ";base64," + base64.StdEncoding.EncodeToString(result.Body)
 		}
 	}
 	encoded, _ := json.Marshal(snapshot)
@@ -681,6 +729,7 @@ type ParameterTranslationResult struct {
 	Status       string
 	Progress     int
 	URLs         []string
+	ContentURL   string `json:",omitempty"`
 	Body         []byte
 	ContentType  string
 	ResponseBody string
@@ -720,6 +769,9 @@ func (translation *ParameterTranslation) Send(ctx context.Context, kind string, 
 	_ = json.Unmarshal(payload, &data)
 	if data != nil {
 		result.ResponseBody = string(payload)
+		if kind == "video" {
+			result.ResponseBody = string(workflowLogJSON(result.ResponseBody, ""))
+		}
 	}
 	if responseType == "text" {
 		data = string(payload)
@@ -809,7 +861,7 @@ func (translation *ParameterTranslation) Send(ctx context.Context, kind string, 
 		if result.ContentType == "" {
 			result.ContentType = http.DetectContentType(payload)
 		}
-		if download && !strings.HasPrefix(result.ContentType, "video/") {
+		if (kind == "video" || download) && !strings.HasPrefix(result.ContentType, "video/") {
 			result.ContentType = "video/mp4"
 		}
 		return result, nil
@@ -832,6 +884,14 @@ func (translation *ParameterTranslation) Send(ctx context.Context, kind string, 
 	}
 	result.URLs = ParameterTranslationMediaURLs(value, kind, mimeType, 0)
 	if kind == "video" {
+		if len(result.URLs) > 0 && strings.HasPrefix(result.URLs[0], "data:video/") {
+			result.Body, result.ContentType, err = readWorkflowMedia(ctx, result.URLs[0], 0)
+			if err != nil {
+				return result, errors.New("接口返回的视频编码无效")
+			}
+			result.URLs, result.ResponseBody = nil, ""
+			return result, nil
+		}
 		var content *url.URL
 		if len(result.URLs) == 1 {
 			if target, err := url.Parse(result.URLs[0]); err == nil && target.User == nil && target.Scheme == request.URL.Scheme && target.Host == request.URL.Host {
@@ -843,19 +903,12 @@ func (translation *ParameterTranslation) Send(ctx context.Context, kind string, 
 		defaultResult := goja.IsUndefined(selector) || goja.IsNull(selector) || (selector.ExportType() == reflect.TypeFor[string]() && selector.String() == "")
 		if len(result.URLs) == 0 && query && defaultResult && request.Method == http.MethodGet && taskID != "" && strings.HasSuffix(request.URL.EscapedPath(), "/videos/"+strings.ReplaceAll(url.QueryEscape(taskID), "+", "%20")) {
 			target := *request.URL
-			target.Path, target.RawPath = target.Path+"/content", target.EscapedPath()+"/content"
+			target.Path, target.RawPath, target.RawQuery = target.Path+"/content", target.EscapedPath()+"/content", ""
 			content = &target
 		}
 		if content != nil {
-			params := request.URL.Query()
-			maps.Copy(params, content.Query())
-			content.RawQuery = params.Encode()
-			contentRequest := request.Clone(ctx)
-			contentRequest.URL, contentRequest.Method = content, http.MethodGet
-			contentRequest.Body, contentRequest.GetBody, contentRequest.ContentLength = nil, nil, 0
-			downloaded, err := translation.Send(ctx, kind, query, taskID, contentRequest)
-			downloaded.ResponseBody = firstNonEmpty(downloaded.ResponseBody, result.ResponseBody)
-			return downloaded, err
+			result.ContentURL, result.URLs = content.String(), nil
+			return result, nil
 		}
 	}
 	if len(result.URLs) == 0 {

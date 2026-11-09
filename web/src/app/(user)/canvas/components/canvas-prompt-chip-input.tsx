@@ -189,6 +189,12 @@ export function CanvasPromptChipInput({ value, references, onChange, onReference
                     if (selection?.isCollapsed && selection.anchorOffset === 0 && node instanceof Text && node.data === "\n" && node === event.currentTarget.lastChild) node.data = "\uFEFF";
                     syncFromEditor();
                 }}
+                onCopy={(event) => {
+                    const selection = window.getSelection();
+                    if (!selection?.rangeCount) return;
+                    event.preventDefault();
+                    event.clipboardData.setData("text/plain", serializePromptNodes(selection.getRangeAt(0).cloneContents().childNodes).replace(/\uFEFF/g, ""));
+                }}
                 onPaste={(event) => {
                     const image = Array.from(event.clipboardData.files).find((file) => file.type.startsWith("image/"));
                     if (image && onPasteImage) {

@@ -23,5 +23,6 @@ func main() {
 	service.StartCanvasProjectCleanupScheduler()
 	service.StartGeneratedMediaCleanupScheduler()
 	handler.StartVideoTaskPoller()
+	service.WakeComfyBridgePoller()
 	log.Fatal(router.New().Run(":" + config.Cfg.Port))
 }

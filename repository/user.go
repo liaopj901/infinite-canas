@@ -3,6 +3,7 @@ package repository
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/tigerowo/infinite-canvas/model"
 	"gorm.io/gorm"
@@ -162,14 +163,22 @@ func ListCreditLogs(q model.Query) ([]model.CreditLog, int64, error) {
 		tx = tx.Where("user_id LIKE ? OR type LIKE ? OR remark LIKE ? OR related_id LIKE ? OR users.username LIKE ? OR users.display_name LIKE ?", like, like, like, like, like, like)
 	}
 	if q.Date != "" {
-		tx = tx.Where("SUBSTR(credit_logs.created_at, 1, 10) = ?", q.Date)
+		if date, parseErr := time.Parse(time.DateOnly, q.Date); parseErr == nil {
+			tx = tx.Where("credit_logs.created_at >= ? AND credit_logs.created_at < ?", q.Date, date.AddDate(0, 0, 1).Format(time.DateOnly))
+		} else {
+			tx = tx.Where("SUBSTR(credit_logs.created_at, 1, 10) = ?", q.Date)
+		}
 	}
 	var total int64
 	if err := tx.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var logs []model.CreditLog
-	err = tx.Select("credit_logs.*, COALESCE(NULLIF(users.display_name, ''), users.username) AS user_display_name").Order("credit_logs.created_at desc").Offset(q.Offset()).Limit(q.PageSize).Find(&logs).Error
+	order := "credit_logs.created_at desc"
+	if db.Dialector.Name() == "sqlite" {
+		order += ", credit_logs.rowid desc"
+	}
+	err = tx.Select("credit_logs.*, COALESCE(NULLIF(users.display_name, ''), users.username) AS user_display_name").Order(order).Offset(q.Offset()).Limit(q.PageSize).Find(&logs).Error
 	return logs, total, err
 }
 

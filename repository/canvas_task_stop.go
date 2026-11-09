@@ -25,12 +25,12 @@ func CanvasTaskStopped(userID, id string, task any) (bool, error) {
 	return count > 0, err
 }
 
-func StopCanvasTask(userID, id, source string, task any, current time.Time) (bool, error) {
+func StopCanvasTask(userID, id, source string, task any, current time.Time) (bool, bool, error) {
 	db, err := DB()
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	stopped := false
+	stopped, comfyCleanup := false, false
 	err = db.Transaction(func(tx *gorm.DB) error {
 		stamp := current.Format(time.RFC3339Nano)
 		if video, ok := task.(*model.VideoTask); ok && video.ID != "" {
@@ -56,9 +56,11 @@ func StopCanvasTask(userID, id, source string, task any, current time.Time) (boo
 			Updates(map[string]any{"status": "failed", "error": "用户停止", "updated_at": current, "completed_at": current}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&model.ComfyBridgeRequest{}).
+		cleanup := tx.Model(&model.ComfyBridgeRequest{}).
 			Where("task_id = ? AND status IN ? AND cleanup_ready_at IS NULL", id, []string{"failed", "succeeded"}).
-			Updates(map[string]any{"cleanup_ready_at": current, "updated_at": current}).Error
+			Updates(map[string]any{"cleanup_ready_at": current, "updated_at": current})
+		comfyCleanup = cleanup.RowsAffected > 0
+		return cleanup.Error
 	})
-	return stopped, err
+	return stopped, comfyCleanup, err
 }

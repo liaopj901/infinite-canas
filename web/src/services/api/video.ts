@@ -12,7 +12,7 @@ import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceDuration, normalize
 import { isKIEGrokVideoModel, isKIEKlingV3Config, kieKlingOmniVariant } from "./protocols/kling-models";
 import { autoDLBaseUrl, getAutoDLCapabilities } from "@/lib/autodl";
 import { fetchAutoDLWorkflow } from "./autodl";
-import { isAgnesVideoV25Model, isCogVideoX3Model, modelKey, normalizeCogVideoX3Duration, supportsVideoAudioGeneration } from "@/lib/video-model-capabilities";
+import { isAgnesVideoV25Model, isCogVideoX3Model, isWan3VideoModel, modelKey, normalizeCogVideoX3Duration, supportsVideoAudioGeneration, videoDurationOptionsForModel } from "@/lib/video-model-capabilities";
 import { resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer } from "@/services/file-storage";
 import { autoSyncToCloud, imageToDataUrl, resolveImageUrl } from "@/services/image-storage";
 import { buildApiUrl, channelIdForActiveModel, channelProtocolForConfig, directAIProviderForConfig, localChannelForActiveModel, type AiConfig, type VideoElementReference } from "@/stores/use-config-store";
@@ -155,7 +155,7 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
 async function createTranslatedVideoTask(config: AiConfig, match: MatchedTranslation, prompt: string, references: Required<VideoReferenceInput>, options: VideoTaskCreateOptions, onProgress?: VideoProgressHandler): Promise<CreatedVideoGenerationTask> {
     const requestToken = useUserStore.getState().token;
     const imageURL = async (image: ReferenceImage) => publicHttpUrl(image.url) || publicHttpUrl(image.dataUrl) || imageToDataUrl(image);
-    const mediaURL = async (media: ReferenceVideo | ReferenceAudio) => translationMediaAddress(await resolveMediaUrl(media.storageKey, media.url));
+    const mediaURL = async (media: ReferenceAudio) => translationMediaAddress(await resolveMediaUrl(media.storageKey, media.url));
     const input: TranslationInput = {
         kind: "video",
         variables: {
@@ -170,7 +170,7 @@ async function createTranslatedVideoTask(config: AiConfig, match: MatchedTransla
             generateAudio: boolConfig(config.videoGenerateAudio, true),
             watermark: boolConfig(config.videoWatermark, false),
             images: await Promise.all(references.references.map(imageURL)),
-            videos: await Promise.all(references.videoReferences.map(mediaURL)),
+            videos: await Promise.all(references.videoReferences.map((reference) => elementReferenceToInputUrl({ ...reference, kind: "video" }))),
             audios: await Promise.all(references.audioReferences.map(mediaURL)),
             firstFrame: references.firstFrame ? await imageURL(references.firstFrame) : "",
             lastFrame: references.lastFrame ? await imageURL(references.lastFrame) : "",
@@ -181,16 +181,18 @@ async function createTranslatedVideoTask(config: AiConfig, match: MatchedTransla
     if (match.accountProxy) {
         options.signal?.throwIfAborted();
         options.onServerTask?.();
-        const response = await axios.post<ApiVideoResponse>("/api/v1/videos", translationBody(config, input), {
+        const clientTaskId = options.clientTaskId || `client_video_task_${nanoid()}`;
+        const response = await axios.post<Blob>("/api/v1/videos", translationBody(config, input), {
+            responseType: "blob",
             headers: {
                 ...translationHeaders(config, match),
-                ...(options.clientTaskId ? { "X-Client-Video-Task-ID": options.clientTaskId } : {}),
+                "X-Client-Video-Task-ID": clientTaskId,
                 ...(options.source ? { "X-Video-Task-Source": options.source } : {}),
                 ...(options.sourceId ? { "X-Video-Task-Source-ID": options.sourceId } : {}),
             },
-            timeout: match.timeout * 1000,
         });
-        task = unwrapVideoResponseForConfig(config, config.model, response.data);
+        if (response.data.type.includes("json")) task = unwrapVideoResponseForConfig(config, config.model, JSON.parse(await response.data.text()));
+        else task = await cacheProtectedVideo(config, config.model, await pollVideoGenerationTask(clientTaskId), undefined, new Response(response.data));
     } else {
         const translation = await BrowserParameterTranslation.create(config, match, input);
         let result: TranslationResult;
@@ -260,7 +262,7 @@ export async function pollCreatedVideoGenerationTask(config: AiConfig, task: Vid
         if (initialDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, initialDelayMs));
         for (; ;) {
             const polled = preserveVideoTaskIdentity(await pollOnce(), task);
-            const video = polled.parameter_translation ? polled : await cacheProtectedVideo(config, model, await cacheProtectedGeminiVideo(config, model, polled));
+            const video = polled.parameter_translation ? await syncGeneratedVideo(polled, config, true) : await cacheProtectedVideo(config, model, await cacheProtectedGeminiVideo(config, model, polled));
             onPoll?.(video);
             if (isFailedVideoStatus(video.status)) throw new VideoRequestError(video.error?.message || "视频生成失败", video);
             if (typeof video.progress === "number") onProgress?.(video.progress, video);
@@ -307,12 +309,15 @@ async function syncGeneratedVideo(task: VideoResponse, config: AiConfig, content
     if (useUserStore.getState().token !== requestToken) return task;
     const url = task.video_url || task.url || "";
     if (task.storageKey || isFailedVideoStatus(task.status) || (!isCompletedVideoStatus(task.status) && !url)) return task;
-    const media = await autoSyncToCloud(`video:${videoSyncKey(config, task)}`, async () => {
+    if (task.parameter_translation && !url) return cacheProtectedVideo(config, config.model || config.videoModel, task);
+    const media = task.parameter_translation && url.startsWith("data:video/")
+        ? await uploadMediaFile(url, "generated-video", `video:${videoSyncKey(config, task)}`, requestToken)
+        : await autoSyncToCloud(`video:${videoSyncKey(config, task)}`, async () => {
         const model = config.model || config.videoModel;
         const cached = contentResolved ? task : await cacheProtectedGeminiVideo(config, model, await cacheProtectedVideo(config, model, task));
         if (cached.storageKey) return { url: cached.video_url || cached.url || url, storageKey: cached.storageKey };
         return url ? uploadRemoteMediaToServer(url, "video", requestToken) : null;
-    });
+        });
     return media ? { ...task, url: media.url, video_url: media.url, storageKey: media.storageKey } : task;
 }
 
@@ -336,17 +341,18 @@ function isGrok2APIVideoConfig(config: AiConfig, model: string) {
     return (normalizedModel === "grok-imagine-video" || normalizedModel === "grok-imagine-video-1.5") && videoChannelProtocol(config, model) === "grok2api";
 }
 
-export async function cacheProtectedVideo(config: AiConfig, model: string, task: VideoResponse, contentRequest?: RequestInit) {
+export async function cacheProtectedVideo(config: AiConfig, model: string, task: VideoResponse, contentRequest?: RequestInit, contentResponse?: Response) {
     const url = task.video_url || task.url || "";
     const needsTaskContent = !url && ("object" in task && task.object === "video");
     const needsContentURL = /\/videos\/[^/?]+\/content(?:[?#]|$)/.test(contentRequest ? new URL(url).pathname : url);
     if (!isCompletedVideoStatus(task.status) || task.storageKey || (!needsTaskContent && !needsContentURL)) return task;
     const taskId = task.task_id || task.id || task.video_id || "";
-    const response = await fetch(contentRequest ? url : `${aiApiUrl(config, `/videos/${encodeURIComponent(taskId)}/content`)}?model=${encodeURIComponent(model)}`, contentRequest || { headers: aiHeaders(config) });
+    const response = contentResponse ?? await fetch(contentRequest ? url : `${aiApiUrl(config, `/videos/${encodeURIComponent(taskId)}/content`)}?model=${encodeURIComponent(model)}`, contentRequest || { headers: aiHeaders(config) });
     if (!response.ok) throw new VideoRequestError(`视频内容下载失败：${response.status}`, task);
     const blob = await response.blob();
-    if (contentRequest && (!blob.size || /json|^text\//i.test(blob.type))) throw new VideoRequestError("视频内容接口没有返回媒体文件", task);
-    const media = await uploadMediaFile(contentRequest && !blob.type.startsWith("video/") ? new Blob([blob], { type: "video/mp4" }) : blob, "generated-video", `video-content:${videoSyncKey(config, task)}`);
+    const translatedContent = task.parameter_translation && !url;
+    if ((contentRequest || translatedContent) && (!blob.size || /json|^text\//i.test(blob.type))) throw new VideoRequestError("视频内容接口没有返回媒体文件", task);
+    const media = await uploadMediaFile((contentRequest || translatedContent) && !blob.type.startsWith("video/") ? new Blob([blob], { type: "video/mp4" }) : blob, "generated-video", `video-content:${videoSyncKey(config, task)}`);
     return { ...task, url: media.url, video_url: media.url, storageKey: media.storageKey };
 }
 
@@ -364,10 +370,12 @@ async function createGrok2APIVideoRequestBody(config: AiConfig, model: string, p
     };
     const aspectRatio = normalizeSeedanceRatio(config.size);
     if (aspectRatio !== "adaptive") body.aspect_ratio = aspectRatio;
-    if (input.firstFrame) body.image = { url: await imageToDataUrl(input.firstFrame) };
-    if (input.references.length) {
-        const urls = await Promise.all(input.references.map((reference) => imageToDataUrl(reference)));
-        body.reference_images = urls.map((url) => ({ url }));
+    if (input.firstFrame) {
+        body.image = { url: await imageToAgnesReference(input.firstFrame) };
+    } else {
+        const urls = await Promise.all(input.references.map(imageToAgnesReference));
+        if (urls.length === 1) body.image = { url: urls[0] };
+        else if (urls.length > 1) body.reference_images = urls.map((url) => ({ url }));
     }
 
     return body;
@@ -417,32 +425,7 @@ async function createVideoRequestBody(config: AiConfig, model: string, prompt: s
             ...(lastFrame ? { last_frame_url: lastFrame } : {}),
         };
     }
-    if (videoChannelProtocol(config, model) === "tokendance") {
-        const { autoDLReferenceURL } = await import("./direct-ai");
-        const referenceURL = (reference: ReferenceImage | ReferenceVideo | ReferenceAudio) => autoDLReferenceURL(reference, "TokenDance");
-        const [images, videos, audios, firstFrame, lastFrame] = await Promise.all([
-            Promise.all(input.references.map(referenceURL)),
-            Promise.all(input.videoReferences.map(referenceURL)),
-            Promise.all(input.audioReferences.map(referenceURL)),
-            input.firstFrame ? referenceURL(input.firstFrame) : Promise.resolve(""),
-            input.lastFrame ? referenceURL(input.lastFrame) : Promise.resolve(""),
-        ]);
-        return {
-            model,
-            prompt,
-            seconds: normalizeVideoSecondsForModel(model, config.videoSeconds),
-            size: normalizeSeedanceRatio(config.size),
-            resolution_name: normalizeVideoResolution(config.vquality),
-            video_generate_audio: boolConfig(config.videoGenerateAudio, false),
-            video_watermark: boolConfig(config.videoWatermark, false),
-            character_orientation: normalizeCharacterOrientation(config.videoCharacterOrientation),
-            ...(images.length ? { "input_reference[]": images } : {}),
-            ...(videos.length ? { "video_reference[]": videos } : {}),
-            ...(audios.length ? { "audio_reference[]": audios } : {}),
-            ...(firstFrame ? { first_frame_url: firstFrame } : {}),
-            ...(lastFrame ? { last_frame_url: lastFrame } : {}),
-        };
-    }
+    const tokenDance = videoChannelProtocol(config, model) === "tokendance";
     if (videoChannelProtocol(config, model) === "ark") return createArkSeedanceVideoRequestBody(config, model, prompt, input);
     const size = normalizeVideoSize(config.size);
     if (isGeminiVideoModel(model) && isGeminiConfig(config, model)) return createGeminiVeoRequestBody(config, model, prompt, input);
@@ -472,6 +455,7 @@ async function createVideoRequestBody(config: AiConfig, model: string, prompt: s
 
     const klingV26 = isAPIMartKlingV26VideoConfig(config, model);
     const apimartKlingV3 = isAPIMartKlingV3VideoConfig(config, model);
+    const apimartWan3 = videoChannelProtocol(config, model) === "apimart" && isWan3VideoModel(model);
     const apimartMotionControl = isAPIMartKlingMotionControlVideoConfig(config, model);
     const kieKlingV3 = isKIEKlingV3Config(config, model);
     const kieKlingOmni = kieKlingOmniVariant(config, model);
@@ -511,15 +495,16 @@ async function createVideoRequestBody(config: AiConfig, model: string, prompt: s
                 : normalizeVideoSecondsForModel(model, config.videoSeconds);
             body.append("seconds", seconds);
         }
-        if (isSeedanceVideoConfig(config)) body.append("size", normalizeSeedanceRatio(config.size));
+        if (tokenDance || isSeedanceVideoConfig(config)) body.append("size", normalizeSeedanceRatio(config.size));
         else if (size) body.append("size", size);
         body.append("resolution_name", normalizeVideoResolution(config.vquality));
         if (isKIEGrokVideoModel(config, model)) body.append("mode", normalizeGrokVideoMode(config.videoMode));
         else body.append("preset", "normal");
     }
-    if (motionControl) body.append("character_orientation", normalizeCharacterOrientation(config.videoCharacterOrientation));
-    if (supportsVideoAudioGeneration(model)) body.append("video_generate_audio", String(boolConfig(config.videoGenerateAudio, false)));
-    const imageReferenceLimit = kieKlingOmni === "text-to-video" ? 0 : kieKlingOmni === "reference-to-video" ? input.references.length : kieKlingOmni === "transformation" ? 4 : kling ? 2 : 9;
+    if (tokenDance || motionControl) body.append("character_orientation", normalizeCharacterOrientation(config.videoCharacterOrientation));
+    if (tokenDance || apimartWan3 || supportsVideoAudioGeneration(model)) body.append("video_generate_audio", String(boolConfig(config.videoGenerateAudio, false)));
+    if (tokenDance) body.append("video_watermark", String(boolConfig(config.videoWatermark, false)));
+    const imageReferenceLimit = kieKlingOmni === "text-to-video" ? 0 : kieKlingOmni === "reference-to-video" ? input.references.length : kieKlingOmni === "transformation" ? 4 : kling ? 2 : 10;
     const files = await Promise.all(input.references.slice(0, imageReferenceLimit).map(imageReferenceToFormValue));
     files.forEach((file) => body.append("input_reference[]", file));
     if (!kling && input.firstFrame) body.append("first_frame_url", await imageReferenceToFormValue(input.firstFrame));
@@ -854,16 +839,10 @@ function isGeminiOmniFlashVideoModel(model: string) {
 }
 
 function normalizeVideoSecondsForModel(model: string, value: string) {
+    const options = videoDurationOptionsForModel(model);
+    if (options?.includes(-1) && value.trim() === "-1") return "-1";
     const seconds = Number(normalizeVideoSeconds(value));
-    const key = modelKey(model);
-    if (key.includes("sora-2")) return closestAllowedSeconds(seconds, [4, 8, 12, 16, 20]);
-    if (key.includes("veo3-1") || key.includes("veo-3-1")) return closestAllowedSeconds(seconds, [4, 6, 8]);
-    if (key.includes("minimax-hailuo-02")) return closestAllowedSeconds(seconds, [5, 10]);
-    if (key.includes("minimax-hailuo-2-3")) return closestAllowedSeconds(seconds, [6, 10]);
-    if (key.includes("omni-flash-ext")) return closestAllowedSeconds(seconds, [4, 6, 8, 10]);
-    if (key.includes("wan2-5") || key.includes("wan2.5")) return closestAllowedSeconds(seconds, [5, 10]);
-    if (key === "wan2-6") return closestAllowedSeconds(seconds, [5, 10, 15]);
-    return String(seconds);
+    return options ? closestAllowedSeconds(seconds, options) : String(seconds);
 }
 
 function closestAllowedSeconds(seconds: number, allowed: number[]) {

@@ -8,9 +8,9 @@ import type { AiConfig } from "@/stores/use-config-store";
 
 const qualityOptions = [
     { value: "auto", label: "自动" },
-    { value: "high", label: "高" },
-    { value: "medium", label: "中" },
-    { value: "low", label: "低" },
+    { value: "high", label: "高 · 4K" },
+    { value: "medium", label: "中 · 2K" },
+    { value: "low", label: "低 · 1K" },
 ];
 const DIMENSION_STEP = 16;
 const GROK_IMAGE_ASPECTS = new Set(["1:1", "3:2", "2:3", "16:9", "9:16"]);
@@ -161,7 +161,10 @@ export function ImageSettingsTheme({ theme, children }: { theme: CanvasTheme; ch
         <ConfigProvider
             theme={{
                 token: { colorBgContainer: theme.toolbar.panel, colorBgElevated: theme.toolbar.panel, colorBorder: theme.node.stroke, colorPrimary: theme.node.activeStroke, colorText: theme.node.text, colorTextLightSolid: theme.node.panel },
-                components: { Button: { defaultBg: theme.toolbar.panel, defaultBorderColor: theme.node.stroke, defaultColor: theme.node.text } },
+                components: {
+                    Button: { defaultBg: theme.toolbar.panel, defaultBorderColor: theme.node.stroke, defaultColor: theme.node.text },
+                    Slider: { railBg: theme.node.stroke, railHoverBg: theme.node.stroke, trackBg: theme.node.activeStroke, trackHoverBg: theme.node.activeStroke, handleColor: theme.node.text, handleActiveColor: theme.node.text },
+                },
             }}
         >
             {children}
@@ -170,7 +173,7 @@ export function ImageSettingsTheme({ theme, children }: { theme: CanvasTheme; ch
 }
 
 export function imageQualityLabel(value: string) {
-    return ({ auto: "自动", high: "高", medium: "中", low: "低" } as Record<string, string>)[value] || value;
+    return ({ auto: "自动", high: "高 · 4K", medium: "中 · 2K", low: "低 · 1K" } as Record<string, string>)[value] || value;
 }
 
 export function imageSizeLabel(size: string) {

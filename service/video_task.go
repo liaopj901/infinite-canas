@@ -108,10 +108,10 @@ func CreateVideoTask(input VideoTaskCreateInput) (model.VideoTask, error) {
 	if IsCompletedVideoTaskStatus(task.Status) || task.VideoURL != "" {
 		task.Status = "completed"
 		task.Progress = 100
-		task.CompletedAt = current
+		task.CompletedAt = videoTaskTime(time.Now())
 	} else if IsFailedVideoTaskStatus(task.Status) || task.Error != "" {
 		task.Status = "failed"
-		task.CompletedAt = current
+		task.CompletedAt = videoTaskTime(time.Now())
 	}
 	var saved model.VideoTask
 	var err error
@@ -230,17 +230,6 @@ func runVideoTaskPoller() {
 	for range videoTaskPollWake {
 		for {
 			current := time.Now()
-			hasComfyTasks, comfyErr := expireComfyBridgeRequests("")
-			if comfyErr != nil {
-				log.Printf("expire Comfy Bridge requests failed err=%v", comfyErr)
-			}
-			hasComfyCleanup, cleanupErr := repository.CleanupComfyBridgeRequests(
-				current.Add(-videoTaskFinishedRetention),
-				current.Add(-comfyBridgeInspectTimeout),
-			)
-			if cleanupErr != nil {
-				log.Printf("cleanup Comfy Bridge requests failed err=%v", cleanupErr)
-			}
 			tasks, err := repository.ListDueVideoTasks(200)
 			if err != nil {
 				log.Printf("list due video tasks failed err=%v", err)
@@ -269,8 +258,8 @@ func runVideoTaskPoller() {
 			if audioErr != nil {
 				log.Printf("check active canvas audio tasks failed err=%v", audioErr)
 			}
-			if len(tasks) == 0 && len(workflowTasks) == 0 && !hasComfyTasks && !hasComfyCleanup && !hasImageTasks && !hasAudioTasks {
-				if workflowErr != nil || comfyErr != nil || cleanupErr != nil || imageErr != nil || audioErr != nil {
+			if len(tasks) == 0 && len(workflowTasks) == 0 && !hasImageTasks && !hasAudioTasks {
+				if workflowErr != nil || imageErr != nil || audioErr != nil {
 					waitForNextVideoTaskPoll()
 					continue
 				}
@@ -397,22 +386,18 @@ func UpdateVideoTaskFromPoll(task model.VideoTask, update VideoTaskPollUpdate) e
 	if task.VideoURL != "" || IsCompletedVideoTaskStatus(task.Status) {
 		task.Status = "completed"
 		task.Progress = 100
-		task.CompletedAt = current
+		task.CompletedAt = videoTaskTime(time.Now())
 		task.Error = ""
 		task.ErrorDetail = ""
 	} else if task.Error != "" || IsFailedVideoTaskStatus(task.Status) {
 		task.Status = "failed"
-		task.CompletedAt = current
+		task.CompletedAt = videoTaskTime(time.Now())
 	}
-	if task.ParameterTranslationSnapshot != "" && task.Status == "failed" {
+	if task.Status == "failed" {
 		extra, _ := json.Marshal(map[string]string{"model": task.Model, "path": "/videos"})
 		return repository.SaveFailedTranslatedVideoTask(task, model.CreditLog{ID: newID("credit"), UserID: task.UserID, Type: model.CreditLogTypeAIRefund, Amount: task.Credits, Remark: "模型调用失败返还 " + task.Model, Extra: string(extra), CreatedAt: current})
 	}
-	if task.Source == "canvas" || task.Source == "video-workbench" {
-		return repository.UpdateVideoTask(task)
-	}
-	_, err := repository.SaveVideoTask(task)
-	return err
+	return repository.UpdateVideoTask(task)
 }
 
 func NormalizeVideoTaskStatus(status string) string {

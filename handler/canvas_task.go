@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -300,13 +301,14 @@ func runCanvasImageTask(parent context.Context, task model.CanvasImageTask, user
 		saveFailedCanvasImageTask(task, err.Error(), err.Error())
 		return
 	}
+	responseDetail := fmt.Sprintf("响应大小：%d bytes；Content-Type：%s", len(payload), responseContentType)
 	if status >= http.StatusBadRequest {
 		message := readUpstreamAIErrorMessage(payload, status)
-		saveFailedCanvasImageTask(task, message, message)
+		saveFailedCanvasImageTask(task, message, responseDetail)
 		return
 	}
 	if message := readWrappedTaskError(payload); message != "" {
-		saveFailedCanvasImageTask(task, message, message)
+		saveFailedCanvasImageTask(task, message, responseDetail)
 		return
 	}
 	translationInput, _ := service.ReadParameterTranslationInput(body)
@@ -323,7 +325,7 @@ func runCanvasImageTask(parent context.Context, task model.CanvasImageTask, user
 		return
 	}
 	if err != nil {
-		saveFailedCanvasImageTask(task, err.Error(), err.Error())
+		saveFailedCanvasImageTask(task, err.Error(), responseDetail)
 		return
 	}
 	task.Status = "completed"
@@ -433,8 +435,7 @@ func executeCanvasAIRequest(ctx context.Context, user model.AuthUser, endpoint s
 	proxyAIRequest(recorder, request, endpoint)
 	response := recorder.Result()
 	defer response.Body.Close()
-	payload, _ := io.ReadAll(io.LimitReader(response.Body, 32*1024*1024))
-	return payload, response.StatusCode, response.Header.Get("Content-Type"), nil
+	return recorder.Body.Bytes(), response.StatusCode, response.Header.Get("Content-Type"), nil
 }
 
 func saveFailedCanvasImageTask(task model.CanvasImageTask, message string, detail string) {
@@ -803,6 +804,9 @@ func collectImageCandidates(value any, depth int, includeChatImages bool) []stri
 		}
 		return result
 	case map[string]any:
+		if thought, _ := typed["thought"].(bool); thought && typed["inlineData"] != nil {
+			return nil
+		}
 		keys := []string{"url", "b64_json", "partial_image_b64", "image_url", "image", "image_data", "base64", "inlineData", "parts", "content", "candidates", "result", "response", "data", "output"}
 		if includeChatImages {
 			keys = append(keys, "choices", "message", "images")

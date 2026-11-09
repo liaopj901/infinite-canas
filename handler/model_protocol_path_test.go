@@ -22,6 +22,7 @@ func TestModelProtocolProxyPathContract(t *testing.T) {
 		{"gemini video before cog", " GEMINI ", "https://api.kie.ai", "cogvideox-3", "/videos", "/v1beta/models/cogvideox-3:predictLongRunning"},
 		{"gemini operation", "gemini", "", "veo", "/videos/operations/task", "/v1beta/operations/task"},
 		{"minimax create before kie URL", "minimax", "https://api.kie.ai", "MiniMax-H3", "/videos", "/v2/video_generation"},
+		{"minimax tts", "minimax", "", "speech-2.8-hd", "/audio/speech", "/v1/t2a_v2"},
 		{"minimax other endpoint stops kie", "minimax", "https://api.kie.ai", "MiniMax-H3", "/images/generations", "/images/generations"},
 		{"cog before kie", "kie", "", " COGVIDEOX-3 ", "/videos", "/videos/generations"},
 		{"kie grok image special", "kie", "", " GROK-IMAGINE-IMAGE-2-0/TEXT-TO-IMAGE ", "/images/generations", "/client/tasks"},
@@ -48,7 +49,7 @@ func TestModelProtocolProxyPathContract(t *testing.T) {
 			}
 		})
 	}
-	for _, protocol := range []string{"", "openai", "grok2api", "minimax", "mimo", "future-protocol"} {
+	for _, protocol := range []string{"", "openai", "grok2api", "minimax", "mimo", "tokendance", "future-protocol"} {
 		for _, path := range []string{"/chat/completions", "/responses", "/images/generations", "/images/edits", "/audio/speech", "/videos", "/videos/task", "/models"} {
 			if got := resolveAIProxyPath(model.ModelChannel{Protocol: protocol}, "future-model", path); got != path {
 				t.Errorf("passthrough %q %q: got %q", protocol, path, got)
@@ -107,6 +108,10 @@ func TestModelProtocolProxyPreparationOrder(t *testing.T) {
 			wantPath: "/videos/generations", wantLabel: "APIMart video", wantBody: `{"model":"future-model","prompt":"scene","duration":7}`,
 		},
 		{
+			name: "TokenDance non-MiniMax audio passthrough", protocol: "tokendance", model: "seed-tts-2.0", endpoint: "/audio/speech", body: `{"model":"seed-tts-2.0","input":"hello"}`,
+			wantPath: "/audio/speech", wantBody: `{"model":"seed-tts-2.0","input":"hello"}`,
+		},
+		{
 			name: "compatible passthrough", protocol: "unknown", model: "future-model", endpoint: "/chat/completions", body: `not JSON`,
 			wantPath: "/chat/completions", wantBody: `not JSON`,
 		},
@@ -139,6 +144,23 @@ func TestModelProtocolProxyPreparationOrder(t *testing.T) {
 			assertProtocolBytes(t, got.body, []byte(test.wantBody))
 		})
 	}
+}
+
+func TestTokenDanceMiniMaxTTSRequest(t *testing.T) {
+	input := aiProtocolRequest{
+		channel:     model.ModelChannel{Protocol: "tokendance"},
+		modelName:   "minimax-speech-2.8-hd",
+		endpoint:    "/audio/speech",
+		path:        "/minimax/v1/t2a_v2",
+		protocol:    "minimax:t2a_v2",
+		contentType: "application/json",
+		body:        []byte(`{"model":"minimax-speech-2.8-hd","input":"你好","voice":"female-yujie","response_format":"mp3","speed":1}`),
+	}
+	got, stop, err := prepareMiniMaxTTSRequest(input)
+	if err != nil || !stop {
+		t.Fatalf("got stop %v, error %v", stop, err)
+	}
+	assertProtocolBytes(t, got.body, []byte(`{"model":"minimax-speech-2.8-hd","text":"你好","stream":false,"output_format":"hex","voice_setting":{"voice_id":"female-yujie","speed":1,"vol":1,"pitch":0},"audio_setting":{"sample_rate":32000,"bitrate":128000,"format":"mp3","channel":1}}`))
 }
 
 // Ordinary conversion fixtures live in RequestGoldens; these lock down overlapping routes.

@@ -12,7 +12,7 @@ func SaveCanvasImageTask(task model.CanvasImageTask) (model.CanvasImageTask, err
 	if err != nil {
 		return task, err
 	}
-	return task, db.Save(&task).Error
+	return task, db.Create(&task).Error
 }
 
 func UpdateCanvasImageTask(task model.CanvasImageTask) (model.CanvasImageTask, error) {
@@ -23,7 +23,11 @@ func UpdateCanvasImageTask(task model.CanvasImageTask) (model.CanvasImageTask, e
 
 	return task, db.Model(&model.CanvasImageTask{}).
 		Where("user_id = ? AND id = ? AND deleted_at = '' AND status <> ?", task.UserID, task.ID, "cancelled").
-		Select("*").
+		Select(
+			"Status", "Progress", "ResponseBody", "Error", "ErrorDetail",
+			"ImageURL", "ImageURLs", "StorageKey", "Width", "Height",
+			"MimeType", "Bytes", "UpdatedAt", "StartedAt", "CompletedAt",
+		).
 		Updates(&task).Error
 }
 

@@ -298,7 +298,7 @@ func uploadRunningHubReference(ctx context.Context, root, apiKey, raw string, ca
 	if strings.TrimSpace(apiKey) == "" {
 		return "", errors.New("参考素材上传需要 RunningHub 企业级 API Key")
 	}
-	data, mimeType, err := readWorkflowMedia(ctx, raw)
+	data, mimeType, err := readWorkflowMedia(ctx, raw, 64<<20)
 	if err != nil {
 		return "", err
 	}
@@ -363,7 +363,7 @@ func uploadRunningHubReference(ctx context.Context, root, apiKey, raw string, ca
 	return "", errors.New("RunningHub 上传响应缺少 fileName")
 }
 
-func readWorkflowMedia(ctx context.Context, raw string) ([]byte, string, error) {
+func readWorkflowMedia(ctx context.Context, raw string, dataURLLimit int) ([]byte, string, error) {
 	if strings.HasPrefix(raw, "data:") {
 		comma := strings.IndexByte(raw, ',')
 		if comma < 0 {
@@ -371,7 +371,7 @@ func readWorkflowMedia(ctx context.Context, raw string) ([]byte, string, error) 
 		}
 		mimeType := strings.Split(strings.TrimPrefix(raw[:comma], "data:"), ";")[0]
 		data, err := base64.StdEncoding.DecodeString(raw[comma+1:])
-		if err != nil || len(data) == 0 || len(data) > 64<<20 {
+		if err != nil || len(data) == 0 || (dataURLLimit > 0 && len(data) > dataURLLimit) {
 			return nil, "", errors.New("素材编码无效或超过 64MB")
 		}
 		return data, mimeType, nil

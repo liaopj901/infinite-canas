@@ -60,7 +60,10 @@ func init() {
 		return normalizeModelChannelBaseURL(channel.BaseURL) + path
 	}
 	minimax.models = func(model.ModelChannel) ([]string, error) { return MiniMaxModels(), nil }
-	minimax.testModel = func(model.ModelChannel, string) (string, error) {
+	minimax.testModel = func(_ model.ModelChannel, modelName string) (string, error) {
+		if IsMiniMaxTTSModelName(modelName) {
+			return "MiniMax TTS 模型配置格式已通过。后台不会执行付费语音生成，请在画布中验证实际生成。", nil
+		}
 		return "MiniMax-H3 是异步视频模型，请在视频创作台测试生成。", nil
 	}
 	modelProtocolRegistry[ModelChannelProtocolMiniMax] = minimax

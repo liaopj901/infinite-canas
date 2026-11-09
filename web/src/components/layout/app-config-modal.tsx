@@ -1,12 +1,13 @@
 "use client";
 
-import { App, Button, Form, Input, Modal, Segmented, Select, Switch } from "antd";
+import { App, Button, Form, Input, Modal, Radio, Segmented, Select, Switch } from "antd";
 import dynamic from "next/dynamic";
 import { useEffect, useRef, useState } from "react";
 
 import { ChannelModelSelectorModal } from "@/components/channel-model-selector-modal";
 import type { WorkflowChannelSettings } from "@/components/workflow/workflow-channel-pane";
 import { GrokTtsVoiceSelect } from "@/components/grok-tts-voice-select";
+import { MiniMaxTtsVoiceSelect } from "@/components/minimax-tts-voice-select";
 import { ModelPicker } from "@/components/model-picker";
 import { fetchImageModels } from "@/services/api/image";
 import { fetchUserConfig, measureUserStorageProvider, syncUserModelConfig, syncUserStorageProvider } from "@/services/api/user-config";
@@ -16,12 +17,14 @@ import { audioFormatOptions, audioVoiceOptions, glmTtsFormatOptions, glmTtsVoice
 import { grokTtsFormatOptions, grokTtsLanguageOptions, isGrok2APITtsConfig, normalizeGrokTtsFormat, normalizeGrokTtsLanguage, normalizeGrokTtsSpeed } from "@/lib/grok-tts";
 import { isGeminiConfig, isGeminiTtsModel } from "@/lib/gemini";
 import { geminiTtsVoiceOptions, normalizeGeminiTtsVoice } from "@/lib/gemini-tts";
+import { isMiniMaxTtsConfig, miniMaxTtsFormatOptions, normalizeMiniMaxTtsFormat, normalizeMiniMaxTtsSpeed, normalizeMiniMaxTtsVoice } from "@/lib/minimax-tts";
+import { miniMaxTtsVoiceOptions } from "@/lib/minimax-tts-voices";
 import { isMimoPresetTtsModel, isMimoTtsModel, isMimoVoiceCloneModel, isMimoVoiceDesignModel, mimoTtsFormatOptions, mimoTtsVoiceOptions } from "@/lib/mimo-tts";
 import { isWorkflowProtocol, modelChannelApiKeyUrls, modelChannelDefaultBaseUrls, modelChannelProtocolOptions } from "@/lib/model-channel";
 import { startTokenDanceOAuth } from "@/lib/tokendance-oauth";
 import type { WorkflowChannelData, WorkflowEntry } from "@/lib/workflow-channel";
 import { listWorkflowChannels, readWorkflowChannel, replaceWorkflowChannels, saveWorkflowChannel } from "@/services/workflow-channel-storage";
-import { filterChannelModelsByCapability, normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig, type LocalModelChannel, type ModelCapabilities, type ModelCapability } from "@/stores/use-config-store";
+import { channelProtocolForConfig, filterChannelModelsByCapability, normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig, type LocalModelChannel, type ModelCapabilities, type ModelCapability } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import { useChannelTranslationStore } from "@/stores/use-channel-translation-store";
 
@@ -82,6 +85,8 @@ export function AppConfigModal() {
     const audioConfig = { ...modelConfig, model: config.audioModel, audioModel: config.audioModel, activeChannelId: modelConfig.audioChannelId || modelConfig.activeChannelId };
     const grokTts = isGrok2APITtsConfig(audioConfig, config.audioModel);
     const geminiTts = isGeminiTtsModel(config.audioModel) && isGeminiConfig(audioConfig, config.audioModel);
+    const miniMaxTts = isMiniMaxTtsConfig(audioConfig, config.audioModel);
+    const officialMiniMaxTts = miniMaxTts && channelProtocolForConfig(audioConfig) === "minimax";
     const modelSelectChannel = normalizeLocalChannels(config).find((channel) => channel.id === modelSelectChannelId);
 
     useEffect(() => {
@@ -552,7 +557,7 @@ export function AppConfigModal() {
                             </Form.Item>
                         ) : isMimoTtsModel(config.audioModel) ? null : (
                             <Form.Item label="默认音频声音" className="mb-4">
-                                {grokTts ? <GrokTtsVoiceSelect config={audioConfig} model={config.audioModel} value={config.grokTtsVoice} enabled={isConfigOpen} onChange={(value) => updateConfig("grokTtsVoice", value)} /> : <Select value={glmTts ? normalizeGlmTtsVoice(config.glmTtsVoice) : config.audioVoice} options={glmTts ? glmTtsVoiceOptions : audioVoiceOptions} onChange={(value) => updateConfig(glmTts ? "glmTtsVoice" : "audioVoice", value)} />}
+                                {grokTts ? <GrokTtsVoiceSelect config={audioConfig} model={config.audioModel} value={config.grokTtsVoice} enabled={isConfigOpen} onChange={(value) => updateConfig("grokTtsVoice", value)} /> : officialMiniMaxTts ? <MiniMaxTtsVoiceSelect config={audioConfig} model={config.audioModel} value={normalizeMiniMaxTtsVoice(config.miniMaxTtsVoice)} enabled={isConfigOpen} onChange={(value) => updateConfig("miniMaxTtsVoice", value)} /> : <Select showSearch={miniMaxTts} optionFilterProp="label" value={glmTts ? normalizeGlmTtsVoice(config.glmTtsVoice) : miniMaxTts ? normalizeMiniMaxTtsVoice(config.miniMaxTtsVoice) : config.audioVoice} options={glmTts ? glmTtsVoiceOptions : miniMaxTts ? miniMaxTtsVoiceOptions : audioVoiceOptions} onChange={(value) => updateConfig(glmTts ? "glmTtsVoice" : miniMaxTts ? "miniMaxTtsVoice" : "audioVoice", value)} />}
                             </Form.Item>
                         )}
                         {grokTts ? (
@@ -562,27 +567,40 @@ export function AppConfigModal() {
                         ) : null}
                         {!geminiTts ? (
                             <Form.Item label="默认音频格式" className="mb-4">
-                                <Select value={isMimoTtsModel(config.audioModel) ? config.mimoTtsFormat : glmTts ? normalizeGlmTtsFormat(config.glmTtsFormat) : grokTts ? normalizeGrokTtsFormat(config.grokTtsFormat) : config.audioFormat} options={isMimoTtsModel(config.audioModel) ? [...mimoTtsFormatOptions] : glmTts ? glmTtsFormatOptions : grokTts ? grokTtsFormatOptions : audioFormatOptions} onChange={(value) => isMimoTtsModel(config.audioModel) ? updateConfig("mimoTtsFormat", value) : updateConfig(glmTts ? "glmTtsFormat" : grokTts ? "grokTtsFormat" : "audioFormat", value)} />
+                                <Select value={isMimoTtsModel(config.audioModel) ? config.mimoTtsFormat : glmTts ? normalizeGlmTtsFormat(config.glmTtsFormat) : miniMaxTts ? normalizeMiniMaxTtsFormat(config.miniMaxTtsFormat) : grokTts ? normalizeGrokTtsFormat(config.grokTtsFormat) : config.audioFormat} options={isMimoTtsModel(config.audioModel) ? [...mimoTtsFormatOptions] : glmTts ? glmTtsFormatOptions : miniMaxTts ? miniMaxTtsFormatOptions : grokTts ? grokTtsFormatOptions : audioFormatOptions} onChange={(value) => isMimoTtsModel(config.audioModel) ? updateConfig("mimoTtsFormat", value) : updateConfig(glmTts ? "glmTtsFormat" : miniMaxTts ? "miniMaxTtsFormat" : grokTts ? "grokTtsFormat" : "audioFormat", value)} />
                             </Form.Item>
                         ) : null}
                         {!geminiTts && !isMimoTtsModel(config.audioModel) ? (
                             <Form.Item label="默认音频语速" className="mb-4">
                                 <Input
                                     type="number"
-                                    min={glmTts ? 0.5 : grokTts ? 0.7 : 0.25}
-                                    max={glmTts ? 2 : grokTts ? 1.5 : 4}
+                                    min={glmTts || miniMaxTts ? 0.5 : grokTts ? 0.7 : 0.25}
+                                    max={glmTts || miniMaxTts ? 2 : grokTts ? 1.5 : 4}
                                     step={0.05}
-                                    value={glmTts ? config.glmTtsSpeed : grokTts ? config.grokTtsSpeed : config.audioSpeed}
-                                    onChange={(event) => updateConfig(glmTts ? "glmTtsSpeed" : grokTts ? "grokTtsSpeed" : "audioSpeed", event.target.value)}
-                                    onBlur={(event) => updateConfig(glmTts ? "glmTtsSpeed" : grokTts ? "grokTtsSpeed" : "audioSpeed", glmTts ? normalizeGlmTtsSpeed(event.target.value) : grokTts ? normalizeGrokTtsSpeed(event.target.value) : normalizeAudioSpeedValue(event.target.value))}
+                                    value={glmTts ? config.glmTtsSpeed : miniMaxTts ? config.miniMaxTtsSpeed : grokTts ? config.grokTtsSpeed : config.audioSpeed}
+                                    onChange={(event) => updateConfig(glmTts ? "glmTtsSpeed" : miniMaxTts ? "miniMaxTtsSpeed" : grokTts ? "grokTtsSpeed" : "audioSpeed", event.target.value)}
+                                    onBlur={(event) => updateConfig(glmTts ? "glmTtsSpeed" : miniMaxTts ? "miniMaxTtsSpeed" : grokTts ? "grokTtsSpeed" : "audioSpeed", glmTts ? normalizeGlmTtsSpeed(event.target.value) : miniMaxTts ? normalizeMiniMaxTtsSpeed(event.target.value) : grokTts ? normalizeGrokTtsSpeed(event.target.value) : normalizeAudioSpeedValue(event.target.value))}
                                 />
                             </Form.Item>
                         ) : null}
                     </div>
-                    <div className="mb-4 grid gap-3 md:grid-cols-3">
-                        <FeatureSwitch title="流式传输" description="开启后请求中追加 stream，支持读取中间图片事件并避免长时间无数据。" checked={Boolean(config.streamImages)} onChange={(checked) => updateConfig("streamImages", checked ? "1" : "")} />
-                        <FeatureSwitch title="返回 Base64 图片数据" description="开启后 Image API 请求会追加 response_format: b64_json。" checked={Boolean(config.responseFormatB64Json)} onChange={(checked) => updateConfig("responseFormatB64Json", checked ? "1" : "")} />
+                    <Form.Item label="已有内容的节点再次生成时" className="mb-4">
+                        <Radio.Group value={config.nodeRegenerateBehavior} onChange={(event) => updateConfig("nodeRegenerateBehavior", event.target.value)} style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", width: "100%", gap: 8 }}>
+                            <Radio value="overwrite">
+                                <span className="block text-sm font-medium">覆盖当前节点</span>
+                                <span className="mt-0.5 block text-xs opacity-60">直接替换该节点的内容和参数，想保留旧结果时，先复制或切换节点模式</span>
+                            </Radio>
+                            <Radio value="new-node">
+                                <span className="block text-sm font-medium">新建衍生节点</span>
+                                <span className="mt-0.5 block text-xs opacity-60">保留当前节点，新建一个节点承接生成结果，适合做变体或分支</span>
+                            </Radio>
+                        </Radio.Group>
+                    </Form.Item>
+                    <div className="mb-4 grid gap-3 md:grid-cols-4">
+                        <FeatureSwitch title="流式传输" description="开启后请求中追加 stream，支持读取中间图片并避免长时间无数据。" checked={Boolean(config.streamImages)} onChange={(checked) => updateConfig("streamImages", checked ? "1" : "")} />
+                        <FeatureSwitch title="返回 Base64 图片" description="开启后 Image API 请求会追加 response_format: b64_json。" checked={Boolean(config.responseFormatB64Json)} onChange={(checked) => updateConfig("responseFormatB64Json", checked ? "1" : "")} />
                         <FeatureSwitch title="Codex CLI 兼容模式" description="开启后减少不兼容参数，并追加防提示词改写前缀。" checked={Boolean(config.codexCli)} onChange={(checked) => updateConfig("codexCli", checked ? "1" : "")} />
+                        <FeatureSwitch title="视频音频生成" description="视频默认生成同步音频。" checked={config.videoGenerateAudio === "true"} onChange={(checked) => updateConfig("videoGenerateAudio", String(checked))} />
                     </div>
                     {canUseUserStorageProvider ? (
                         <>
@@ -599,6 +617,8 @@ export function AppConfigModal() {
                                         <Button size="small" loading={measuringStorageType === "s3"} onClick={() => void measureStorage(userStorage)}>
                                             统计容量
                                         </Button>
+                                        <span className="text-xs text-stone-500">路径 / 子域名</span>
+                                        <Switch size="small" checked={userStorage.bucketInHost} onChange={(bucketInHost) => setUserStorage((value) => ({ ...value, bucketInHost }))} />
                                         <span className="text-xs text-stone-500">自动同步</span>
                                         <Switch size="small" checked={config.syncStorageConfig} onChange={(checked) => updateConfig("syncStorageConfig", checked)} />
                                         <Switch checked={userStorage.enabled} disabled={userWebDAVStorage.enabled} onChange={(enabled) => setUserStorage((value) => ({ ...value, enabled }))} />
@@ -647,7 +667,7 @@ export function AppConfigModal() {
                             </section>
                         </>
                     ) : null}
-                    {(!isMimoTtsModel(config.audioModel) || isMimoPresetTtsModel(config.audioModel) || isMimoVoiceCloneModel(config.audioModel)) && !glmTts && !grokTts ? (
+                    {(!isMimoTtsModel(config.audioModel) || isMimoPresetTtsModel(config.audioModel) || isMimoVoiceCloneModel(config.audioModel)) && !glmTts && !grokTts && !miniMaxTts ? (
                         <Form.Item label="默认音频指令" className="mb-4">
                             <Input.TextArea rows={2} value={config.audioInstructions} placeholder="例如：自然、温暖、适合旁白。" onChange={(event) => updateConfig("audioInstructions", event.target.value)} />
                         </Form.Item>

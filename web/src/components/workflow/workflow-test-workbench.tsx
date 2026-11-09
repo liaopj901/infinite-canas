@@ -3,7 +3,7 @@ import { FileAudio, FileImage, Film, Grip, Play, RotateCcw, Square, Upload, Wand
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 
 import { readFileAsDataUrl } from "@/lib/image-utils";
-import { runWorkflowTask, type WorkflowGenerationTask } from "@/services/api/workflow-generation";
+import { runWorkflowTask, workflowMediaSource, type WorkflowGenerationTask } from "@/services/api/workflow-generation";
 import type { WorkflowCapability, WorkflowFieldMapping, WorkflowRef } from "@/lib/workflow-channel";
 import { workflowFieldChoiceValues, workflowOptionText, workflowOptionValue } from "@/lib/workflow-field-options";
 import { useConfigStore, type AiConfig } from "@/stores/use-config-store";
@@ -168,7 +168,7 @@ export function WorkflowTestWorkbench({ workflowRef, token, provider, workflowId
                 audioSpeed: Number(config.audioSpeed) || 1,
                 audioInstructions: config.audioInstructions,
                 referenceImages: await Promise.all(files.image.slice(0, imageReferenceCount).map((item) => readFileAsDataUrl(item.file, `读取素材失败：${item.file.name}`))),
-                referenceVideos: await Promise.all(files.video.map((item) => readFileAsDataUrl(item.file, `读取素材失败：${item.file.name}`))),
+                referenceVideos: await Promise.all(files.video.map((item) => workflowMediaSource(item.url, { ...workflowRef, channelId }, provider))),
                 referenceAudios: await Promise.all(files.audio.map((item) => readFileAsDataUrl(item.file, `读取素材失败：${item.file.name}`))),
                 mask: maskEnabled && files.image[imageReferenceCount] ? await readFileAsDataUrl(files.image[imageReferenceCount].file, `读取素材失败：${files.image[imageReferenceCount].file.name}`) : undefined,
                 source: "workflow_settings_test",
